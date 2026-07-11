@@ -1,112 +1,198 @@
-CREATE TABLE IF NOT EXISTS JOIN_results (
-    resultIdJOIN INTEGER PRIMARY KEY AUTOINCREMENT,
+Да, это хороший вариант. Сделаем лог прямо в папке проекта рядом с `sync.py`, например:
 
-    TaskId INTEGER,
-    sampleCode TEXT NOT NULL,
+```text
+sync_errors.log
+```
 
-    date TEXT,
-    operator TEXT,
+Тогда в MsgBox можно показывать короткое сообщение, а полный traceback смотреть в файле.
 
-    equipment TEXT,
-    equipmentNumber TEXT,
+## Что добавить в `sync.py`
 
-    preparationPressure REAL,
-    absolutePressure REAL,
-    pressureUnit TEXT,
+### 1. Вверху добавить импорты
 
-    preparationTemperature REAL,
-    preparationPressureMPa REAL,
+У тебя уже есть `traceback`, `Path` может ещё не быть. Добавь:
 
-    completeFWC INTEGER,
+```python
+from datetime import datetime
+from pathlib import Path
+```
 
-    dateTimeSync TEXT
-);
+Если `datetime` уже добавлен ранее — второй раз не надо.
 
-CREATE TABLE IF NOT EXISTS JOIN_sourceData (
-    rowIdJoin INTEGER PRIMARY KEY AUTOINCREMENT,
-    resultIdJoin INTEGER NOT NULL,
+### 2. Добавить константу и функцию логирования
 
-    mixSampleCode TEXT,
-    depleted INTEGER,
+Где-нибудь после regex-констант:
 
-    FOREIGN KEY (resultIdJoin)
-        REFERENCES JOIN_results(resultIdJOIN)
-        ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_JOIN_results_TaskId
-ON JOIN_results(TaskId);
-
-CREATE INDEX IF NOT EXISTS idx_JOIN_results_sampleCode
-ON JOIN_results(sampleCode);
-
-CREATE INDEX IF NOT EXISTS idx_JOIN_results_sampleCode_TaskId
-ON JOIN_results(sampleCode, TaskId);
-
-CREATE INDEX IF NOT EXISTS idx_JOIN_sourceData_resultIdJoin
-ON JOIN_sourceData(resultIdJoin);
-
-CREATE INDEX IF NOT EXISTS idx_JOIN_sourceData_mixSampleCode
-ON JOIN_sourceData(mixSampleCode);
+```python
+PROJECT_DIR = Path(__file__).resolve().parent
+ERROR_LOG_PATH = PROJECT_DIR / "sync_errors.log"
 
 
+def write_error_log(
+    *,
+    mode: str,
+    message: str,
+    error_type: str,
+    traceback_text: str,
+) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-CCE_RESULTS = TableSchema(
-    logical_name="CCE_RESULTS",
-    db_table="CCE_results",
-    sheet_name="CCE_results",
-    excel_table_name="CCE_results",
-    columns=[
-        _col(db_name="resultIdCCE", excel_name="resultIdCCE", typ="INTEGER", value_type="integer", pk=True),
-        _col(db_name="TaskId", excel_name="TaskId", typ="INTEGER", value_type="integer"),
-        _col(db_name="sampleCode", excel_name="sampleCode", typ="TEXT", value_type="text", required=True),
-        _col(db_name="PVTEqNumber", excel_name="PVTEqNumber", typ="TEXT", value_type="text"),
+    with ERROR_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write("\n" + "=" * 100 + "\n")
+        f.write(f"datetime: {now}\n")
+        f.write(f"mode: {mode}\n")
+        f.write(f"error_type: {error_type}\n")
+        f.write(f"message: {message}\n")
+        f.write("-" * 100 + "\n")
+        f.write(traceback_text)
+        f.write("\n")
+```
 
-        _col(db_name="dateStart", excel_name="dateStart", typ="TEXT", value_type="date"),
-        _col(db_name="dateEnd", excel_name="dateEnd", typ="TEXT", value_type="date"),
-        _col(db_name="operator", excel_name="operator", typ="TEXT", value_type="text"),
-        _col(db_name="analyseNumber", excel_name="analyseNumber", typ="TEXT", value_type="text"),
+### 3. Исправить обработку ошибок в `run_json`
 
-        _col(db_name="Vres", excel_name="Vres", typ="REAL", value_type="real"),
-        _col(db_name="Vdew", excel_name="Vdew", typ="REAL", value_type="real"),
+Сейчас у тебя, скорее всего, в `run_json` есть что-то типа:
 
-        _col(db_name="Pres", excel_name="Pres", typ="REAL", value_type="real"),
-        _col(db_name="Punit", excel_name="Punit", typ="TEXT", value_type="text"),
-        _col(db_name="PresMPa", excel_name="PresMPa", typ="REAL", value_type="real"),
+```python
+except Exception as exc:
+    report = SyncReport(
+        ok=False,
+        message=str(exc),
+        mode=mode,
+        error_type=type(exc).__name__,
+        traceback=traceback.format_exc(),
+    )
+    return json.dumps(asdict(report), ensure_ascii=False, indent=2)
+```
 
-        _col(db_name="fluidMass", excel_name="fluidMass", typ="REAL", value_type="real"),
-        _col(db_name="fluidTransferDensity", excel_name="fluidTransferDensity", typ="REAL", value_type="real"),
+Замени на такой вариант:
 
-        _col(db_name="dateTimeSync", excel_name="dateTimeSync", typ="TEXT", value_type="datetime"),
-    ],
-)
+```python
+except Exception as exc:
+    traceback_text = traceback.format_exc()
+    error_type = type(exc).__name__
+    message = str(exc)
 
-CCE_SOURCE_DATA = TableSchema(
-    logical_name="CCE_SOURCE_DATA",
-    db_table="CCE_sourceData",
-    sheet_name="CCE_sourceData",
-    parent="CCE_RESULTS",
-    fk_column="resultIdCCE",
-    excel_table_name="CCE_sourceData",
-    delete_if_empty_columns=("Pressure", "Vcell"),
-    columns=[
-        _col(db_name="rowIdCCE", excel_name="rowIdCCE", typ="INTEGER", value_type="integer", pk=True),
-        _col(db_name="resultIdCCE", excel_name="resultIdCCE", typ="INTEGER", value_type="integer", required=True),
+    write_error_log(
+        mode=mode,
+        message=message,
+        error_type=error_type,
+        traceback_text=traceback_text,
+    )
 
-        _col(db_name="Pressure", excel_name="Pressure", typ="REAL", value_type="real"),
-        _col(db_name="PressureMPa", excel_name="PressureMPa", typ="REAL", value_type="real"),
-        _col(db_name="Phase", excel_name="Phase", typ="INTEGER", value_type="integer"),
+    report = SyncReport(
+        ok=False,
+        message=(
+            f"{error_type}: {message}\n\n"
+            f"Полный traceback записан в лог:\n{ERROR_LOG_PATH}"
+        ),
+        mode=mode,
+        tables=[],
+        error_type=error_type,
+        traceback=None,
+    )
 
-        _col(db_name="Vcell", excel_name="Vcell", typ="REAL", value_type="real"),
-        _col(db_name="Vliquid", excel_name="Vliquid", typ="REAL", value_type="real"),
-        _col(db_name="Vgas", excel_name="Vgas", typ="REAL", value_type="real"),
+    return json.dumps(asdict(report), ensure_ascii=False, indent=2)
+```
 
-        _col(db_name="relativeCellVolume", excel_name="relativeCellVolume", typ="REAL", value_type="real"),
-        _col(db_name="liquidVolumeFraction", excel_name="liquidVolumeFraction", typ="REAL", value_type="real"),
-        _col(db_name="gasVolumeFraction", excel_name="gasVolumeFraction", typ="REAL", value_type="real"),
+Важно: `traceback=None`, чтобы огромный traceback больше не летел в MsgBox.
 
-        _col(db_name="monophaseDensity", excel_name="monophaseDensity", typ="REAL", value_type="real"),
-        _col(db_name="comment", excel_name="comment", typ="TEXT", value_type="text"),
-        _col(db_name="active", excel_name="active", typ="INTEGER", value_type="boolean"),
-    ],
-)
+## Полный пример блока `run_json`
+
+Примерно так должен выглядеть конец:
+
+```python
+def run_json(
+    mode: str,
+    workbook: str | None,
+    db_path: str,
+    study_codes: list[str] | None = None,
+    project_number: str | None = None,
+    task_status: str = TaskStatusRepository.COMPLETED_STATUS,
+    taskid: int | None = None,
+    task_type: str | None = None,
+    result_id: int | None = None,
+    date_time: str | None = None,
+) -> str:
+    try:
+        if mode == "save":
+            if not workbook:
+                raise ValueError("Для режима save обязательно нужен --workbook")
+            report = run_save(
+                workbook,
+                db_path,
+                study_codes,
+                task_status=task_status,
+            )
+
+        elif mode == "load":
+            if not workbook:
+                raise ValueError("Для режима load обязательно нужен --workbook")
+            if not project_number:
+                raise ValueError("Для режима load обязательно нужен --project")
+            report = run_load(workbook, db_path, project_number, study_codes)
+
+        elif mode == "status":
+            if taskid is None:
+                raise ValueError("Для режима status обязательно нужен --task-id")
+            if not task_type:
+                raise ValueError("Для режима status обязательно нужен --task-type")
+
+            report = run_status(
+                db_path,
+                taskid=taskid,
+                task_type=task_type,
+                status=task_status,
+                result_id=result_id,
+                date_time=date_time,
+            )
+
+        else:
+            raise ValueError("mode должен быть 'save', 'load' или 'status'")
+
+        return json.dumps(
+            asdict(report),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    except Exception as exc:
+        traceback_text = traceback.format_exc()
+        error_type = type(exc).__name__
+        message = str(exc)
+
+        write_error_log(
+            mode=mode,
+            message=message,
+            error_type=error_type,
+            traceback_text=traceback_text,
+        )
+
+        report = SyncReport(
+            ok=False,
+            message=(
+                f"{error_type}: {message}\n\n"
+                f"Полный traceback записан в лог:\n{ERROR_LOG_PATH}"
+            ),
+            mode=mode,
+            tables=[],
+            error_type=error_type,
+            traceback=None,
+        )
+
+        return json.dumps(
+            asdict(report),
+            ensure_ascii=False,
+            indent=2,
+        )
+```
+
+После этого в Excel-окне будет коротко:
+
+```text
+ValueError: В таблице 'CCE_results' нет столбца '...'
+
+Полный traceback записан в лог:
+L:\LRC\common_data\...\sqlite-excel\sync_errors.log
+```
+
+А весь подробный traceback будет в файле `sync_errors.log`.
