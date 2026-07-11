@@ -1,61 +1,112 @@
-CREATE TABLE IF NOT EXISTS CCE_results (
-    resultIdCCE INTEGER PRIMARY KEY AUTOINCREMENT,
+CREATE TABLE IF NOT EXISTS JOIN_results (
+    resultIdJOIN INTEGER PRIMARY KEY AUTOINCREMENT,
 
     TaskId INTEGER,
-    sampleCode TEXT,
-    PVTEqNumber TEXT,
+    sampleCode TEXT NOT NULL,
 
-    dateStart TEXT,
-    dateEnd TEXT,
+    date TEXT,
     operator TEXT,
-    analyseNumber TEXT,
 
-    Vres REAL,
-    Vdew REAL,
+    equipment TEXT,
+    equipmentNumber TEXT,
 
-    Pres REAL,
-    Punit TEXT,
-    PresMPa REAL,
+    preparationPressure REAL,
+    absolutePressure REAL,
+    pressureUnit TEXT,
 
-    fluidMass REAL,
-    fluidTransferDensity REAL,
+    preparationTemperature REAL,
+    preparationPressureMPa REAL,
+
+    completeFWC INTEGER,
 
     dateTimeSync TEXT
 );
 
-CREATE TABLE IF NOT EXISTS CCE_sourceData (
-    rowIdCCE INTEGER PRIMARY KEY AUTOINCREMENT,
-    resultIdCCE INTEGER NOT NULL,
+CREATE TABLE IF NOT EXISTS JOIN_sourceData (
+    rowIdJoin INTEGER PRIMARY KEY AUTOINCREMENT,
+    resultIdJoin INTEGER NOT NULL,
 
-    Pressure REAL,
-    PressureMPa REAL,
-    Phase INTEGER,
+    mixSampleCode TEXT,
+    depleted INTEGER,
 
-    Vcell REAL,
-    Vliquid REAL,
-    Vgas REAL,
-
-    relativeCellVolume REAL,
-    liquidVolumeFraction REAL,
-    gasVolumeFraction REAL,
-
-    monophaseDensity REAL,
-    comment TEXT,
-    active INTEGER,
-
-    FOREIGN KEY (resultIdCCE)
-        REFERENCES CCE_results(resultIdCCE)
+    FOREIGN KEY (resultIdJoin)
+        REFERENCES JOIN_results(resultIdJOIN)
         ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_CCE_results_sampleCode
-ON CCE_results(sampleCode);
+CREATE INDEX IF NOT EXISTS idx_JOIN_results_TaskId
+ON JOIN_results(TaskId);
 
-CREATE INDEX IF NOT EXISTS idx_CCE_results_taskId
-ON CCE_results(TaskId);
+CREATE INDEX IF NOT EXISTS idx_JOIN_results_sampleCode
+ON JOIN_results(sampleCode);
 
-CREATE INDEX IF NOT EXISTS idx_CCE_results_sampleCode_analyseNumber
-ON CCE_results(sampleCode, analyseNumber);
+CREATE INDEX IF NOT EXISTS idx_JOIN_results_sampleCode_TaskId
+ON JOIN_results(sampleCode, TaskId);
 
-CREATE INDEX IF NOT EXISTS idx_CCE_sourceData_resultIdCCE
-ON CCE_sourceData(resultIdCCE);
+CREATE INDEX IF NOT EXISTS idx_JOIN_sourceData_resultIdJoin
+ON JOIN_sourceData(resultIdJoin);
+
+CREATE INDEX IF NOT EXISTS idx_JOIN_sourceData_mixSampleCode
+ON JOIN_sourceData(mixSampleCode);
+
+
+
+CCE_RESULTS = TableSchema(
+    logical_name="CCE_RESULTS",
+    db_table="CCE_results",
+    sheet_name="CCE_results",
+    excel_table_name="CCE_results",
+    columns=[
+        _col(db_name="resultIdCCE", excel_name="resultIdCCE", typ="INTEGER", value_type="integer", pk=True),
+        _col(db_name="TaskId", excel_name="TaskId", typ="INTEGER", value_type="integer"),
+        _col(db_name="sampleCode", excel_name="sampleCode", typ="TEXT", value_type="text", required=True),
+        _col(db_name="PVTEqNumber", excel_name="PVTEqNumber", typ="TEXT", value_type="text"),
+
+        _col(db_name="dateStart", excel_name="dateStart", typ="TEXT", value_type="date"),
+        _col(db_name="dateEnd", excel_name="dateEnd", typ="TEXT", value_type="date"),
+        _col(db_name="operator", excel_name="operator", typ="TEXT", value_type="text"),
+        _col(db_name="analyseNumber", excel_name="analyseNumber", typ="TEXT", value_type="text"),
+
+        _col(db_name="Vres", excel_name="Vres", typ="REAL", value_type="real"),
+        _col(db_name="Vdew", excel_name="Vdew", typ="REAL", value_type="real"),
+
+        _col(db_name="Pres", excel_name="Pres", typ="REAL", value_type="real"),
+        _col(db_name="Punit", excel_name="Punit", typ="TEXT", value_type="text"),
+        _col(db_name="PresMPa", excel_name="PresMPa", typ="REAL", value_type="real"),
+
+        _col(db_name="fluidMass", excel_name="fluidMass", typ="REAL", value_type="real"),
+        _col(db_name="fluidTransferDensity", excel_name="fluidTransferDensity", typ="REAL", value_type="real"),
+
+        _col(db_name="dateTimeSync", excel_name="dateTimeSync", typ="TEXT", value_type="datetime"),
+    ],
+)
+
+CCE_SOURCE_DATA = TableSchema(
+    logical_name="CCE_SOURCE_DATA",
+    db_table="CCE_sourceData",
+    sheet_name="CCE_sourceData",
+    parent="CCE_RESULTS",
+    fk_column="resultIdCCE",
+    excel_table_name="CCE_sourceData",
+    delete_if_empty_columns=("Pressure", "Vcell"),
+    columns=[
+        _col(db_name="rowIdCCE", excel_name="rowIdCCE", typ="INTEGER", value_type="integer", pk=True),
+        _col(db_name="resultIdCCE", excel_name="resultIdCCE", typ="INTEGER", value_type="integer", required=True),
+
+        _col(db_name="Pressure", excel_name="Pressure", typ="REAL", value_type="real"),
+        _col(db_name="PressureMPa", excel_name="PressureMPa", typ="REAL", value_type="real"),
+        _col(db_name="Phase", excel_name="Phase", typ="INTEGER", value_type="integer"),
+
+        _col(db_name="Vcell", excel_name="Vcell", typ="REAL", value_type="real"),
+        _col(db_name="Vliquid", excel_name="Vliquid", typ="REAL", value_type="real"),
+        _col(db_name="Vgas", excel_name="Vgas", typ="REAL", value_type="real"),
+
+        _col(db_name="relativeCellVolume", excel_name="relativeCellVolume", typ="REAL", value_type="real"),
+        _col(db_name="liquidVolumeFraction", excel_name="liquidVolumeFraction", typ="REAL", value_type="real"),
+        _col(db_name="gasVolumeFraction", excel_name="gasVolumeFraction", typ="REAL", value_type="real"),
+
+        _col(db_name="monophaseDensity", excel_name="monophaseDensity", typ="REAL", value_type="real"),
+        _col(db_name="comment", excel_name="comment", typ="TEXT", value_type="text"),
+        _col(db_name="active", excel_name="active", typ="INTEGER", value_type="boolean"),
+    ],
+)
