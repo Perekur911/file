@@ -1,27 +1,17 @@
-Да, это хороший вариант. Сделаем лог прямо в папке проекта рядом с `sync.py`, например:
+Да, тогда проще всего — обернуть **весь текущий `run_json` в `try/except`**, а основную логику почти не трогать.
 
-```text
-sync_errors.log
-```
+Твой текущий `run_json` сейчас без `try`, поэтому добавь `try:` перед первым `if mode == "save":`, а весь блок `if/elif/else` с `return json.dumps(...)` сдвинь внутрь.
 
-Тогда в MsgBox можно показывать короткое сообщение, а полный traceback смотреть в файле.
+### 1. Добавь сверху в `sync.py`
 
-## Что добавить в `sync.py`
-
-### 1. Вверху добавить импорты
-
-У тебя уже есть `traceback`, `Path` может ещё не быть. Добавь:
+Если ещё нет:
 
 ```python
 from datetime import datetime
 from pathlib import Path
 ```
 
-Если `datetime` уже добавлен ранее — второй раз не надо.
-
-### 2. Добавить константу и функцию логирования
-
-Где-нибудь после regex-констант:
+Потом рядом с константами:
 
 ```python
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -48,57 +38,7 @@ def write_error_log(
         f.write("\n")
 ```
 
-### 3. Исправить обработку ошибок в `run_json`
-
-Сейчас у тебя, скорее всего, в `run_json` есть что-то типа:
-
-```python
-except Exception as exc:
-    report = SyncReport(
-        ok=False,
-        message=str(exc),
-        mode=mode,
-        error_type=type(exc).__name__,
-        traceback=traceback.format_exc(),
-    )
-    return json.dumps(asdict(report), ensure_ascii=False, indent=2)
-```
-
-Замени на такой вариант:
-
-```python
-except Exception as exc:
-    traceback_text = traceback.format_exc()
-    error_type = type(exc).__name__
-    message = str(exc)
-
-    write_error_log(
-        mode=mode,
-        message=message,
-        error_type=error_type,
-        traceback_text=traceback_text,
-    )
-
-    report = SyncReport(
-        ok=False,
-        message=(
-            f"{error_type}: {message}\n\n"
-            f"Полный traceback записан в лог:\n{ERROR_LOG_PATH}"
-        ),
-        mode=mode,
-        tables=[],
-        error_type=error_type,
-        traceback=None,
-    )
-
-    return json.dumps(asdict(report), ensure_ascii=False, indent=2)
-```
-
-Важно: `traceback=None`, чтобы огромный traceback больше не летел в MsgBox.
-
-## Полный пример блока `run_json`
-
-Примерно так должен выглядеть конец:
+### 2. `run_json` замени на такой
 
 ```python
 def run_json(
@@ -113,10 +53,15 @@ def run_json(
     result_id: int | None = None,
     date_time: str | None = None,
 ) -> str:
+    """
+    Возвращает результат JSON-строкой для VBA.
+    """
+
     try:
         if mode == "save":
             if not workbook:
                 raise ValueError("Для режима save обязательно нужен --workbook")
+
             report = run_save(
                 workbook,
                 db_path,
@@ -127,13 +72,16 @@ def run_json(
         elif mode == "load":
             if not workbook:
                 raise ValueError("Для режима load обязательно нужен --workbook")
+
             if not project_number:
                 raise ValueError("Для режима load обязательно нужен --project")
+
             report = run_load(workbook, db_path, project_number, study_codes)
 
         elif mode == "status":
             if taskid is None:
                 raise ValueError("Для режима status обязательно нужен --task-id")
+
             if not task_type:
                 raise ValueError("Для режима status обязательно нужен --task-type")
 
@@ -186,13 +134,13 @@ def run_json(
         )
 ```
 
-После этого в Excel-окне будет коротко:
+После этого MsgBox уже не будет забит полным traceback. Он покажет коротко:
 
 ```text
-ValueError: В таблице 'CCE_results' нет столбца '...'
+ValueError: ...
 
 Полный traceback записан в лог:
-L:\LRC\common_data\...\sqlite-excel\sync_errors.log
+L:\LRC\common_data\ФЛЮИДЫ\ПТИ\sqlite-excel\sync_errors.log
 ```
 
-А весь подробный traceback будет в файле `sync_errors.log`.
+И уже в `sync_errors.log` будет полная причина.
