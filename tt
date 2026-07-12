@@ -1,1 +1,925 @@
+from __future__ import annotations
 
+import argparse
+import json
+import logging
+import shutil
+import sys
+import time
+import traceback
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import xlwings as xw
+from openpyxl import load_workbook
+from openpyxl.utils.cell import coordinate_from_string
+
+
+# =============================================================================
+# Настройки по умолчанию
+# =============================================================================
+
+DEFAULT_ACT_TEMPLATE = (
+    r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\Работа\База данных результатов\Акт качества.xlsx"
+)
+
+PROJECT_DIR = Path(__file__).resolve().parent
+ERROR_LOG_PATH = PROJECT_DIR / "create_quality_act_errors.log"
+
+
+GAS_SAMPLE_TYPES = {"GS", "DG", "PNG", "SHFLU", "WHG"}
+LIQ_SAMPLE_TYPES = {"LS", "DEC"}
+
+
+# =============================================================================
+# Report
+# =============================================================================
+
+@dataclass
+class QualityActReport:
+    ok: bool
+    message: str
+    output_path: str | None = None
+    gas_rows: int = 0
+    liquid_rows: int = 0
+    error_type: str | None = None
+    traceback: str | None = None
+
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+def write_error_log(
+    *,
+    message: str,
+    error_type: str,
+    traceback_text: str,
+) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with ERROR_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write("\n" + "=" * 100 + "\n")
+        f.write(f"datetime: {now}\n")
+        f.write(f"error_type: {error_type}\n")
+        f.write(f"message: {message}\n")
+        f.write("-" * 100 + "\n")
+        f.write(traceback_text)
+        f.write("\n")
+
+
+logging.basicConfig(
+    filename=PROJECT_DIR / "create_quality_act.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    filemode="a",
+    encoding="utf-8",
+)
+
+
+# =============================================================================
+# xlwings helpers
+# =============================================================================
+
+def find_open_book(workbook: str) -> xw.Book:
+    target = str(Path(workbook)).lower()
+    target_name = Path(workbook).name.lower()
+
+    for app in xw.apps:
+        for book in app.books:
+            full_name = str(book.fullname).lower() if book.fullname else ""
+            book_name = book.name.lower()
+
+            if full_name == target or book_name == target_name:
+                return book
+
+    raise FileNotFoundError(
+        f"Открытая книга Excel не найдена: {workbook}. "
+        f"Открой книгу с формами перед запуском скрипта."
+    )
+
+
+def read_xlwings_table(
+    book: xw.Book,
+    *,
+    sheet_name: str,
+    table_name: str,
+) -> tuple[list[str], list[list[Any]]]:
+    try:
+        sheet = book.sheets[sheet_name]
+    except Exception as exc:
+        raise ValueError(f"В книге '{book.name}' нет листа '{sheet_name}'") from exc
+
+    try:
+        table = sheet.tables[table_name]
+    except Exception as exc:
+        raise ValueError(
+            f"На листе '{sheet_name}' нет умной таблицы '{table_name}'"
+        ) from exc
+
+    values = table.range.value
+
+    if not values:
+        return [], []
+
+    if not isinstance(values[0], list):
+        values = [values]
+
+    headers = [normalize_header(v) for v in values[0]]
+    rows = values[1:]
+
+    return headers, rows
+
+
+def build_header_map(headers: list[str]) -> dict[str, int]:
+    return {
+        str(header).strip().lower(): idx
+        for idx, header in enumerate(headers)
+        if str(header).strip()
+    }
+
+
+def require_columns(
+    header_map: dict[str, int],
+    columns: list[str],
+    source_name: str,
+) -> None:
+    missing = [
+        col for col in columns
+        if col.lower() not in header_map
+    ]
+
+    if missing:
+        raise ValueError(
+            f"В '{source_name}' не найдены обязательные колонки: {missing}. "
+            f"Фактические колонки: {list(header_map.keys())}"
+        )
+
+
+def normalize_header(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+# =============================================================================
+# Result table wrapper
+# =============================================================================
+
+class ResultTable:
+    def __init__(self, headers: list[str], rows: list[list[Any]], name: str):
+        self.headers = headers
+        self.rows = rows
+        self.name = name
+        self.map = build_header_map(headers)
+
+    def get_column_index(self, column_name: str) -> int | None:
+        return self.map.get(column_name.lower())
+
+    def get_value(self, row_index: int, column_name: str) -> Any:
+        col_index = self.get_column_index(column_name)
+        if col_index is None:
+            return None
+
+        row = self.rows[row_index]
+        if col_index >= len(row):
+            return None
+
+        return row[col_index]
+
+    def find_row_by_sample_code(self, sample_code: str) -> int | None:
+        sample_col = self.get_column_index("sampleCode")
+        if sample_col is None:
+            raise ValueError(f"В таблице '{self.name}' нет колонки sampleCode")
+
+        for i, row in enumerate(self.rows):
+            if sample_col < len(row) and normalize_text(row[sample_col]) == sample_code:
+                return i
+
+        return None
+
+
+# =============================================================================
+# openpyxl named ranges / template helpers
+# =============================================================================
+
+def read_defined_range_table(wb, defined_name: str) -> list[list[Any]]:
+    dn = wb.defined_names[defined_name]
+
+    for sheet_name, coord in dn.destinations:
+        ws = wb[sheet_name]
+        cell_range = ws[coord]
+        return [[cell.value for cell in row] for row in cell_range]
+
+    raise ValueError(f"Не найден именованный диапазон '{defined_name}'")
+
+
+def write_defined_range_table(
+    wb,
+    defined_name: str,
+    data: list[list[Any]],
+    data_row_count: int,
+) -> None:
+    dn = wb.defined_names[defined_name]
+
+    for sheet_name, coord in dn.destinations:
+        ws = wb[sheet_name]
+        cell_range = ws[coord]
+
+        for idx, (row_cells, row_data) in enumerate(zip(cell_range, data)):
+            if idx == 0:
+                continue
+
+            if idx > data_row_count:
+                break
+
+            for cell, value in zip(row_cells, row_data):
+                if value is not None:
+                    cell.value = value
+
+
+def write_defined_name_value(wb, defined_name: str, value: Any) -> None:
+    if value is None:
+        return
+
+    if defined_name not in wb.defined_names:
+        return
+
+    dn = wb.defined_names[defined_name]
+
+    for sheet_name, coord in dn.destinations:
+        top_left = coord.split(":")[0]
+        ws = wb[sheet_name]
+        ws[top_left] = value
+
+
+def hide_unused_rows_for_defined_table(
+    wb,
+    sheet_name: str,
+    defined_name: str,
+    used_data_rows: int,
+) -> None:
+    ws = wb[sheet_name]
+    dn = wb.defined_names[defined_name]
+
+    min_row = 0
+    max_row = 0
+
+    for _, coord in dn.destinations:
+        start, *rest = coord.replace("$", "").split(":")
+        end = rest[-1] if rest else start
+
+        _, r1 = coordinate_from_string(start)
+        _, r2 = coordinate_from_string(end)
+
+        if min_row == 0 or r1 < min_row:
+            min_row = r1
+
+        if max_row == 0 or r2 > max_row:
+            max_row = r2
+
+    if min_row == 0:
+        return
+
+    ws.row_dimensions[min_row].hidden = True
+
+    for r in range(min_row + used_data_rows + 1, max_row + 1):
+        ws.row_dimensions[r].hidden = True
+
+
+# =============================================================================
+# Mapping helpers
+# =============================================================================
+
+def build_act_map(table_data: list[list[Any]]) -> dict[str, dict[str, int]]:
+    """
+    По первой строке таблицы акта строит карту вида:
+        {
+            "LIF": {"samplecode": 0, ...},
+            "OP": {"deltapopenpct": 3, ...},
+            "locate": {"calc": 10}
+        }
+
+    Заголовки в шаблоне ожидаются вида:
+        LIF_sampleCode
+        OP_deltaPopenPCT
+        GC_gasvolumePCT
+        calc
+    """
+    result: dict[str, dict[str, int]] = {
+        "LIF": {},
+        "OP": {},
+        "BP": {},
+        "GC": {},
+        "locate": {},
+    }
+
+    if not table_data:
+        return result
+
+    for idx, col_name in enumerate(table_data[0]):
+        if not col_name:
+            continue
+
+        col_text = str(col_name).strip()
+
+        if col_text in ("-",):
+            continue
+
+        if col_text == "calc":
+            result["locate"]["calc"] = idx
+            continue
+
+        if "_" not in col_text:
+            continue
+
+        prefix, field = col_text.split("_", 1)
+        prefix = prefix.strip()
+        field = field.strip().lower()
+
+        if prefix not in result:
+            result[prefix] = {}
+
+        result[prefix][field] = idx
+
+    return result
+
+
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def to_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    if text == "":
+        return None
+
+    try:
+        return float(text.replace(",", "."))
+    except Exception:
+        return None
+
+
+def get_row_value(row: list[Any], col_map: dict[str, int], column_name: str) -> Any:
+    idx = col_map.get(column_name.lower())
+    if idx is None:
+        return None
+
+    if idx >= len(row):
+        return None
+
+    return row[idx]
+
+
+def first_non_empty(
+    rows: list[list[Any]],
+    col_map: dict[str, int],
+    column_name: str,
+) -> Any:
+    idx = col_map.get(column_name.lower())
+    if idx is None:
+        return None
+
+    for row in rows:
+        if idx < len(row) and row[idx] not in (None, ""):
+            return row[idx]
+
+    return None
+
+
+def min_max_dates(
+    rows: list[list[Any]],
+    col_map: dict[str, int],
+    column_name: str,
+) -> tuple[Any, Any]:
+    idx = col_map.get(column_name.lower())
+    if idx is None:
+        return None, None
+
+    min_date = None
+    max_date = None
+
+    for row in rows:
+        if idx >= len(row):
+            continue
+
+        value = row[idx]
+        if not value:
+            continue
+
+        if min_date is None or value < min_date:
+            min_date = value
+
+        if max_date is None or value > max_date:
+            max_date = value
+
+    return min_date, max_date
+
+
+def format_date_range(min_date: Any, max_date: Any) -> Any:
+    if min_date is None and max_date is None:
+        return None
+
+    if min_date is None:
+        return max_date
+
+    if max_date is None:
+        return min_date
+
+    if hasattr(min_date, "strftime") and hasattr(max_date, "strftime"):
+        if min_date.strftime("%d.%m.%Y") == max_date.strftime("%d.%m.%Y"):
+            return min_date.strftime("%d.%m.%Y")
+
+        return f"{min_date.strftime('%d.%m.%Y')} - {max_date.strftime('%d.%m.%Y')}"
+
+    if min_date == max_date:
+        return min_date
+
+    return f"{min_date} - {max_date}"
+
+
+# =============================================================================
+# Main logic
+# =============================================================================
+
+def create_quality_act(
+    *,
+    workbook: str,
+    template_path: str = DEFAULT_ACT_TEMPLATE,
+    output_dir: str | None = None,
+) -> QualityActReport:
+    start_time = time.time()
+
+    target_book = find_open_book(workbook)
+
+    if output_dir is None:
+        output_dir = str(Path(workbook).parent)
+
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+
+    today_str = datetime.today().strftime("%d-%m-%Y, %H-%M")
+    new_act_path = output_dir_path / f"Акт качества {today_str}.xlsx"
+
+    shutil.copy2(template_path, new_act_path)
+
+    logging.info("[Act] Читаем текущую книгу")
+
+    op_headers, op_rows = read_xlwings_table(
+        target_book,
+        sheet_name="OP_results",
+        table_name="OP_results",
+    )
+    bp_headers, bp_rows = read_xlwings_table(
+        target_book,
+        sheet_name="BP_results",
+        table_name="BP_results",
+    )
+    gc_headers, gc_rows = read_xlwings_table(
+        target_book,
+        sheet_name="GC_results",
+        table_name="GC_results",
+    )
+
+    lif_headers, lif_rows = read_xlwings_table(
+        target_book,
+        sheet_name="All_samples",
+        table_name="Append1",
+    )
+
+    results: dict[str, ResultTable] = {
+        "OP": ResultTable(op_headers, op_rows, "OP_results"),
+        "BP": ResultTable(bp_headers, bp_rows, "BP_results"),
+        "GC": ResultTable(gc_headers, gc_rows, "GC_results"),
+    }
+
+    lif_map = build_header_map(lif_headers)
+
+    require_columns(
+        lif_map,
+        [
+            "typeSampleShort",
+            "sampleCode",
+            "Project",
+            "Field",
+            "Well",
+        ],
+        "All_samples/Append1",
+    )
+
+    act_wb = load_workbook(new_act_path)
+    act_sheet = act_wb["Акт качества"]
+
+    gas_act_tbl = read_defined_range_table(act_wb, "GasActTable")
+    liq_act_tbl = read_defined_range_table(act_wb, "LiquidActTable")
+
+    gas_map = build_act_map(gas_act_tbl)
+    liq_map = build_act_map(liq_act_tbl)
+
+    min_result_date = None
+    max_result_date = None
+
+    gas_cur_row = 0
+    liq_cur_row = 0
+
+    # -------------------------------------------------------------------------
+    # 1. Заполняем LIF-часть из All_samples / Append1
+    # -------------------------------------------------------------------------
+
+    for lif_row in lif_rows:
+        sample_type = normalize_text(
+            get_row_value(lif_row, lif_map, "typeSampleShort")
+        )
+
+        if sample_type in GAS_SAMPLE_TYPES:
+            gas_cur_row += 1
+
+            if gas_cur_row >= len(gas_act_tbl):
+                raise ValueError("В GasActTable не хватает строк под газовые пробы")
+
+            for col_name, act_col_idx in gas_map["LIF"].items():
+                gas_act_tbl[gas_cur_row][act_col_idx] = get_row_value(
+                    lif_row,
+                    lif_map,
+                    col_name,
+                )
+
+        elif sample_type in LIQ_SAMPLE_TYPES:
+            liq_cur_row += 1
+
+            if liq_cur_row >= len(liq_act_tbl):
+                raise ValueError("В LiquidActTable не хватает строк под жидкостные пробы")
+
+            for col_name, act_col_idx in liq_map["LIF"].items():
+                liq_act_tbl[liq_cur_row][act_col_idx] = get_row_value(
+                    lif_row,
+                    lif_map,
+                    col_name,
+                )
+
+    # -------------------------------------------------------------------------
+    # 2. Подмешиваем результаты OP/BP/GC по sampleCode
+    # -------------------------------------------------------------------------
+
+    min_result_date, max_result_date = fill_result_blocks(
+        act_table=gas_act_tbl,
+        act_map=gas_map,
+        row_count=gas_cur_row,
+        results=results,
+        min_date=min_result_date,
+        max_date=max_result_date,
+    )
+
+    min_result_date, max_result_date = fill_result_blocks(
+        act_table=liq_act_tbl,
+        act_map=liq_map,
+        row_count=liq_cur_row,
+        results=results,
+        min_date=min_result_date,
+        max_date=max_result_date,
+    )
+
+    # -------------------------------------------------------------------------
+    # 3. Расчёт качества
+    # -------------------------------------------------------------------------
+
+    calculate_gas_quality(gas_act_tbl, gas_map, gas_cur_row)
+    calculate_liquid_quality(liq_act_tbl, liq_map, liq_cur_row)
+
+    # -------------------------------------------------------------------------
+    # 4. Записываем таблицы в акт
+    # -------------------------------------------------------------------------
+
+    write_defined_range_table(
+        act_wb,
+        "GasActTable",
+        gas_act_tbl,
+        gas_cur_row,
+    )
+
+    write_defined_range_table(
+        act_wb,
+        "LiquidActTable",
+        liq_act_tbl,
+        liq_cur_row,
+    )
+
+    # -------------------------------------------------------------------------
+    # 5. Заполняем именованные диапазоны шапки
+    # -------------------------------------------------------------------------
+
+    write_defined_name_value(
+        act_wb,
+        "dates",
+        format_date_range(min_result_date, max_result_date),
+    )
+
+    project = first_non_empty(lif_rows, lif_map, "Project")
+    field = first_non_empty(lif_rows, lif_map, "Field")
+    well = first_non_empty(lif_rows, lif_map, "Well")
+
+    if isinstance(well, float) and well.is_integer():
+        well_text = str(int(well))
+    else:
+        well_text = normalize_text(well)
+
+    project_str = f"{project}-{field}-{well_text}" if project and field and well_text else None
+    write_defined_name_value(act_wb, "project", project_str)
+
+    delivery_min, delivery_max = min_max_dates(lif_rows, lif_map, "deliveryDate")
+    write_defined_name_value(
+        act_wb,
+        "dateDelivery",
+        format_date_range(delivery_min, delivery_max),
+    )
+
+    transfer_min, transfer_max = min_max_dates(lif_rows, lif_map, "transferDate")
+    write_defined_name_value(
+        act_wb,
+        "dateSampling",
+        format_date_range(transfer_min, transfer_max),
+    )
+
+    write_defined_name_value(
+        act_wb,
+        "reservoir",
+        first_non_empty(lif_rows, lif_map, "reservoir"),
+    )
+
+    write_defined_name_value(
+        act_wb,
+        "FullNameDZO",
+        first_non_empty(lif_rows, lif_map, "FullNameDZO"),
+    )
+
+    write_defined_name_value(
+        act_wb,
+        "LU",
+        first_non_empty(lif_rows, lif_map, "LU"),
+    )
+
+    write_defined_name_value(
+        act_wb,
+        "Well",
+        well,
+    )
+
+    # -------------------------------------------------------------------------
+    # 6. Скрываем лишние строки
+    # -------------------------------------------------------------------------
+
+    hide_unused_rows_for_defined_table(
+        act_wb,
+        "Акт качества",
+        "LiquidActTable",
+        liq_cur_row,
+    )
+
+    hide_unused_rows_for_defined_table(
+        act_wb,
+        "Акт качества",
+        "GasActTable",
+        gas_cur_row,
+    )
+
+    act_wb.save(new_act_path)
+    act_wb.close()
+
+    elapsed = time.time() - start_time
+    logging.info("[Act] Готово: %s, %.2f сек", new_act_path, elapsed)
+
+    return QualityActReport(
+        ok=True,
+        message=f"Акт качества создан за {elapsed:.2f} сек",
+        output_path=str(new_act_path),
+        gas_rows=gas_cur_row,
+        liquid_rows=liq_cur_row,
+    )
+
+
+def fill_result_blocks(
+    *,
+    act_table: list[list[Any]],
+    act_map: dict[str, dict[str, int]],
+    row_count: int,
+    results: dict[str, ResultTable],
+    min_date: Any,
+    max_date: Any,
+) -> tuple[Any, Any]:
+    lif_sample_col = act_map["LIF"].get("samplecode")
+    if lif_sample_col is None:
+        return min_date, max_date
+
+    for row_num_act in range(1, row_count + 1):
+        sample_code = normalize_text(act_table[row_num_act][lif_sample_col])
+
+        for result_code, result_table in results.items():
+            if result_code not in act_map:
+                continue
+
+            if result_code in ("LIF", "locate"):
+                continue
+
+            result_fields = act_map.get(result_code, {})
+            if not result_fields:
+                continue
+
+            result_row_index = result_table.find_row_by_sample_code(sample_code)
+            if result_row_index is None:
+                continue
+
+            result_date = result_table.get_value(result_row_index, "date")
+
+            if result_date:
+                if min_date is None or result_date < min_date:
+                    min_date = result_date
+
+                if max_date is None or result_date > max_date:
+                    max_date = result_date
+
+            for col_name, act_col_idx in result_fields.items():
+                value = result_table.get_value(result_row_index, col_name)
+                act_table[row_num_act][act_col_idx] = value
+
+    return min_date, max_date
+
+
+def calculate_gas_quality(
+    gas_act_tbl: list[list[Any]],
+    gas_map: dict[str, dict[str, int]],
+    gas_cur_row: int,
+) -> None:
+    calc_col = gas_map.get("locate", {}).get("calc")
+    delta_col = gas_map.get("OP", {}).get("deltapopenpct")
+    vliq_col = gas_map.get("OP", {}).get("vliqphase")
+
+    if calc_col is None or delta_col is None or vliq_col is None:
+        return
+
+    for row in range(1, gas_cur_row + 1):
+        delta_popen = to_float_or_none(gas_act_tbl[row][delta_col])
+        v_liq_ph = to_float_or_none(gas_act_tbl[row][vliq_col])
+
+        if v_liq_ph is None:
+            v_liq_ph = 0.0
+
+        if delta_popen is None:
+            continue
+
+        if delta_popen < -10 or v_liq_ph > 1.0:
+            gas_act_tbl[row][calc_col] = "Некачественная"
+        elif 10 > delta_popen > -10 and v_liq_ph == 0:
+            gas_act_tbl[row][calc_col] = "Качественная"
+        else:
+            gas_act_tbl[row][calc_col] = "Качественная с отклонением"
+
+
+def calculate_liquid_quality(
+    liq_act_tbl: list[list[Any]],
+    liq_map: dict[str, dict[str, int]],
+    liq_cur_row: int,
+) -> None:
+    calc_col = liq_map.get("locate", {}).get("calc")
+    delta_col = liq_map.get("OP", {}).get("deltapopenpct")
+    gas_pct_col = liq_map.get("GC", {}).get("gasvolumepct")
+
+    if calc_col is None or delta_col is None or gas_pct_col is None:
+        return
+
+    for row in range(1, liq_cur_row + 1):
+        delta_popen = to_float_or_none(liq_act_tbl[row][delta_col])
+        pct_gas_ph = to_float_or_none(liq_act_tbl[row][gas_pct_col])
+
+        if pct_gas_ph is None:
+            pct_gas_ph = 0.0
+
+        if delta_popen is None:
+            continue
+
+        if delta_popen < -10 or pct_gas_ph >= 5.0:
+            liq_act_tbl[row][calc_col] = "Некачественная"
+        elif 10 > delta_popen > -10 and pct_gas_ph == 0:
+            liq_act_tbl[row][calc_col] = "Качественная"
+        else:
+            liq_act_tbl[row][calc_col] = "Качественная с отклонением"
+
+
+# =============================================================================
+# JSON / CLI
+# =============================================================================
+
+def run_json(
+    *,
+    workbook: str,
+    template_path: str = DEFAULT_ACT_TEMPLATE,
+    output_dir: str | None = None,
+) -> str:
+    try:
+        report = create_quality_act(
+            workbook=workbook,
+            template_path=template_path,
+            output_dir=output_dir,
+        )
+
+        return json.dumps(asdict(report), ensure_ascii=False, indent=2)
+
+    except Exception as exc:
+        traceback_text = traceback.format_exc()
+        error_type = type(exc).__name__
+        message = str(exc)
+
+        write_error_log(
+            message=message,
+            error_type=error_type,
+            traceback_text=traceback_text,
+        )
+
+        report = QualityActReport(
+            ok=False,
+            message=(
+                f"{error_type}: {message}\n\n"
+                f"Полный traceback записан в лог:\n{ERROR_LOG_PATH}"
+            ),
+            error_type=error_type,
+            traceback=None,
+        )
+
+        return json.dumps(asdict(report), ensure_ascii=False, indent=2)
+
+
+def load_payload(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Создание акта качества из текущей книги Excel"
+    )
+
+    parser.add_argument(
+        "--payload",
+        type=Path,
+        default=None,
+        help="Путь к JSON payload. Если указан, остальные параметры можно не передавать.",
+    )
+
+    parser.add_argument(
+        "--workbook",
+        default=None,
+        help="Путь к уже открытой книге с формами",
+    )
+
+    parser.add_argument(
+        "--template",
+        default=DEFAULT_ACT_TEMPLATE,
+        help="Путь к шаблону акта качества",
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Папка для сохранения созданного акта. По умолчанию папка книги.",
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.payload:
+        data = load_payload(args.payload)
+
+        workbook = data["workbook"]
+        template_path = data.get("template", args.template)
+        output_dir = data.get("output_dir", args.output_dir)
+    else:
+        if not args.workbook:
+            parser.error("Нужно указать --workbook или --payload")
+
+        workbook = args.workbook
+        template_path = args.template
+        output_dir = args.output_dir
+
+    json_result = run_json(
+        workbook=workbook,
+        template_path=template_path,
+        output_dir=output_dir,
+    )
+
+    print(json_result)
+
+    try:
+        parsed = json.loads(json_result)
+        return 0 if parsed.get("ok") else 1
+    except Exception:
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
