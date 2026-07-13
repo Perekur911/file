@@ -3,9 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import shutil
 import sys
-import time
 import traceback
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -13,65 +13,56 @@ from pathlib import Path
 from typing import Any
 
 import xlwings as xw
-from openpyxl import load_workbook
-from openpyxl.utils.cell import coordinate_from_string
 
 
 # =============================================================================
-# Настройки по умолчанию
+# Настройки
 # =============================================================================
 
-DEFAULT_ACT_TEMPLATE = (
-    r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\Работа\База данных результатов\Акт качества.xlsx"
-)
+BASE_PROJECTS_DIR = r"L:\LRC\common_data\ФЛЮИДЫ\ПТИ\PROJECTS"
+CLEAN_V22_TEMPLATE = r"L:\LRC\common_data\ФЛЮИДЫ\ПТИ\sqlite-excel\clean_form_v22.xlsx"
 
 PROJECT_DIR = Path(__file__).resolve().parent
-ERROR_LOG_PATH = PROJECT_DIR / "create_quality_act_errors.log"
+LOG_PATH = PROJECT_DIR / "migrate_v21_to_v22.log"
 
+STUDIES = ["AP", "BP", "GC", "GOR", "SSF", "OP", "EMV"]
 
-GAS_SAMPLE_TYPES = {"GS", "DG", "PNG", "SHFLU", "WHG"}
-LIQ_SAMPLE_TYPES = {"LS", "DEC"}
+UNPROTECT_PASSWORDS = ("1984", "9184", "")
+PROTECT_PASSWORD = "1984"
 
+SKIP_RESULT_FIELDS = {
+    "datetimesync",
+    "page",
+}
 
-# =============================================================================
-# Report
-# =============================================================================
+SKIP_FIELD_PREFIXES = (
+    "resultid",
+    "rowid",
+)
 
-@dataclass
-class QualityActReport:
-    ok: bool
-    message: str
-    output_path: str | None = None
-    gas_rows: int = 0
-    liquid_rows: int = 0
-    error_type: str | None = None
-    traceback: str | None = None
-
-
-# =============================================================================
-# Logging
-# =============================================================================
-
-def write_error_log(
-    *,
-    message: str,
-    error_type: str,
-    traceback_text: str,
-) -> None:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    with ERROR_LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write("\n" + "=" * 100 + "\n")
-        f.write(f"datetime: {now}\n")
-        f.write(f"error_type: {error_type}\n")
-        f.write(f"message: {message}\n")
-        f.write("-" * 100 + "\n")
-        f.write(traceback_text)
-        f.write("\n")
-
+OP_SKIP_FIELDS = {
+    "page",
+    "datetimesync",
+    "typeSampler",
+    "volumeSampler",
+    "numberSampler",
+    "regime",
+    "transferDate",
+    "PsamplingMPa",
+    "Tsampling",
+    "resultIdOP",
+    "PopenMPa",
+    "PendMPa",
+    "BP_bpMPa",
+    "BP_deltaPCT",
+    "natureLiq",
+    "deltaPopenPCT",
+    "PopenMPaT",
+    "typeSample"
+}
 
 logging.basicConfig(
-    filename=PROJECT_DIR / "create_quality_act.log",
+    filename=LOG_PATH,
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     filemode="a",
@@ -80,836 +71,795 @@ logging.basicConfig(
 
 
 # =============================================================================
-# xlwings helpers
+# Reports
 # =============================================================================
 
-def find_open_book(workbook: str) -> xw.Book:
-    target = str(Path(workbook)).lower()
-    target_name = Path(workbook).name.lower()
+@dataclass
+class ProjectMigrationReport:
+    project: str
+    ok: bool
+    message: str
+    folder: str | None = None
+    old_file: str | None = None
+    new_file: str | None = None
+    forms_copied: int = 0
+    named_values_copied: int = 0
+    table_values_copied: int = 0
+    warnings: list[str] | None = None
+    error_type: str | None = None
 
-    for app in xw.apps:
-        for book in app.books:
-            full_name = str(book.fullname).lower() if book.fullname else ""
-            book_name = book.name.lower()
 
-            if full_name == target or book_name == target_name:
-                return book
+@dataclass
+class MigrationReport:
+    ok: bool
+    message: str
+    projects: list[ProjectMigrationReport]
 
-    raise FileNotFoundError(
-        f"Открытая книга Excel не найдена: {workbook}. "
-        f"Открой книгу с формами перед запуском скрипта."
+
+# =============================================================================
+# Project parsing / search
+# =============================================================================
+
+def parse_project_input(text: str) -> list[str]:
+    text = text.strip()
+
+    if not text:
+        raise ValueError("Не указан проект или диапазон проектов")
+
+    text = re.sub(r"\s*\.{2,3}\s*", "...", text)
+    parts = re.split(r"[,\s;]+", text)
+
+    result: list[str] = []
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if "..." in part:
+            start, end = part.split("...", 1)
+            result.extend(expand_project_range(start, end))
+        else:
+            result.append(normalize_project_code(part))
+
+    # Убираем дубли, порядок сохраняем
+    seen = set()
+    unique: list[str] = []
+
+    for project in result:
+        if project not in seen:
+            unique.append(project)
+            seen.add(project)
+
+    return unique
+
+
+def normalize_project_code(value: str) -> str:
+    value = value.strip().upper()
+
+    if not re.fullmatch(r"\d{2}-F\d+", value):
+        raise ValueError(f"Некорректный формат проекта: {value}")
+
+    prefix, num = value.split("F", 1)
+    return f"{prefix}F{int(num):0{len(num)}d}"
+
+
+def expand_project_range(start: str, end: str) -> list[str]:
+    start = normalize_project_code(start)
+    end = normalize_project_code(end)
+
+    m1 = re.fullmatch(r"(\d{2}-F)(\d+)", start)
+    m2 = re.fullmatch(r"(\d{2}-F)(\d+)", end)
+
+    if not m1 or not m2:
+        raise ValueError(f"Некорректный диапазон проектов: {start}...{end}")
+
+    prefix1, n1_text = m1.groups()
+    prefix2, n2_text = m2.groups()
+
+    if prefix1 != prefix2:
+        raise ValueError(f"Диапазон проектов должен быть внутри одного года/префикса: {start}...{end}")
+
+    n1 = int(n1_text)
+    n2 = int(n2_text)
+    width = max(len(n1_text), len(n2_text))
+
+    if n2 < n1:
+        raise ValueError(f"Конец диапазона меньше начала: {start}...{end}")
+
+    return [f"{prefix1}{n:0{width}d}" for n in range(n1, n2 + 1)]
+
+
+def find_project_folder(base_dir: Path, project_code: str, recursive: bool = False) -> Path:
+    if not base_dir.exists():
+        raise FileNotFoundError(f"Основная папка проектов не найдена: {base_dir}")
+
+    candidates = []
+
+    iterator = base_dir.rglob("*") if recursive else base_dir.iterdir()
+
+    for path in iterator:
+        if path.is_dir() and path.name.upper().startswith(project_code.upper()):
+            candidates.append(path)
+
+    if not candidates:
+        raise FileNotFoundError(f"Не найдена папка проекта, начинающаяся на {project_code}")
+
+    candidates = sorted(candidates, key=lambda p: len(p.name))
+
+    if len(candidates) > 1:
+        logging.warning(
+            "Для проекта %s найдено несколько папок, беру первую: %s; все варианты: %s",
+            project_code,
+            candidates[0],
+            candidates,
+        )
+
+    return candidates[0]
+
+
+def find_v21_file(project_folder: Path) -> Path:
+    folder_name = project_folder.name.lower()
+
+    files = []
+
+    for path in project_folder.iterdir():
+        if not path.is_file():
+            continue
+
+        if path.name.startswith("~$"):
+            continue
+
+        if path.suffix.lower() not in (".xlsx", ".xlsm"):
+            continue
+
+        name_lower = path.name.lower()
+
+        if name_lower.startswith(folder_name) and "_v21" in name_lower:
+            files.append(path)
+
+    if not files:
+        raise FileNotFoundError(
+            f"В папке '{project_folder}' не найден файл, начинающийся с имени папки и содержащий '_v21'"
+        )
+
+    if len(files) > 1:
+        raise ValueError(
+            f"В папке '{project_folder}' найдено несколько v21-файлов: {files}"
+        )
+
+    return files[0]
+
+
+def make_v22_file(project_folder: Path, template_path: Path, overwrite: bool = False) -> Path:
+    new_path = project_folder / f"{project_folder.name}_v22.xlsx"
+
+    if new_path.exists():
+        if not overwrite:
+            raise FileExistsError(
+                f"Файл v22 уже существует: {new_path}. "
+                f"Для перезаписи запусти с --overwrite"
+            )
+
+        new_path.unlink()
+
+    shutil.copy2(template_path, new_path)
+
+    return new_path
+
+
+# =============================================================================
+# Excel helpers
+# =============================================================================
+
+def open_book(app: xw.App, path: Path, read_only: bool) -> xw.Book:
+    return app.books.open(
+        str(path),
+        read_only=read_only,
+        update_links=False,
+        ignore_read_only_recommended=True,
     )
 
 
-def read_xlwings_table(
-    book: xw.Book,
-    *,
-    sheet_name: str,
-    table_name: str,
-) -> tuple[list[str], list[list[Any]]]:
+def unprotect_all_sheets(book: xw.Book) -> None:
+    for sheet in book.sheets:
+        for password in UNPROTECT_PASSWORDS:
+            try:
+                sheet.api.Unprotect(Password=password)
+                break
+            except Exception:
+                pass
+
+def protect_all_sheets(book: xw.Book) -> None:
+    for sheet in book.sheets:
+        try:
+            sheet.api.Protect(
+                Password=PROTECT_PASSWORD,
+                DrawingObjects=True,
+                Contents=True,
+                Scenarios=True,
+                UserInterfaceOnly=True,
+                AllowFiltering=True,
+            )
+        except Exception as exc:
+            logging.warning("Не удалось защитить лист %s: %s", sheet.name, exc)
+
+def get_named_range(book: xw.Book, name: str):
+    try:
+        return book.api.Names.Item(name).RefersToRange
+    except Exception:
+        try:
+            return book.names[name].refers_to_range.api
+        except Exception:
+            return None
+
+
+def named_range_exists(book: xw.Book, name: str) -> bool:
+    return get_named_range(book, name) is not None
+
+
+def get_list_object(book: xw.Book, sheet_name: str, table_name: str):
     try:
         sheet = book.sheets[sheet_name]
     except Exception as exc:
         raise ValueError(f"В книге '{book.name}' нет листа '{sheet_name}'") from exc
 
     try:
-        table = sheet.tables[table_name]
+        return sheet.api.ListObjects.Item(table_name)
     except Exception as exc:
         raise ValueError(
             f"На листе '{sheet_name}' нет умной таблицы '{table_name}'"
         ) from exc
 
-    values = table.range.value
 
-    if not values:
-        return [], []
-
-    if not isinstance(values[0], list):
-        values = [values]
-
-    headers = [normalize_header(v) for v in values[0]]
-    rows = values[1:]
-
-    return headers, rows
-
-
-def build_header_map(headers: list[str]) -> dict[str, int]:
-    return {
-        str(header).strip().lower(): idx
-        for idx, header in enumerate(headers)
-        if str(header).strip()
-    }
-
-
-def require_columns(
-    header_map: dict[str, int],
-    columns: list[str],
-    source_name: str,
-) -> None:
-    missing = [
-        col for col in columns
-        if col.lower() not in header_map
-    ]
-
-    if missing:
-        raise ValueError(
-            f"В '{source_name}' не найдены обязательные колонки: {missing}. "
-            f"Фактические колонки: {list(header_map.keys())}"
-        )
-
-
-def normalize_header(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-# =============================================================================
-# Result table wrapper
-# =============================================================================
-
-class ResultTable:
-    def __init__(self, headers: list[str], rows: list[list[Any]], name: str):
-        self.headers = headers
-        self.rows = rows
-        self.name = name
-        self.map = build_header_map(headers)
-
-    def get_column_index(self, column_name: str) -> int | None:
-        return self.map.get(column_name.lower())
-
-    def get_value(self, row_index: int, column_name: str) -> Any:
-        col_index = self.get_column_index(column_name)
-        if col_index is None:
-            return None
-
-        row = self.rows[row_index]
-        if col_index >= len(row):
-            return None
-
-        return row[col_index]
-
-    def find_row_by_sample_code(self, sample_code: str) -> int | None:
-        sample_col = self.get_column_index("sampleCode")
-        if sample_col is None:
-            raise ValueError(f"В таблице '{self.name}' нет колонки sampleCode")
-
-        for i, row in enumerate(self.rows):
-            if sample_col < len(row) and normalize_text(row[sample_col]) == sample_code:
-                return i
-
-        return None
-
-
-# =============================================================================
-# openpyxl named ranges / template helpers
-# =============================================================================
-
-def read_defined_range_table(wb, defined_name: str) -> list[list[Any]]:
-    dn = wb.defined_names[defined_name]
-
-    for sheet_name, coord in dn.destinations:
-        ws = wb[sheet_name]
-        cell_range = ws[coord]
-        return [[cell.value for cell in row] for row in cell_range]
-
-    raise ValueError(f"Не найден именованный диапазон '{defined_name}'")
-
-
-def write_defined_range_table(
-    wb,
-    defined_name: str,
-    data: list[list[Any]],
-    data_row_count: int,
-) -> None:
-    dn = wb.defined_names[defined_name]
-
-    for sheet_name, coord in dn.destinations:
-        ws = wb[sheet_name]
-        cell_range = ws[coord]
-
-        for idx, (row_cells, row_data) in enumerate(zip(cell_range, data)):
-            if idx == 0:
-                continue
-
-            if idx > data_row_count:
-                break
-
-            for cell, value in zip(row_cells, row_data):
-                if value is not None:
-                    cell.value = value
-
-
-def write_defined_name_value(wb, defined_name: str, value: Any) -> None:
-    if value is None:
-        return
-
-    if defined_name not in wb.defined_names:
-        return
-
-    dn = wb.defined_names[defined_name]
-
-    for sheet_name, coord in dn.destinations:
-        top_left = coord.split(":")[0]
-        ws = wb[sheet_name]
-        ws[top_left] = value
-
-
-def hide_unused_rows_for_defined_table(
-    wb,
-    sheet_name: str,
-    defined_name: str,
-    used_data_rows: int,
-) -> None:
-    ws = wb[sheet_name]
-    dn = wb.defined_names[defined_name]
-
-    min_row = 0
-    max_row = 0
-
-    for _, coord in dn.destinations:
-        start, *rest = coord.replace("$", "").split(":")
-        end = rest[-1] if rest else start
-
-        _, r1 = coordinate_from_string(start)
-        _, r2 = coordinate_from_string(end)
-
-        if min_row == 0 or r1 < min_row:
-            min_row = r1
-
-        if max_row == 0 or r2 > max_row:
-            max_row = r2
-
-    if min_row == 0:
-        return
-
-    ws.row_dimensions[min_row].hidden = True
-
-    for r in range(min_row + used_data_rows + 1, max_row + 1):
-        ws.row_dimensions[r].hidden = True
-
-
-# =============================================================================
-# Mapping helpers
-# =============================================================================
-
-def build_act_map(table_data: list[list[Any]]) -> dict[str, dict[str, int]]:
-    """
-    По первой строке таблицы акта строит карту вида:
-        {
-            "LIF": {"samplecode": 0, ...},
-            "OP": {"deltapopenpct": 3, ...},
-            "locate": {"calc": 10}
-        }
-
-    Заголовки в шаблоне ожидаются вида:
-        LIF_sampleCode
-        OP_deltaPopenPCT
-        GC_gasvolumePCT
-        calc
-    """
-    result: dict[str, dict[str, int]] = {
-        "LIF": {},
-        "OP": {},
-        "BP": {},
-        "GC": {},
-        "locate": {},
-    }
-
-    if not table_data:
-        return result
-
-    for idx, col_name in enumerate(table_data[0]):
-        if not col_name:
-            continue
-
-        col_text = str(col_name).strip()
-
-        if col_text in ("-",):
-            continue
-
-        if col_text == "calc":
-            result["locate"]["calc"] = idx
-            continue
-
-        if "_" not in col_text:
-            continue
-
-        prefix, field = col_text.split("_", 1)
-        prefix = prefix.strip()
-        field = field.strip().lower()
-
-        if prefix not in result:
-            result[prefix] = {}
-
-        result[prefix][field] = idx
-
-    return result
-
-
-def normalize_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def to_float_or_none(value: Any) -> float | None:
-    if value is None:
-        return None
-
-    text = str(value).strip()
-
-    if text == "":
-        return None
-
+def try_get_list_object(book: xw.Book, sheet_name: str, table_name: str):
     try:
-        return float(text.replace(",", "."))
+        return get_list_object(book, sheet_name, table_name)
     except Exception:
         return None
 
 
-def get_row_value(row: list[Any], col_map: dict[str, int], column_name: str) -> Any:
-    idx = col_map.get(column_name.lower())
-    if idx is None:
+def list_object_exists(book: xw.Book, sheet_name: str, table_name: str) -> bool:
+    return try_get_list_object(book, sheet_name, table_name) is not None
+
+
+def read_table_headers(table) -> list[str]:
+    values = table.HeaderRowRange.Value
+
+    if values is None:
+        return []
+
+    if isinstance(values, tuple) and values and isinstance(values[0], tuple):
+        raw = values[0]
+    else:
+        raw = values
+
+    return [str(v).strip() if v is not None else "" for v in raw]
+
+
+def header_index_map(table) -> dict[str, int]:
+    headers = read_table_headers(table)
+    return {h: idx + 1 for idx, h in enumerate(headers) if h}
+
+
+def ensure_table_rows(table, row_count: int) -> None:
+    if row_count <= 0:
+        return
+
+    while table.ListRows.Count < row_count:
+        table.ListRows.Add()
+
+
+def cell_has_formula(cell) -> bool:
+    try:
+        if bool(cell.MergeCells):
+            top_left = cell.MergeArea.Cells(1, 1)
+            return bool(top_left.HasFormula)
+
+        return bool(cell.HasFormula)
+    except Exception:
+        return False
+
+
+def get_cell_value_from_range(rng):
+    if rng is None:
         return None
 
-    if idx >= len(row):
-        return None
+    try:
+        if bool(rng.MergeCells):
+            return rng.MergeArea.Cells(1, 1).Value
 
-    return row[idx]
-
-
-def first_non_empty(
-    rows: list[list[Any]],
-    col_map: dict[str, int],
-    column_name: str,
-) -> Any:
-    idx = col_map.get(column_name.lower())
-    if idx is None:
-        return None
-
-    for row in rows:
-        if idx < len(row) and row[idx] not in (None, ""):
-            return row[idx]
-
-    return None
+        return rng.Cells(1, 1).Value
+    except Exception:
+        return rng.Value
 
 
-def min_max_dates(
-    rows: list[list[Any]],
-    col_map: dict[str, int],
-    column_name: str,
-) -> tuple[Any, Any]:
-    idx = col_map.get(column_name.lower())
-    if idx is None:
-        return None, None
+def write_value_to_range_if_not_formula(target_rng, value: Any) -> bool:
+    if target_rng is None:
+        return False
 
-    min_date = None
-    max_date = None
+    try:
+        if bool(target_rng.MergeCells):
+            write_cell = target_rng.MergeArea.Cells(1, 1)
+        else:
+            write_cell = target_rng.Cells(1, 1)
 
-    for row in rows:
-        if idx >= len(row):
-            continue
+        if cell_has_formula(write_cell):
+            return False
 
-        value = row[idx]
-        if not value:
-            continue
+        write_cell.Value = value
+        return True
 
-        if min_date is None or value < min_date:
-            min_date = value
-
-        if max_date is None or value > max_date:
-            max_date = value
-
-    return min_date, max_date
+    except Exception:
+        return False
 
 
-def format_date_range(min_date: Any, max_date: Any) -> Any:
-    if min_date is None and max_date is None:
-        return None
+def copy_named_range_value(
+    old_book: xw.Book,
+    new_book: xw.Book,
+    range_name: str,
+) -> bool:
+    old_rng = get_named_range(old_book, range_name)
+    new_rng = get_named_range(new_book, range_name)
 
-    if min_date is None:
-        return max_date
+    if old_rng is None or new_rng is None:
+        return False
 
-    if max_date is None:
-        return min_date
+    value = get_cell_value_from_range(old_rng)
 
-    if hasattr(min_date, "strftime") and hasattr(max_date, "strftime"):
-        if min_date.strftime("%d.%m.%Y") == max_date.strftime("%d.%m.%Y"):
-            return min_date.strftime("%d.%m.%Y")
-
-        return f"{min_date.strftime('%d.%m.%Y')} - {max_date.strftime('%d.%m.%Y')}"
-
-    if min_date == max_date:
-        return min_date
-
-    return f"{min_date} - {max_date}"
+    return write_value_to_range_if_not_formula(new_rng, value)
 
 
-# =============================================================================
-# Main logic
-# =============================================================================
+def should_skip_field(field_name: str) -> bool:
+    f = str(field_name).strip().lower()
 
-def create_quality_act(
+    if not f:
+        return True
+
+    if f in SKIP_RESULT_FIELDS:
+        return True
+
+    return any(f.startswith(prefix) for prefix in SKIP_FIELD_PREFIXES)
+
+
+def copy_table_values_by_common_columns(
+    old_table,
+    new_table,
     *,
-    workbook: str,
-    template_path: str = DEFAULT_ACT_TEMPLATE,
-    output_dir: str | None = None,
-) -> QualityActReport:
-    start_time = time.time()
+    skip_fields: set[str] | None = None,
+) -> int:
+    if skip_fields is None:
+        skip_fields = set()
 
-    target_book = find_open_book(workbook)
+    old_map = header_index_map(old_table)
+    new_map = header_index_map(new_table)
 
-    if output_dir is None:
-        output_dir = str(Path(workbook).parent)
+    common_headers = [
+        header
+        for header in new_map.keys()
+        if header in old_map
+        and header.lower() not in skip_fields
+        and not should_skip_field(header)
+    ]
 
-    output_dir_path = Path(output_dir)
-    output_dir_path.mkdir(parents=True, exist_ok=True)
+    if not common_headers:
+        return 0
 
-    today_str = datetime.today().strftime("%d-%m-%Y, %H-%M")
-    new_act_path = output_dir_path / f"Акт качества {today_str}.xlsx"
+    old_rows_count = old_table.ListRows.Count
 
-    shutil.copy2(template_path, new_act_path)
+    if old_rows_count == 0:
+        return 0
 
-    logging.info("[Act] Читаем текущую книгу")
+    ensure_table_rows(new_table, old_rows_count)
 
-    op_headers, op_rows = read_xlwings_table(
-        target_book,
-        sheet_name="OP_results",
-        table_name="OP_results",
+    old_body = old_table.DataBodyRange
+    new_body = new_table.DataBodyRange
+
+    if old_body is None or new_body is None:
+        return 0
+
+    copied = 0
+
+    for row_idx in range(1, old_rows_count + 1):
+        for header in common_headers:
+            old_col = old_map[header]
+            new_col = new_map[header]
+
+            src_cell = old_body.Cells(row_idx, old_col)
+            dst_cell = new_body.Cells(row_idx, new_col)
+
+            if cell_has_formula(dst_cell):
+                continue
+
+            dst_cell.Value = src_cell.Value
+            copied += 1
+
+    return copied
+
+
+# =============================================================================
+# Study migration
+# =============================================================================
+
+def source_form_table_name(study: str, form_index: int) -> str:
+    if study in ("GOR", "SSF"):
+        return f"{study}_{form_index}"
+
+    return f"{study}_source_{form_index}"
+
+
+def migrate_named_range_study(
+    *,
+    old_book: xw.Book,
+    new_book: xw.Book,
+    study: str,
+    warnings: list[str],
+) -> tuple[int, int, int]:
+    """
+    Переносит обычные формы:
+    AP, BP, GC, GOR, SSF, EMV.
+
+    Parent-поля берутся по заголовкам новой таблицы <study>_results.
+    Child/source-таблицы копируются по общим заголовкам таблиц формы.
+    """
+    forms_copied = 0
+    named_values_copied = 0
+    table_values_copied = 0
+
+    result_table = try_get_list_object(
+        new_book,
+        f"{study}_results",
+        f"{study}_results",
     )
-    bp_headers, bp_rows = read_xlwings_table(
-        target_book,
-        sheet_name="BP_results",
-        table_name="BP_results",
+
+    if result_table is None:
+        warnings.append(f"{study}: не найдена новая таблица {study}_results, пропускаю")
+        return 0, 0, 0
+
+    result_fields = read_table_headers(result_table)
+    form_index = 1
+
+    while named_range_exists(old_book, f"{study}_{form_index}_sampleCode"):
+        if not named_range_exists(new_book, f"{study}_{form_index}_sampleCode"):
+            warnings.append(
+                f"{study}_{form_index}: в новой форме нет именованного диапазона sampleCode, форма пропущена"
+            )
+            form_index += 1
+            continue
+
+        form_has_any_data = False
+
+        for field in result_fields:
+            if should_skip_field(field):
+                continue
+
+            range_name = f"{study}_{form_index}_{field}"
+
+            if not named_range_exists(old_book, range_name):
+                continue
+
+            if not named_range_exists(new_book, range_name):
+                continue
+
+            if copy_named_range_value(old_book, new_book, range_name):
+                named_values_copied += 1
+                form_has_any_data = True
+
+        old_src_table_name = source_form_table_name(study, form_index)
+        new_src_table_name = source_form_table_name(study, form_index)
+
+        old_src_table = try_get_list_object(old_book, study, old_src_table_name)
+        new_src_table = try_get_list_object(new_book, study, new_src_table_name)
+
+        if old_src_table is not None and new_src_table is not None:
+            copied = copy_table_values_by_common_columns(
+                old_src_table,
+                new_src_table,
+                skip_fields={"page"},
+            )
+            table_values_copied += copied
+
+            if copied > 0:
+                form_has_any_data = True
+
+        elif old_src_table is not None and new_src_table is None:
+            warnings.append(
+                f"{study}_{form_index}: в старой форме есть таблица {old_src_table_name}, "
+                f"а в новой не найдена"
+            )
+
+        if form_has_any_data:
+            forms_copied += 1
+
+        form_index += 1
+
+    return forms_copied, named_values_copied, table_values_copied
+
+
+def migrate_op_table(
+    *,
+    old_book: xw.Book,
+    new_book: xw.Book,
+    warnings: list[str],
+) -> tuple[int, int]:
+    """
+    OP — особый случай: форма OP сама является умной таблицей.
+    """
+    old_table = try_get_list_object(old_book, "OP", "OP")
+    new_table = try_get_list_object(new_book, "OP", "OP")
+
+    if old_table is None:
+        warnings.append("OP: в старой книге не найдена таблица OP")
+        return 0, 0
+
+    if new_table is None:
+        warnings.append("OP: в новой книге не найдена таблица OP")
+        return 0, 0
+
+    copied = copy_table_values_by_common_columns(
+        old_table,
+        new_table,
+        skip_fields=OP_SKIP_FIELDS,
     )
-    gc_headers, gc_rows = read_xlwings_table(
-        target_book,
-        sheet_name="GC_results",
-        table_name="GC_results",
-    )
 
-    lif_headers, lif_rows = read_xlwings_table(
-        target_book,
-        sheet_name="All_samples",
-        table_name="Append1",
-    )
+    forms_copied = old_table.ListRows.Count if copied > 0 else 0
 
-    results: dict[str, ResultTable] = {
-        "OP": ResultTable(op_headers, op_rows, "OP_results"),
-        "BP": ResultTable(bp_headers, bp_rows, "BP_results"),
-        "GC": ResultTable(gc_headers, gc_rows, "GC_results"),
-    }
+    return forms_copied, copied
 
-    lif_map = build_header_map(lif_headers)
 
-    require_columns(
-        lif_map,
-        [
-            "typeSampleShort",
-            "sampleCode",
-            "Project",
-            "Field",
-            "Well",
-        ],
-        "All_samples/Append1",
-    )
+def migrate_workbook_data(
+    *,
+    old_book: xw.Book,
+    new_book: xw.Book,
+) -> tuple[int, int, int, list[str]]:
+    warnings: list[str] = []
 
-    act_wb = load_workbook(new_act_path)
-    act_sheet = act_wb["Акт качества"]
+    total_forms = 0
+    total_named = 0
+    total_table_values = 0
 
-    gas_act_tbl = read_defined_range_table(act_wb, "GasActTable")
-    liq_act_tbl = read_defined_range_table(act_wb, "LiquidActTable")
+    unprotect_all_sheets(new_book)
 
-    gas_map = build_act_map(gas_act_tbl)
-    liq_map = build_act_map(liq_act_tbl)
+    for study in STUDIES:
+        logging.info("Миграция исследования %s", study)
 
-    min_result_date = None
-    max_result_date = None
+        if study == "OP":
+            forms, table_values = migrate_op_table(
+                old_book=old_book,
+                new_book=new_book,
+                warnings=warnings,
+            )
 
-    gas_cur_row = 0
-    liq_cur_row = 0
+            total_forms += forms
+            total_table_values += table_values
+            continue
 
-    # -------------------------------------------------------------------------
-    # 1. Заполняем LIF-часть из All_samples / Append1
-    # -------------------------------------------------------------------------
-
-    for lif_row in lif_rows:
-        sample_type = normalize_text(
-            get_row_value(lif_row, lif_map, "typeSampleShort")
+        forms, named_values, table_values = migrate_named_range_study(
+            old_book=old_book,
+            new_book=new_book,
+            study=study,
+            warnings=warnings,
         )
 
-        if sample_type in GAS_SAMPLE_TYPES:
-            gas_cur_row += 1
+        total_forms += forms
+        total_named += named_values
+        total_table_values += table_values
 
-            if gas_cur_row >= len(gas_act_tbl):
-                raise ValueError("В GasActTable не хватает строк под газовые пробы")
-
-            for col_name, act_col_idx in gas_map["LIF"].items():
-                gas_act_tbl[gas_cur_row][act_col_idx] = get_row_value(
-                    lif_row,
-                    lif_map,
-                    col_name,
-                )
-
-        elif sample_type in LIQ_SAMPLE_TYPES:
-            liq_cur_row += 1
-
-            if liq_cur_row >= len(liq_act_tbl):
-                raise ValueError("В LiquidActTable не хватает строк под жидкостные пробы")
-
-            for col_name, act_col_idx in liq_map["LIF"].items():
-                liq_act_tbl[liq_cur_row][act_col_idx] = get_row_value(
-                    lif_row,
-                    lif_map,
-                    col_name,
-                )
-
-    # -------------------------------------------------------------------------
-    # 2. Подмешиваем результаты OP/BP/GC по sampleCode
-    # -------------------------------------------------------------------------
-
-    min_result_date, max_result_date = fill_result_blocks(
-        act_table=gas_act_tbl,
-        act_map=gas_map,
-        row_count=gas_cur_row,
-        results=results,
-        min_date=min_result_date,
-        max_date=max_result_date,
-    )
-
-    min_result_date, max_result_date = fill_result_blocks(
-        act_table=liq_act_tbl,
-        act_map=liq_map,
-        row_count=liq_cur_row,
-        results=results,
-        min_date=min_result_date,
-        max_date=max_result_date,
-    )
-
-    # -------------------------------------------------------------------------
-    # 3. Расчёт качества
-    # -------------------------------------------------------------------------
-
-    calculate_gas_quality(gas_act_tbl, gas_map, gas_cur_row)
-    calculate_liquid_quality(liq_act_tbl, liq_map, liq_cur_row)
-
-    # -------------------------------------------------------------------------
-    # 4. Записываем таблицы в акт
-    # -------------------------------------------------------------------------
-
-    write_defined_range_table(
-        act_wb,
-        "GasActTable",
-        gas_act_tbl,
-        gas_cur_row,
-    )
-
-    write_defined_range_table(
-        act_wb,
-        "LiquidActTable",
-        liq_act_tbl,
-        liq_cur_row,
-    )
-
-    # -------------------------------------------------------------------------
-    # 5. Заполняем именованные диапазоны шапки
-    # -------------------------------------------------------------------------
-
-    write_defined_name_value(
-        act_wb,
-        "dates",
-        format_date_range(min_result_date, max_result_date),
-    )
-
-    project = first_non_empty(lif_rows, lif_map, "Project")
-    field = first_non_empty(lif_rows, lif_map, "Field")
-    well = first_non_empty(lif_rows, lif_map, "Well")
-
-    if isinstance(well, float) and well.is_integer():
-        well_text = str(int(well))
-    else:
-        well_text = normalize_text(well)
-
-    project_str = f"{project}-{field}-{well_text}" if project and field and well_text else None
-    write_defined_name_value(act_wb, "project", project_str)
-
-    delivery_min, delivery_max = min_max_dates(lif_rows, lif_map, "deliveryDate")
-    write_defined_name_value(
-        act_wb,
-        "dateDelivery",
-        format_date_range(delivery_min, delivery_max),
-    )
-
-    transfer_min, transfer_max = min_max_dates(lif_rows, lif_map, "transferDate")
-    write_defined_name_value(
-        act_wb,
-        "dateSampling",
-        format_date_range(transfer_min, transfer_max),
-    )
-
-    write_defined_name_value(
-        act_wb,
-        "reservoir",
-        first_non_empty(lif_rows, lif_map, "reservoir"),
-    )
-
-    write_defined_name_value(
-        act_wb,
-        "FullNameDZO",
-        first_non_empty(lif_rows, lif_map, "FullNameDZO"),
-    )
-
-    write_defined_name_value(
-        act_wb,
-        "LU",
-        first_non_empty(lif_rows, lif_map, "LU"),
-    )
-
-    write_defined_name_value(
-        act_wb,
-        "Well",
-        well,
-    )
-
-    # -------------------------------------------------------------------------
-    # 6. Скрываем лишние строки
-    # -------------------------------------------------------------------------
-
-    hide_unused_rows_for_defined_table(
-        act_wb,
-        "Акт качества",
-        "LiquidActTable",
-        liq_cur_row,
-    )
-
-    hide_unused_rows_for_defined_table(
-        act_wb,
-        "Акт качества",
-        "GasActTable",
-        gas_cur_row,
-    )
-
-    act_wb.save(new_act_path)
-    act_wb.close()
-
-    elapsed = time.time() - start_time
-    logging.info("[Act] Готово: %s, %.2f сек", new_act_path, elapsed)
-
-    return QualityActReport(
-        ok=True,
-        message=f"Акт качества создан за {elapsed:.2f} сек",
-        output_path=str(new_act_path),
-        gas_rows=gas_cur_row,
-        liquid_rows=liq_cur_row,
-    )
-
-
-def fill_result_blocks(
-    *,
-    act_table: list[list[Any]],
-    act_map: dict[str, dict[str, int]],
-    row_count: int,
-    results: dict[str, ResultTable],
-    min_date: Any,
-    max_date: Any,
-) -> tuple[Any, Any]:
-    lif_sample_col = act_map["LIF"].get("samplecode")
-    if lif_sample_col is None:
-        return min_date, max_date
-
-    for row_num_act in range(1, row_count + 1):
-        sample_code = normalize_text(act_table[row_num_act][lif_sample_col])
-
-        for result_code, result_table in results.items():
-            if result_code not in act_map:
-                continue
-
-            if result_code in ("LIF", "locate"):
-                continue
-
-            result_fields = act_map.get(result_code, {})
-            if not result_fields:
-                continue
-
-            result_row_index = result_table.find_row_by_sample_code(sample_code)
-            if result_row_index is None:
-                continue
-
-            result_date = result_table.get_value(result_row_index, "date")
-
-            if result_date:
-                if min_date is None or result_date < min_date:
-                    min_date = result_date
-
-                if max_date is None or result_date > max_date:
-                    max_date = result_date
-
-            for col_name, act_col_idx in result_fields.items():
-                value = result_table.get_value(result_row_index, col_name)
-                act_table[row_num_act][act_col_idx] = value
-
-    return min_date, max_date
-
-
-def calculate_gas_quality(
-    gas_act_tbl: list[list[Any]],
-    gas_map: dict[str, dict[str, int]],
-    gas_cur_row: int,
-) -> None:
-    calc_col = gas_map.get("locate", {}).get("calc")
-    delta_col = gas_map.get("OP", {}).get("deltapopenpct")
-    vliq_col = gas_map.get("OP", {}).get("vliqphase")
-
-    if calc_col is None or delta_col is None or vliq_col is None:
-        return
-
-    for row in range(1, gas_cur_row + 1):
-        delta_popen = to_float_or_none(gas_act_tbl[row][delta_col])
-        v_liq_ph = to_float_or_none(gas_act_tbl[row][vliq_col])
-
-        if v_liq_ph is None:
-            v_liq_ph = 0.0
-
-        if delta_popen is None:
-            continue
-
-        if delta_popen < -10 or v_liq_ph > 1.0:
-            gas_act_tbl[row][calc_col] = "Некачественная"
-        elif 10 > delta_popen > -10 and v_liq_ph == 0:
-            gas_act_tbl[row][calc_col] = "Качественная"
-        else:
-            gas_act_tbl[row][calc_col] = "Качественная с отклонением"
-
-
-def calculate_liquid_quality(
-    liq_act_tbl: list[list[Any]],
-    liq_map: dict[str, dict[str, int]],
-    liq_cur_row: int,
-) -> None:
-    calc_col = liq_map.get("locate", {}).get("calc")
-    delta_col = liq_map.get("OP", {}).get("deltapopenpct")
-    gas_pct_col = liq_map.get("GC", {}).get("gasvolumepct")
-
-    if calc_col is None or delta_col is None or gas_pct_col is None:
-        return
-
-    for row in range(1, liq_cur_row + 1):
-        delta_popen = to_float_or_none(liq_act_tbl[row][delta_col])
-        pct_gas_ph = to_float_or_none(liq_act_tbl[row][gas_pct_col])
-
-        if pct_gas_ph is None:
-            pct_gas_ph = 0.0
-
-        if delta_popen is None:
-            continue
-
-        if delta_popen < -10 or pct_gas_ph >= 5.0:
-            liq_act_tbl[row][calc_col] = "Некачественная"
-        elif 10 > delta_popen > -10 and pct_gas_ph == 0:
-            liq_act_tbl[row][calc_col] = "Качественная"
-        else:
-            liq_act_tbl[row][calc_col] = "Качественная с отклонением"
+    return total_forms, total_named, total_table_values, warnings
 
 
 # =============================================================================
-# JSON / CLI
+# Project processing
+# =============================================================================
+
+def migrate_one_project(
+    *,
+    app: xw.App,
+    project_code: str,
+    base_dir: Path,
+    template_path: Path,
+    recursive: bool,
+    overwrite: bool,
+) -> ProjectMigrationReport:
+    warnings: list[str] = []
+
+    old_book = None
+    new_book = None
+
+    try:
+        folder = find_project_folder(base_dir, project_code, recursive=recursive)
+        old_file = find_v21_file(folder)
+        new_file = make_v22_file(folder, template_path, overwrite=overwrite)
+
+        logging.info("Проект %s: folder=%s", project_code, folder)
+        logging.info("Проект %s: old=%s", project_code, old_file)
+        logging.info("Проект %s: new=%s", project_code, new_file)
+
+        old_book = open_book(app, old_file, read_only=True)
+        new_book = open_book(app, new_file, read_only=False)
+
+        forms, named_values, table_values, warnings = migrate_workbook_data(
+            old_book=old_book,
+            new_book=new_book,
+        )
+
+        protect_all_sheets(new_book)
+
+        new_book.save()
+
+        return ProjectMigrationReport(
+            project=project_code,
+            ok=True,
+            message="Миграция выполнена",
+            folder=str(folder),
+            old_file=str(old_file),
+            new_file=str(new_file),
+            forms_copied=forms,
+            named_values_copied=named_values,
+            table_values_copied=table_values,
+            warnings=warnings,
+        )
+
+    except Exception as exc:
+        logging.exception("Ошибка миграции проекта %s", project_code)
+
+        return ProjectMigrationReport(
+            project=project_code,
+            ok=False,
+            message=str(exc),
+            warnings=warnings,
+            error_type=type(exc).__name__,
+        )
+
+    finally:
+        if old_book is not None:
+            try:
+                old_book.close()
+            except Exception:
+                pass
+
+        if new_book is not None:
+            try:
+                new_book.close()
+            except Exception:
+                pass
+
+
+def run_migration(
+    *,
+    projects_text: str,
+    base_dir: str = BASE_PROJECTS_DIR,
+    template_path: str = CLEAN_V22_TEMPLATE,
+    recursive: bool = False,
+    overwrite: bool = False,
+) -> MigrationReport:
+    projects = parse_project_input(projects_text)
+
+    base_path = Path(base_dir)
+    template = Path(template_path)
+
+    if not template.exists():
+        raise FileNotFoundError(f"Чистая форма v22 не найдена: {template}")
+
+    app = xw.App(visible=False, add_book=False)
+
+    try:
+        app.display_alerts = False
+        app.screen_updating = False
+
+        reports: list[ProjectMigrationReport] = []
+
+        for project_code in projects:
+            report = migrate_one_project(
+                app=app,
+                project_code=project_code,
+                base_dir=base_path,
+                template_path=template,
+                recursive=recursive,
+                overwrite=overwrite,
+            )
+            reports.append(report)
+
+        ok = all(r.ok for r in reports)
+
+        return MigrationReport(
+            ok=ok,
+            message="Миграция завершена" if ok else "Миграция завершена с ошибками",
+            projects=reports,
+        )
+
+    finally:
+        try:
+            app.quit()
+        except Exception:
+            pass
+
+
+# =============================================================================
+# CLI / JSON
 # =============================================================================
 
 def run_json(
     *,
-    workbook: str,
-    template_path: str = DEFAULT_ACT_TEMPLATE,
-    output_dir: str | None = None,
+    projects_text: str,
+    base_dir: str = BASE_PROJECTS_DIR,
+    template_path: str = CLEAN_V22_TEMPLATE,
+    recursive: bool = False,
+    overwrite: bool = False,
 ) -> str:
     try:
-        report = create_quality_act(
-            workbook=workbook,
+        report = run_migration(
+            projects_text=projects_text,
+            base_dir=base_dir,
             template_path=template_path,
-            output_dir=output_dir,
+            recursive=recursive,
+            overwrite=overwrite,
         )
 
         return json.dumps(asdict(report), ensure_ascii=False, indent=2)
 
     except Exception as exc:
-        traceback_text = traceback.format_exc()
-        error_type = type(exc).__name__
-        message = str(exc)
+        logging.exception("Критическая ошибка миграции")
 
-        write_error_log(
-            message=message,
-            error_type=error_type,
-            traceback_text=traceback_text,
-        )
-
-        report = QualityActReport(
+        report = MigrationReport(
             ok=False,
-            message=(
-                f"{error_type}: {message}\n\n"
-                f"Полный traceback записан в лог:\n{ERROR_LOG_PATH}"
-            ),
-            error_type=error_type,
-            traceback=None,
+            message=f"{type(exc).__name__}: {exc}. Подробности в логе: {LOG_PATH}",
+            projects=[],
         )
 
         return json.dumps(asdict(report), ensure_ascii=False, indent=2)
 
 
-def load_payload(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8-sig") as f:
-        return json.load(f)
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Создание акта качества из текущей книги Excel"
+        description="Миграция данных из старой формы v21 в новую чистую форму v22"
     )
 
     parser.add_argument(
-        "--payload",
-        type=Path,
+        "--projects",
         default=None,
-        help="Путь к JSON payload. Если указан, остальные параметры можно не передавать.",
+        help="Проект или диапазон проектов. Например: 26-F001 или 26-F001...26-F015",
     )
 
     parser.add_argument(
-        "--workbook",
-        default=None,
-        help="Путь к уже открытой книге с формами",
+        "--base-dir",
+        default=BASE_PROJECTS_DIR,
+        help="Папка, внутри которой искать папки проектов",
     )
 
     parser.add_argument(
         "--template",
-        default=DEFAULT_ACT_TEMPLATE,
-        help="Путь к шаблону акта качества",
+        default=CLEAN_V22_TEMPLATE,
+        help="Путь к чистой форме v22",
     )
 
     parser.add_argument(
-        "--output-dir",
-        default=None,
-        help="Папка для сохранения созданного акта. По умолчанию папка книги.",
+        "--recursive",
+        action="store_true",
+        help="Искать папки проектов рекурсивно внутри base-dir",
+    )
+
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Перезаписывать уже существующий файл *_v22.xlsx",
     )
 
     args = parser.parse_args(argv)
 
-    if args.payload:
-        data = load_payload(args.payload)
+    projects_text = args.projects
 
-        workbook = data["workbook"]
-        template_path = data.get("template", args.template)
-        output_dir = data.get("output_dir", args.output_dir)
-    else:
-        if not args.workbook:
-            parser.error("Нужно указать --workbook или --payload")
-
-        workbook = args.workbook
-        template_path = args.template
-        output_dir = args.output_dir
+    if not projects_text:
+        projects_text = input(
+            "Введите проект или диапазон проектов, например 26-F001 или 26-F001...26-F015: "
+        ).strip()
 
     json_result = run_json(
-        workbook=workbook,
-        template_path=template_path,
-        output_dir=output_dir,
+        projects_text=projects_text,
+        base_dir=args.base_dir,
+        template_path=args.template,
+        recursive=args.recursive,
+        overwrite=args.overwrite,
     )
 
     print(json_result)
