@@ -1,128 +1,54 @@
-Да, это лучше сделать через общий фильтр should_skip_field, чтобы analyseNumber не переносился вообще нигде: ни в именованные диапазоны, ни в OP-таблицу, ни в source-таблицы, если вдруг где-то такое поле встретится.
+Да, это лучше добавить прямо в скрипт переноса в migrate_one_project, после открытия новой книги и разблокировки листов.
 
-В скрипте миграции найди блок:
+1. Добавь константы
 
-SKIP_RESULT_FIELDS = {
-    "datetimesync",
-    "page",
-}
+Рядом с остальными константами:
+
+PROJECT_CELL_SHEET = "OP"
+PROJECT_CELL_ADDRESS = "B6"
+
+2. Добавь helper
+
+Где-нибудь рядом с Excel helpers:
+
+def set_current_project_in_form(book: xw.Book, project_code: str) -> None:
+    sheet = book.sheets[PROJECT_CELL_SHEET]
+    sheet.range(PROJECT_CELL_ADDRESS).value = project_code
+
+3. В migrate_one_project добавь вызов
+
+Найди место:
+
+old_book = open_book(app, old_file, read_only=True)
+new_book = open_book(app, new_file, read_only=False)
+
+forms, named_values, table_values, warnings = migrate_workbook_data(
+    old_book=old_book,
+    new_book=new_book,
+)
 
 Замени на:
 
-SKIP_RESULT_FIELDS = {
-    "datetimesync",
-    "page",
-    "analysenumber",
-}
+old_book = open_book(app, old_file, read_only=True)
+new_book = open_book(app, new_file, read_only=False)
 
-Больше ничего менять не нужно, потому что у тебя уже есть проверка:
+unprotect_all_sheets(new_book)
 
-def should_skip_field(field_name: str) -> bool:
-    f = str(field_name).strip().lower()
+set_current_project_in_form(new_book, project_code)
 
-    if not f:
-        return True
+forms, named_values, table_values, warnings = migrate_workbook_data(
+    old_book=old_book,
+    new_book=new_book,
+)
 
-    if f in SKIP_RESULT_FIELDS:
-        return True
+migrate_workbook_data у тебя тоже вызывает unprotect_all_sheets(new_book), это не страшно. Если хочешь аккуратнее, можно оставить только один вызов, но минимально — так нормально.
 
-    return any(f.startswith(prefix) for prefix in SKIP_FIELD_PREFIXES)
+В итоге для проекта:
 
-А перенос parent-полей идёт через:
+25-F123
 
-if should_skip_field(field):
-    continue
+в новой форме будет записано:
 
-и перенос таблиц тоже через:
+OP!B6 = 25-F123
 
-and not should_skip_field(header)
-
-То есть после добавления "analysenumber" поле:
-
-analyseNumber
-
-превратится в:
-
-analysenumber
-
-и будет пропущено везде.
-
-Если уже были созданы _v22.xlsx, для повторного переноса запускай мигратор с --overwrite, иначе старые созданные файлы не перезапишутся.    recursive: bool,
-    overwrite: bool,
-) -> ProjectMigrationReport:
-    project_start = time.perf_counter()
-    progress(f"{project_code}: начинаю перенос")
-
-    warnings: list[str] = []
-
-    old_book = None
-    new_book = None
-
-    try:
-        folder = find_project_folder(base_dir, project_code, recursive=recursive)
-        old_file = find_v21_file(folder)
-        new_file = make_v22_file(folder, template_path, overwrite=overwrite)
-
-        logging.info("Проект %s: folder=%s", project_code, folder)
-        logging.info("Проект %s: old=%s", project_code, old_file)
-        logging.info("Проект %s: new=%s", project_code, new_file)
-
-        old_book = open_book(app, old_file, read_only=True)
-        new_book = open_book(app, new_file, read_only=False)
-
-        forms, named_values, table_values, warnings = migrate_workbook_data(
-            old_book=old_book,
-            new_book=new_book,
-        )
-
-        protect_all_sheets(new_book)
-
-        new_book.save()
-
-        elapsed = time.perf_counter() - project_start
-        progress(f"{project_code}: перенос завершён за {elapsed:.2f} сек")
-
-        return ProjectMigrationReport(
-            project=project_code,
-            ok=True,
-            message=f"Миграция выполнена за {elapsed:.2f} сек",
-            folder=str(folder),
-            old_file=str(old_file),
-            new_file=str(new_file),
-            forms_copied=forms,
-            named_values_copied=named_values,
-            table_values_copied=table_values,
-            warnings=warnings,
-        )
-
-    except Exception as exc:
-        elapsed = time.perf_counter() - project_start
-        progress(f"{project_code}: ошибка переноса через {elapsed:.2f} сек")
-
-        logging.exception("Ошибка миграции проекта %s", project_code)
-
-        return ProjectMigrationReport(
-            project=project_code,
-            ok=False,
-            message=f"{exc}. Время до ошибки: {elapsed:.2f} сек",
-            warnings=warnings,
-            error_type=type(exc).__name__,
-        )
-
-    finally:
-        if old_book is not None:
-            try:
-                old_book.close()
-            except Exception:
-                pass
-
-        if new_book is not None:
-            try:
-                new_book.close()
-            except Exception:
-                pass
-
-Так в консоли будет видно примерно:
-
-[14:21:03] 26-F001: начинаю перенос
-[14:21:28] 26-F001: перенос завершён за 25.41 сек
+И потом уже пойдёт перенос данных, защита листов обратно и сохранение.
