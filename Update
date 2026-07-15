@@ -1,40 +1,53 @@
-Да, добавь замер прямо в migrate_one_project.
+Да, это лучше сделать через общий фильтр should_skip_field, чтобы analyseNumber не переносился вообще нигде: ни в именованные диапазоны, ни в OP-таблицу, ни в source-таблицы, если вдруг где-то такое поле встретится.
 
-1. Вверху добавь импорт
+В скрипте миграции найди блок:
 
-import time
+SKIP_RESULT_FIELDS = {
+    "datetimesync",
+    "page",
+}
 
-2. Добавь helper для print, если его ещё нет
+Замени на:
 
-def progress(message: str) -> None:
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+SKIP_RESULT_FIELDS = {
+    "datetimesync",
+    "page",
+    "analysenumber",
+}
 
-3. В migrate_one_project добавь замер времени
+Больше ничего менять не нужно, потому что у тебя уже есть проверка:
 
-В самое начало функции, перед warnings:
+def should_skip_field(field_name: str) -> bool:
+    f = str(field_name).strip().lower()
 
-project_start = time.perf_counter()
-progress(f"{project_code}: начинаю перенос")
+    if not f:
+        return True
 
-И после успешного сохранения, перед return ProjectMigrationReport(...):
+    if f in SKIP_RESULT_FIELDS:
+        return True
 
-elapsed = time.perf_counter() - project_start
-progress(f"{project_code}: перенос завершён за {elapsed:.2f} сек")
+    return any(f.startswith(prefix) for prefix in SKIP_FIELD_PREFIXES)
 
-В except тоже добавь:
+А перенос parent-полей идёт через:
 
-elapsed = time.perf_counter() - project_start
-progress(f"{project_code}: ошибка переноса через {elapsed:.2f} сек")
+if should_skip_field(field):
+    continue
 
-Итоговый кусок будет примерно такой:
+и перенос таблиц тоже через:
 
-def migrate_one_project(
-    *,
-    app: xw.App,
-    project_code: str,
-    base_dir: Path,
-    template_path: Path,
-    recursive: bool,
+and not should_skip_field(header)
+
+То есть после добавления "analysenumber" поле:
+
+analyseNumber
+
+превратится в:
+
+analysenumber
+
+и будет пропущено везде.
+
+Если уже были созданы _v22.xlsx, для повторного переноса запускай мигратор с --overwrite, иначе старые созданные файлы не перезапишутся.    recursive: bool,
     overwrite: bool,
 ) -> ProjectMigrationReport:
     project_start = time.perf_counter()
