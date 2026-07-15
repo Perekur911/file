@@ -1,85 +1,115 @@
-Да, это мой косяк в логике мигратора: я сделал одну функцию source_form_table_name(...) и использовал её и для старой, и для новой формы.
+Да, добавь замер прямо в migrate_one_project.
 
-А нужно разделить:
+1. Вверху добавь импорт
 
-старая форма:
-GOR_1, GOR_2...
-SSF_1, SSF_2...
+import time
 
-новая форма:
-GOR_source_1, GOR_source_2...
-SSF_source_1, SSF_source_2...
+2. Добавь helper для print, если его ещё нет
 
-Исправление
+def progress(message: str) -> None:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
 
-Замени эту функцию:
+3. В migrate_one_project добавь замер времени
 
-def source_form_table_name(study: str, form_index: int) -> str:
-    if study in ("GOR", "SSF"):
-        return f"{study}_{form_index}"
+В самое начало функции, перед warnings:
 
-    return f"{study}_source_{form_index}"
+project_start = time.perf_counter()
+progress(f"{project_code}: начинаю перенос")
 
-на две функции:
+И после успешного сохранения, перед return ProjectMigrationReport(...):
 
-def old_source_form_table_name(study: str, form_index: int) -> str:
-    if study in ("GOR", "SSF"):
-        return f"{study}_{form_index}"
+elapsed = time.perf_counter() - project_start
+progress(f"{project_code}: перенос завершён за {elapsed:.2f} сек")
 
-    return f"{study}_source_{form_index}"
+В except тоже добавь:
 
+elapsed = time.perf_counter() - project_start
+progress(f"{project_code}: ошибка переноса через {elapsed:.2f} сек")
 
-def new_source_form_table_name(study: str, form_index: int) -> str:
-    return f"{study}_source_{form_index}"
+Итоговый кусок будет примерно такой:
 
-Потом в migrate_named_range_study замени этот кусок:
+def migrate_one_project(
+    *,
+    app: xw.App,
+    project_code: str,
+    base_dir: Path,
+    template_path: Path,
+    recursive: bool,
+    overwrite: bool,
+) -> ProjectMigrationReport:
+    project_start = time.perf_counter()
+    progress(f"{project_code}: начинаю перенос")
 
-old_src_table_name = source_form_table_name(study, form_index)
-new_src_table_name = source_form_table_name(study, form_index)
+    warnings: list[str] = []
 
-на:
+    old_book = None
+    new_book = None
 
-old_src_table_name = old_source_form_table_name(study, form_index)
-new_src_table_name = new_source_form_table_name(study, form_index)
+    try:
+        folder = find_project_folder(base_dir, project_code, recursive=recursive)
+        old_file = find_v21_file(folder)
+        new_file = make_v22_file(folder, template_path, overwrite=overwrite)
 
-Итоговый кусок должен быть такой:
+        logging.info("Проект %s: folder=%s", project_code, folder)
+        logging.info("Проект %s: old=%s", project_code, old_file)
+        logging.info("Проект %s: new=%s", project_code, new_file)
 
-old_src_table_name = old_source_form_table_name(study, form_index)
-new_src_table_name = new_source_form_table_name(study, form_index)
+        old_book = open_book(app, old_file, read_only=True)
+        new_book = open_book(app, new_file, read_only=False)
 
-old_src_table = try_get_list_object(old_book, study, old_src_table_name)
-new_src_table = try_get_list_object(new_book, study, new_src_table_name)
+        forms, named_values, table_values, warnings = migrate_workbook_data(
+            old_book=old_book,
+            new_book=new_book,
+        )
 
-if old_src_table is not None and new_src_table is not None:
-    copied = copy_table_values_by_common_columns(
-        old_src_table,
-        new_src_table,
-        skip_fields={"page"},
-    )
-    table_values_copied += copied
+        protect_all_sheets(new_book)
 
-    if copied > 0:
-        form_has_any_data = True
+        new_book.save()
 
-elif old_src_table is not None and new_src_table is None:
-    warnings.append(
-        f"{study}_{form_index}: в старой форме есть таблица {old_src_table_name}, "
-        f"а в новой не найдена {new_src_table_name}"
-    )
+        elapsed = time.perf_counter() - project_start
+        progress(f"{project_code}: перенос завершён за {elapsed:.2f} сек")
 
-После этого для GOR будет:
+        return ProjectMigrationReport(
+            project=project_code,
+            ok=True,
+            message=f"Миграция выполнена за {elapsed:.2f} сек",
+            folder=str(folder),
+            old_file=str(old_file),
+            new_file=str(new_file),
+            forms_copied=forms,
+            named_values_copied=named_values,
+            table_values_copied=table_values,
+            warnings=warnings,
+        )
 
-old: GOR_1
-new: GOR_source_1
+    except Exception as exc:
+        elapsed = time.perf_counter() - project_start
+        progress(f"{project_code}: ошибка переноса через {elapsed:.2f} сек")
 
-для SSF:
+        logging.exception("Ошибка миграции проекта %s", project_code)
 
-old: SSF_1
-new: SSF_source_1
+        return ProjectMigrationReport(
+            project=project_code,
+            ok=False,
+            message=f"{exc}. Время до ошибки: {elapsed:.2f} сек",
+            warnings=warnings,
+            error_type=type(exc).__name__,
+        )
 
-а для остальных:
+    finally:
+        if old_book is not None:
+            try:
+                old_book.close()
+            except Exception:
+                pass
 
-old: AP_source_1
-new: AP_source_1
+        if new_book is not None:
+            try:
+                new_book.close()
+            except Exception:
+                pass
 
-Предупреждения должны уйти, и исходные таблицы GOR/SSF начнут переноситься.
+Так в консоли будет видно примерно:
+
+[14:21:03] 26-F001: начинаю перенос
+[14:21:28] 26-F001: перенос завершён за 25.41 сек
