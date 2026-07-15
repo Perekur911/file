@@ -1,0 +1,85 @@
+Да, это мой косяк в логике мигратора: я сделал одну функцию source_form_table_name(...) и использовал её и для старой, и для новой формы.
+
+А нужно разделить:
+
+старая форма:
+GOR_1, GOR_2...
+SSF_1, SSF_2...
+
+новая форма:
+GOR_source_1, GOR_source_2...
+SSF_source_1, SSF_source_2...
+
+Исправление
+
+Замени эту функцию:
+
+def source_form_table_name(study: str, form_index: int) -> str:
+    if study in ("GOR", "SSF"):
+        return f"{study}_{form_index}"
+
+    return f"{study}_source_{form_index}"
+
+на две функции:
+
+def old_source_form_table_name(study: str, form_index: int) -> str:
+    if study in ("GOR", "SSF"):
+        return f"{study}_{form_index}"
+
+    return f"{study}_source_{form_index}"
+
+
+def new_source_form_table_name(study: str, form_index: int) -> str:
+    return f"{study}_source_{form_index}"
+
+Потом в migrate_named_range_study замени этот кусок:
+
+old_src_table_name = source_form_table_name(study, form_index)
+new_src_table_name = source_form_table_name(study, form_index)
+
+на:
+
+old_src_table_name = old_source_form_table_name(study, form_index)
+new_src_table_name = new_source_form_table_name(study, form_index)
+
+Итоговый кусок должен быть такой:
+
+old_src_table_name = old_source_form_table_name(study, form_index)
+new_src_table_name = new_source_form_table_name(study, form_index)
+
+old_src_table = try_get_list_object(old_book, study, old_src_table_name)
+new_src_table = try_get_list_object(new_book, study, new_src_table_name)
+
+if old_src_table is not None and new_src_table is not None:
+    copied = copy_table_values_by_common_columns(
+        old_src_table,
+        new_src_table,
+        skip_fields={"page"},
+    )
+    table_values_copied += copied
+
+    if copied > 0:
+        form_has_any_data = True
+
+elif old_src_table is not None and new_src_table is None:
+    warnings.append(
+        f"{study}_{form_index}: в старой форме есть таблица {old_src_table_name}, "
+        f"а в новой не найдена {new_src_table_name}"
+    )
+
+После этого для GOR будет:
+
+old: GOR_1
+new: GOR_source_1
+
+для SSF:
+
+old: SSF_1
+new: SSF_source_1
+
+а для остальных:
+
+old: AP_source_1
+new: AP_source_1
+
+Предупреждения должны уйти, и исходные таблицы GOR/SSF начнут переноситься.
