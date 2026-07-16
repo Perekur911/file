@@ -1,54 +1,29 @@
-Да, это лучше добавить прямо в скрипт переноса в migrate_one_project, после открытия новой книги и разблокировки листов.
+CREATE TABLE EquipmentModel (
+    equipmentModelId   INTEGER PRIMARY KEY,
+    typeEquipmentId    INTEGER,
+    shortNameEquipment TEXT,
+    fullNameEquipment  TEXT,
+    mnemonicName       TEXT,
+    Manufacturer       TEXT,
+    UnitPressure       TEXT,
+    absolutePressure   INTEGER,
+    UnitVolume         TEXT,
+    VolumeCC           REAL
+);
 
-1. Добавь константы
+CREATE TABLE EquipmentUnit (
+    equipmentUnitId    INTEGER PRIMARY KEY,
+    equipmentModelId   INTEGER,
+    serialNumber       TEXT,
+    inventoryNumber    TEXT,
+    shortNumber        TEXT,
+    status             TEXT,
+    CellFactor         REAL,
+    UnitPressure       TEXT,
+    absolutePressure   INTEGER,
+    UnitVolume         TEXT,
+    VolumeCC           REAL,
 
-Рядом с остальными константами:
-
-PROJECT_CELL_SHEET = "OP"
-PROJECT_CELL_ADDRESS = "B6"
-
-2. Добавь helper
-
-Где-нибудь рядом с Excel helpers:
-
-def set_current_project_in_form(book: xw.Book, project_code: str) -> None:
-    sheet = book.sheets[PROJECT_CELL_SHEET]
-    sheet.range(PROJECT_CELL_ADDRESS).value = project_code
-
-3. В migrate_one_project добавь вызов
-
-Найди место:
-
-old_book = open_book(app, old_file, read_only=True)
-new_book = open_book(app, new_file, read_only=False)
-
-forms, named_values, table_values, warnings = migrate_workbook_data(
-    old_book=old_book,
-    new_book=new_book,
-)
-
-Замени на:
-
-old_book = open_book(app, old_file, read_only=True)
-new_book = open_book(app, new_file, read_only=False)
-
-unprotect_all_sheets(new_book)
-
-set_current_project_in_form(new_book, project_code)
-
-forms, named_values, table_values, warnings = migrate_workbook_data(
-    old_book=old_book,
-    new_book=new_book,
-)
-
-migrate_workbook_data у тебя тоже вызывает unprotect_all_sheets(new_book), это не страшно. Если хочешь аккуратнее, можно оставить только один вызов, но минимально — так нормально.
-
-В итоге для проекта:
-
-25-F123
-
-в новой форме будет записано:
-
-OP!B6 = 25-F123
-
-И потом уже пойдёт перенос данных, защита листов обратно и сохранение.
+    FOREIGN KEY (equipmentModelId)
+        REFERENCES EquipmentModel(equipmentModelId)
+);
