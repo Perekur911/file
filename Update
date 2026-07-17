@@ -1,29 +1,82 @@
-CREATE TABLE EquipmentModel (
-    equipmentModelId   INTEGER PRIMARY KEY,
-    typeEquipmentId    INTEGER,
-    shortNameEquipment TEXT,
-    fullNameEquipment  TEXT,
-    mnemonicName       TEXT,
-    Manufacturer       TEXT,
-    UnitPressure       TEXT,
-    absolutePressure   INTEGER,
-    UnitVolume         TEXT,
-    VolumeCC           REAL
-);
+Да, для refresh_tasks.py лучше поставить запись в лог в run_json() в блок except, точно так же, как мы сделали в sync.py.
 
-CREATE TABLE EquipmentUnit (
-    equipmentUnitId    INTEGER PRIMARY KEY,
-    equipmentModelId   INTEGER,
-    serialNumber       TEXT,
-    inventoryNumber    TEXT,
-    shortNumber        TEXT,
-    status             TEXT,
-    CellFactor         REAL,
-    UnitPressure       TEXT,
-    absolutePressure   INTEGER,
-    UnitVolume         TEXT,
-    VolumeCC           REAL,
+У тебя сейчас run_json() ловит ошибку и возвращает весь traceback прямо в JSON. Вот это место и надо заменить. 
 
-    FOREIGN KEY (equipmentModelId)
-        REFERENCES EquipmentModel(equipmentModelId)
-);
+1. Добавь импорт
+
+Вверху:
+
+import logging
+
+2. Добавь константы и функцию лога
+
+После импортов или после блока колонок:
+
+PROJECT_DIR = Path(__file__).resolve().parent
+ERROR_LOG_PATH = PROJECT_DIR / "refresh_tasks_errors.log"
+
+
+def write_error_log(
+    *,
+    message: str,
+    error_type: str,
+    traceback_text: str,
+) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with ERROR_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write("\n" + "=" * 100 + "\n")
+        f.write(f"datetime: {now}\n")
+        f.write(f"error_type: {error_type}\n")
+        f.write(f"message: {message}\n")
+        f.write("-" * 100 + "\n")
+        f.write(traceback_text)
+        f.write("\n")
+
+3. Замени run_json() на такой
+
+def run_json(**kwargs: Any) -> str:
+    try:
+        report = refresh_tasks(**kwargs)
+        return json.dumps(asdict(report), ensure_ascii=False, indent=2)
+
+    except Exception as exc:
+        traceback_text = traceback.format_exc()
+        error_type = type(exc).__name__
+        message = str(exc)
+
+        write_error_log(
+            message=message,
+            error_type=error_type,
+            traceback_text=traceback_text,
+        )
+
+        report = RefreshTasksReport(
+            ok=False,
+            message=(
+                f"{error_type}: {message}\n\n"
+                f"Полный traceback записан в лог:\n{ERROR_LOG_PATH}"
+            ),
+            project=str(kwargs.get("project_number", "")),
+            error_type=error_type,
+            traceback=None,
+        )
+
+        return json.dumps(asdict(report), ensure_ascii=False, indent=2)
+
+Вот именно здесь:
+
+except Exception as exc:
+
+и должна стоять запись в лог.
+
+После этого в MsgBox/консоль будет коротко:
+
+ValueError: ...
+
+Полный traceback записан в лог:
+...\refresh_tasks_errors.log
+
+А весь подробный traceback будет в файле.
+
+Важный нюанс: если другой скрипт вызывает refresh_tasks(...) напрямую как функцию, а не через CLI/run_json, то этот except не сработает. Для обычного вызова из VBA через python refresh_tasks.py ... всё будет нормально.
