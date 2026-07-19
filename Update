@@ -1,238 +1,94 @@
-Да, в `refresh_tasks.py` лучше поставить `progress(...)` в саму функцию `refresh_tasks`, потому что именно там все основные этапы: чтение внешнего Excel, фильтрация, дедупликация, чтение SQLite, запись в открытую книгу Excel. У тебя эта функция сейчас уже централизует весь процесс. 
+Это почти точно **гонка доступа к progress-файлу**.
 
-Сначала убедись, что сверху есть helper:
+Сейчас схема такая:
+
+```text
+Python пишет в C:\Users\...\Temp\python_progress_....log
+VBA каждые 0.25 сек читает этот же файл
+```
+
+Иногда VBA в этот момент держит файл открытым через `ADODB.Stream`, а Python пытается туда дописать:
 
 ```python
-PROGRESS_FILE_PATH: Path | None = None
+with PROGRESS_FILE_PATH.open("a", encoding="utf-8") as f:
+```
 
+и получает:
 
-def set_progress_file(path: str | None) -> None:
-    global PROGRESS_FILE_PATH
+```text
+PermissionError: [Errno 13] Permission denied
+```
 
-    if not path:
-        PROGRESS_FILE_PATH = None
-        return
+То есть проблема не в правах пользователя, а в том, что файл на долю секунды занят. Прогресс-файл вообще не должен валить синхронизацию, поэтому надо сделать запись прогресса “мягкой”: получилось — записали, не получилось — пропустили.
 
-    PROGRESS_FILE_PATH = Path(path)
-    PROGRESS_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PROGRESS_FILE_PATH.write_text("", encoding="utf-8")
+### Исправь `progress()` в Python
 
+Добавь импорт:
 
+```python
+import time
+```
+
+И замени функцию `progress` на такую:
+
+```python
 def progress(message: str) -> None:
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
 
     if PROGRESS_FILE_PATH is not None:
-        with PROGRESS_FILE_PATH.open("a", encoding="utf-8") as f:
-            f.write(line)
+        for _ in range(5):
+            try:
+                with PROGRESS_FILE_PATH.open("a", encoding="utf-8") as f:
+                    f.write(line)
+                return
+            except PermissionError:
+                time.sleep(0.05)
+            except OSError:
+                time.sleep(0.05)
+
+        # Прогресс не критичен. Не даём ему ломать основную синхронизацию.
         return
 
-    print(line, file=sys.stderr, flush=True)
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except Exception:
+        pass
 ```
 
-В `main()` добавь аргумент:
+Вот это главное:
 
 ```python
-parser.add_argument("--progress-file", default=None)
+return
 ```
 
-И после:
+после неудачных попыток. Даже если файл занят, синхронизация продолжит работать.
 
-```python
-args = parser.parse_args(argv)
+### Ещё лучше сделать имя progress-файла более уникальным в VBA
+
+Сейчас у тебя:
+
+```vba
+progressFile = Environ$("TEMP") & "\python_progress_" & Format$(Now, "yyyymmdd_hhnnss") & ".log"
 ```
 
-сразу:
+Если два запуска попали в одну секунду, файл может совпасть. Лучше так:
 
-```python
-set_progress_file(args.progress_file)
+```vba
+Randomize
+
+progressFile = Environ$("TEMP") & "\python_progress_" & _
+               Format$(Now, "yyyymmdd_hhnnss") & "_" & _
+               CStr(Int(Rnd() * 1000000)) & ".log"
 ```
 
-Теперь в `refresh_tasks()` я бы добавил так:
+### И можно реже читать файл
 
-```python
-def refresh_tasks(
-    *,
-    workbook: str,
-    db_path: str,
-    source_workbook: str,
-    project_number: str,
-    source_parent_sheet: str,
-    source_parent_table: str,
-    source_child_sheet: str,
-    source_child_table: str,
-    target_parent_sheet: str,
-    target_parent_table: str,
-    target_child_sheet: str,
-    target_child_table: str,
-) -> RefreshTasksReport:
+Вместо `0.25` поставь `0.5`:
 
-    progress(f"Ищу открытую книгу с формами: {Path(workbook).name}")
-    target_book = find_open_book(workbook)
-
-    progress(f"Читаю внешнюю родительскую таблицу: {source_parent_sheet}/{source_parent_table}")
-    parent_headers, external_parent_rows_all = read_excel_table_openpyxl(
-        source_workbook,
-        sheet_name=source_parent_sheet,
-        table_name=source_parent_table,
-    )
-
-    progress(f"Читаю внешнюю дочернюю таблицу: {source_child_sheet}/{source_child_table}")
-    child_headers, external_child_rows_all = read_excel_table_openpyxl(
-        source_workbook,
-        sheet_name=source_child_sheet,
-        table_name=source_child_table,
-    )
-
-    progress("Проверяю обязательные колонки родительской таблицы")
-    require_columns(
-        parent_headers,
-        [
-            PARENT_TASK_ID_COL,
-            PARENT_SAMPLE_CODE_COL,
-            PARENT_TASK_TYPE_COL,
-            PARENT_STATUS_COL,
-            PARENT_ROW_ID_COL,
-            PARENT_DATETIME_COL,
-        ],
-        f"внешняя таблица {source_parent_table}",
-    )
-
-    progress("Проверяю обязательные колонки дочерней таблицы")
-    require_columns(
-        child_headers,
-        [
-            CHILD_TASK_ID_COL,
-        ],
-        f"внешняя таблица {source_child_table}",
-    )
-
-    progress(f"Фильтрую задания по проекту: {project_number}")
-    parent_rows = filter_parent_rows(
-        external_parent_rows_all,
-        project_number,
-    )
-
-    progress(f"Найдено строк родительской таблицы по проекту: {len(parent_rows)}")
-
-    parent_rows_before_dedupe = len(parent_rows)
-
-    progress("Удаляю дубли родительской таблицы по taskId, оставляю последний статус")
-    parent_rows = keep_latest_parent_rows_by_task_id(parent_rows)
-
-    parent_duplicates_removed = parent_rows_before_dedupe - len(parent_rows)
-
-    progress(
-        f"После удаления дублей осталось строк: {len(parent_rows)}. "
-        f"Удалено дублей: {parent_duplicates_removed}"
-    )
-
-    task_ids: set[int] = set()
-
-    for row in parent_rows:
-        task_id = normalize_task_id(row.get(PARENT_TASK_ID_COL))
-
-        if task_id is None:
-            continue
-
-        task_ids.add(task_id)
-
-    progress(f"Собрано уникальных taskId: {len(task_ids)}")
-
-    progress("Читаю последние статусы из SQLite TaskStatus")
-    sqlite_statuses = fetch_latest_statuses(db_path, task_ids)
-
-    progress(f"Найдено статусов в SQLite: {len(sqlite_statuses)}")
-
-    progress("Подмешиваю статусы SQLite в родительскую таблицу")
-    sqlite_statuses_applied, external_statuses_kept = apply_sqlite_statuses(
-        parent_rows,
-        sqlite_statuses,
-    )
-
-    progress(
-        f"Статусов взято из SQLite: {sqlite_statuses_applied}; "
-        f"оставлено из внешнего Excel: {external_statuses_kept}"
-    )
-
-    progress("Фильтрую дочернюю таблицу task_mix по taskId")
-    child_rows = filter_child_rows(
-        external_child_rows_all,
-        task_ids,
-    )
-
-    progress(f"Строк task_mix после фильтрации: {len(child_rows)}")
-
-    progress(f"Ищу целевую таблицу Excel: {target_parent_sheet}/{target_parent_table}")
-    target_parent_table_obj = get_list_object(
-        target_book,
-        target_parent_sheet,
-        target_parent_table,
-    )
-
-    progress(f"Ищу целевую таблицу Excel: {target_child_sheet}/{target_child_table}")
-    target_child_table_obj = get_list_object(
-        target_book,
-        target_child_sheet,
-        target_child_table,
-    )
-
-    progress(f"Записываю родительскую таблицу {target_parent_table}: {len(parent_rows)} строк")
-    parent_written = replace_table_rows(target_parent_table_obj, parent_rows)
-
-    progress(f"Записываю дочернюю таблицу {target_child_table}: {len(child_rows)} строк")
-    child_written = replace_table_rows(target_child_table_obj, child_rows)
-
-    progress("Сохраняю книгу с формами")
-    target_book.save()
-
-    progress("Обновление заданий завершено")
-
-    return RefreshTasksReport(
-        ok=True,
-        message=(
-            "Задания успешно обновлены. "
-            f"Дубликатов по taskId удалено: {parent_duplicates_removed}"
-        ),
-        project=project_number,
-        parent_rows_read=len(external_parent_rows_all),
-        parent_rows_written=parent_written,
-        child_rows_read=len(external_child_rows_all),
-        child_rows_written=child_written,
-        sqlite_statuses_applied=sqlite_statuses_applied,
-        external_statuses_kept=external_statuses_kept,
-    )
+```vba
+If Timer - lastPoll >= 0.5 Then
 ```
 
-Ещё можно добавить мелкие `progress` внутри `replace_table_rows`, потому что именно запись в Excel иногда самая долгая:
+Это снизит шанс конфликта.
 
-```python
-def replace_table_rows(table, rows: list[dict[str, Any]]) -> int:
-    headers = read_headers_from_list_object(table)
-    col_count = len(headers)
-    row_count = len(rows)
-
-    progress(f"Меняю размер таблицы {table.Name}: строк={row_count}, колонок={col_count}")
-    resize_list_object(table, data_rows=max(row_count, 1), col_count=col_count)
-
-    body = table.DataBodyRange
-    if body is None:
-        return 0
-
-    if row_count == 0:
-        progress(f"Очищаю таблицу {table.Name}")
-        body.ClearContents()
-        return 0
-
-    progress(f"Готовлю матрицу для записи в {table.Name}")
-    matrix: list[list[Any]] = []
-
-    for row in rows:
-        matrix.append([row.get(header, "") for header in headers])
-
-    progress(f"Записываю данные блоком в {table.Name}")
-    body.Value = matrix
-
-    return row_count
-```
-
-Самые полезные места для прогресса: перед чтением внешних таблиц, после фильтрации, после удаления дублей, перед чтением SQLite, перед каждой записью в Excel и перед сохранением книги.
+Главное исправление — именно в Python: `progress()` не должен выбрасывать ошибку наружу. Прогресс — вспомогательная штука, он не должен ломать сохранение в БД.
