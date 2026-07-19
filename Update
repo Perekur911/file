@@ -1,160 +1,202 @@
-Да, именно так и можно сделать: форма сама появится перед запуском Python, будет обновляться строками из `progress(...)`, а после завершения сама закроется.
-
-## 1. Создай UserForm
-
-В VBA создай форму:
-
-```text
-frmProgress
-```
-
-На неё добавь `Label`:
-
-```text
-Name: lblStatus
-Caption: Подготовка...
-WordWrap: True
-```
-
-Можно размер формы небольшой, например 450×120.
-
-В код формы можно добавить защиту от случайного закрытия крестиком:
+Да, это ожидаемая ловушка. Скорее всего зависание появилось из-за этого блока:
 
 ```vba
-Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
-    If CloseMode = vbFormControlMenu Then
-        Cancel = True
-    End If
-End Sub
-```
-
-## 2. Добавь общий helper для обновления формы
-
-В обычный модуль:
-
-```vba
-Private Sub ShowProgress(ByVal text As String)
-
-    On Error Resume Next
-
-    frmProgress.lblStatus.Caption = text
-    frmProgress.Repaint
-
-    Application.StatusBar = text
-
-    DoEvents
-
-    On Error GoTo 0
-
-End Sub
-```
-
-## 3. В `RunStudySync` замени цикл ожидания
-
-Перед запуском процесса:
-
-```vba
-Set shell = CreateObject("WScript.Shell")
-Set exec = shell.Exec(cmd)
-
-frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
-frmProgress.Show vbModeless
-DoEvents
-```
-
-Потом вместо этого:
-
-```vba
-Do While exec.status = 0
-    DoEvents
-Loop
-```
-
-поставь:
-
-```vba
-Dim progressLine As String
-
-Do While exec.Status = 0
-    DoEvents
-    
-    Do While Not exec.StdErr.AtEndOfStream
-        progressLine = exec.StdErr.ReadLine
-        
-        If Len(Trim$(progressLine)) > 0 Then
-            Debug.Print progressLine
-            ShowProgress progressLine
-        End If
-    Loop
-Loop
-
 Do While Not exec.StdErr.AtEndOfStream
     progressLine = exec.StdErr.ReadLine
-    
-    If Len(Trim$(progressLine)) > 0 Then
-        Debug.Print progressLine
-        ShowProgress progressLine
-    End If
-Loop
 ```
 
-После чтения `stdout/stderr`, перед `MsgBox`, закрывай форму:
+`StdErr.AtEndOfStream` / `ReadLine` у `WScript.Shell.Exec` может **блокировать VBA**, пока Python ещё работает. А Python в это время может ждать Excel через `xlwings`. Получается взаимная блокировка: VBA ждёт строку из Python, Python ждёт Excel/VBA.
 
-```vba
-Application.StatusBar = False
-Unload frmProgress
-```
+Лучше не читать `StdErr` вживую. Надёжнее сделать прогресс через временный `.log` файл: Python пишет туда текущий статус, а VBA просто раз в 0.2–0.5 сек читает файл и обновляет `frmProgress`.
 
-## 4. Важно: Python запускай с `-u`
+## 1. В Python добавь progress-file
 
-В сборке команды должно быть так:
-
-```vba
-cmd = Quote(PYTHON_EXE) & " -u " & _
-      Quote(SYNC_SCRIPT) & " " & _
-      "--mode " & mode & " " & _
-      "--workbook " & Quote(targetWorkbookPath) & " " & _
-      "--db " & Quote(DB_PATH) & " " & _
-      "--studies " & studies
-```
-
-`-u` нужен, чтобы Python сразу отдавал строки прогресса, а не держал их в буфере.
-
-## 5. В Python progress должен писать в stderr
+В каждый скрипт, где нужен прогресс, добавь:
 
 ```python
+PROGRESS_FILE_PATH: Path | None = None
+
+
+def set_progress_file(path: str | None) -> None:
+    global PROGRESS_FILE_PATH
+
+    if not path:
+        PROGRESS_FILE_PATH = None
+        return
+
+    PROGRESS_FILE_PATH = Path(path)
+    PROGRESS_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PROGRESS_FILE_PATH.write_text("", encoding="utf-8")
+
+
 def progress(message: str) -> None:
-    print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] {message}",
-        file=sys.stderr,
-        flush=True,
-    )
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
+
+    if PROGRESS_FILE_PATH is not None:
+        with PROGRESS_FILE_PATH.open("a", encoding="utf-8") as f:
+            f.write(line)
+        return
+
+    print(line, file=sys.stderr, flush=True)
 ```
 
-И дальше в коде:
+В `argparse` добавь:
+
+```python
+parser.add_argument("--progress-file", default=None)
+```
+
+После `args = parser.parse_args(argv)`:
+
+```python
+set_progress_file(args.progress_file)
+```
+
+Теперь твои вызовы:
 
 ```python
 progress("Читаю таблицу OP_results...")
 progress("Сохраняю строки в БД...")
-progress("Выгружаю TaskStatus в Excel...")
 ```
 
-Тогда поведение будет такое:
+будут писать не в `stderr`, а в файл.
+
+## 2. В VBA больше не читай StdErr в цикле
+
+В команду добавь временный файл:
+
+```vba
+Dim progressFile As String
+progressFile = Environ$("TEMP") & "\python_progress_" & Format$(Now, "yyyymmdd_hhnnss") & ".log"
+```
+
+К команде добавь:
+
+```vba
+cmd = cmd & " --progress-file " & Quote(progressFile)
+```
+
+И замени цикл ожидания на такой:
+
+```vba
+Dim lastProgressLen As Long
+Dim lastPoll As Double
+Dim progressText As String
+Dim newChunk As String
+
+frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
+frmProgress.Show vbModeless
+DoEvents
+
+lastProgressLen = 0
+lastPoll = Timer
+
+Do While exec.Status = 0
+    DoEvents
+    
+    If Timer - lastPoll >= 0.25 Then
+        progressText = ReadUtf8TextFileSafe(progressFile)
+        
+        If Len(progressText) > lastProgressLen Then
+            newChunk = Mid$(progressText, lastProgressLen + 1)
+            lastProgressLen = Len(progressText)
+            UpdateProgressFromText newChunk
+        End If
+        
+        lastPoll = Timer
+    End If
+Loop
+
+progressText = ReadUtf8TextFileSafe(progressFile)
+
+If Len(progressText) > lastProgressLen Then
+    newChunk = Mid$(progressText, lastProgressLen + 1)
+    UpdateProgressFromText newChunk
+End If
+```
+
+После завершения уже спокойно читаешь:
+
+```vba
+stdoutText = exec.StdOut.ReadAll
+stderrText = exec.StdErr.ReadAll
+```
+
+## 3. Добавь VBA helpers
+
+```vba
+Private Function ReadUtf8TextFileSafe(ByVal filePath As String) As String
+
+    On Error GoTo Fail
+    
+    If Len(Dir(filePath)) = 0 Then Exit Function
+    
+    Dim stream As Object
+    Set stream = CreateObject("ADODB.Stream")
+    
+    stream.Type = 2
+    stream.Charset = "utf-8"
+    stream.Open
+    stream.LoadFromFile filePath
+    
+    ReadUtf8TextFileSafe = stream.ReadText
+    
+    stream.Close
+    Exit Function
+
+Fail:
+    ReadUtf8TextFileSafe = ""
+
+End Function
+```
+
+```vba
+Private Sub UpdateProgressFromText(ByVal text As String)
+
+    Dim lines() As String
+    Dim i As Long
+    Dim lineText As String
+    
+    text = Replace(text, vbCrLf, vbLf)
+    text = Replace(text, vbCr, vbLf)
+    
+    lines = Split(text, vbLf)
+    
+    For i = LBound(lines) To UBound(lines)
+        lineText = Trim$(lines(i))
+        
+        If Len(lineText) > 0 Then
+            Debug.Print lineText
+            Application.StatusBar = lineText
+            
+            frmProgress.lblStatus.Caption = lineText
+            frmProgress.Repaint
+        End If
+    Next i
+
+End Sub
+```
+
+## 4. Главное — убери этот блок
+
+Вот это больше не используй во время работы процесса:
+
+```vba
+Do While Not exec.StdErr.AtEndOfStream
+    progressLine = exec.StdErr.ReadLine
+    ...
+Loop
+```
+
+Именно он мог подвесить Excel.
+
+Итоговая схема будет безопаснее:
 
 ```text
-VBA запускает Python
-↓
-появляется frmProgress
-↓
-Python печатает progress в stderr
-↓
-VBA читает строки и обновляет lblStatus
-↓
-Python завершился
-↓
-frmProgress закрывается
-↓
-показывается финальный MsgBox с результатом
+Python пишет прогресс в файл
+VBA не блокируется на StdErr
+VBA периодически читает файл
+frmProgress обновляется
+после завершения форма закрывается
+stdout остаётся чистым JSON
 ```
-
-Лучше потом сделать один общий VBA-метод типа `RunCommandWithProgress(cmd, title)`, чтобы использовать его и для `RunStudySync`, и для `RefreshTasks`, и для создания акта качества.
