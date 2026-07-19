@@ -1,17 +1,6 @@
-Да, это ожидаемая ловушка. Скорее всего зависание появилось из-за этого блока:
+Да, в `refresh_tasks.py` лучше поставить `progress(...)` в саму функцию `refresh_tasks`, потому что именно там все основные этапы: чтение внешнего Excel, фильтрация, дедупликация, чтение SQLite, запись в открытую книгу Excel. У тебя эта функция сейчас уже централизует весь процесс. 
 
-```vba
-Do While Not exec.StdErr.AtEndOfStream
-    progressLine = exec.StdErr.ReadLine
-```
-
-`StdErr.AtEndOfStream` / `ReadLine` у `WScript.Shell.Exec` может **блокировать VBA**, пока Python ещё работает. А Python в это время может ждать Excel через `xlwings`. Получается взаимная блокировка: VBA ждёт строку из Python, Python ждёт Excel/VBA.
-
-Лучше не читать `StdErr` вживую. Надёжнее сделать прогресс через временный `.log` файл: Python пишет туда текущий статус, а VBA просто раз в 0.2–0.5 сек читает файл и обновляет `frmProgress`.
-
-## 1. В Python добавь progress-file
-
-В каждый скрипт, где нужен прогресс, добавь:
+Сначала убедись, что сверху есть helper:
 
 ```python
 PROGRESS_FILE_PATH: Path | None = None
@@ -40,163 +29,210 @@ def progress(message: str) -> None:
     print(line, file=sys.stderr, flush=True)
 ```
 
-В `argparse` добавь:
+В `main()` добавь аргумент:
 
 ```python
 parser.add_argument("--progress-file", default=None)
 ```
 
-После `args = parser.parse_args(argv)`:
+И после:
+
+```python
+args = parser.parse_args(argv)
+```
+
+сразу:
 
 ```python
 set_progress_file(args.progress_file)
 ```
 
-Теперь твои вызовы:
+Теперь в `refresh_tasks()` я бы добавил так:
 
 ```python
-progress("Читаю таблицу OP_results...")
-progress("Сохраняю строки в БД...")
+def refresh_tasks(
+    *,
+    workbook: str,
+    db_path: str,
+    source_workbook: str,
+    project_number: str,
+    source_parent_sheet: str,
+    source_parent_table: str,
+    source_child_sheet: str,
+    source_child_table: str,
+    target_parent_sheet: str,
+    target_parent_table: str,
+    target_child_sheet: str,
+    target_child_table: str,
+) -> RefreshTasksReport:
+
+    progress(f"Ищу открытую книгу с формами: {Path(workbook).name}")
+    target_book = find_open_book(workbook)
+
+    progress(f"Читаю внешнюю родительскую таблицу: {source_parent_sheet}/{source_parent_table}")
+    parent_headers, external_parent_rows_all = read_excel_table_openpyxl(
+        source_workbook,
+        sheet_name=source_parent_sheet,
+        table_name=source_parent_table,
+    )
+
+    progress(f"Читаю внешнюю дочернюю таблицу: {source_child_sheet}/{source_child_table}")
+    child_headers, external_child_rows_all = read_excel_table_openpyxl(
+        source_workbook,
+        sheet_name=source_child_sheet,
+        table_name=source_child_table,
+    )
+
+    progress("Проверяю обязательные колонки родительской таблицы")
+    require_columns(
+        parent_headers,
+        [
+            PARENT_TASK_ID_COL,
+            PARENT_SAMPLE_CODE_COL,
+            PARENT_TASK_TYPE_COL,
+            PARENT_STATUS_COL,
+            PARENT_ROW_ID_COL,
+            PARENT_DATETIME_COL,
+        ],
+        f"внешняя таблица {source_parent_table}",
+    )
+
+    progress("Проверяю обязательные колонки дочерней таблицы")
+    require_columns(
+        child_headers,
+        [
+            CHILD_TASK_ID_COL,
+        ],
+        f"внешняя таблица {source_child_table}",
+    )
+
+    progress(f"Фильтрую задания по проекту: {project_number}")
+    parent_rows = filter_parent_rows(
+        external_parent_rows_all,
+        project_number,
+    )
+
+    progress(f"Найдено строк родительской таблицы по проекту: {len(parent_rows)}")
+
+    parent_rows_before_dedupe = len(parent_rows)
+
+    progress("Удаляю дубли родительской таблицы по taskId, оставляю последний статус")
+    parent_rows = keep_latest_parent_rows_by_task_id(parent_rows)
+
+    parent_duplicates_removed = parent_rows_before_dedupe - len(parent_rows)
+
+    progress(
+        f"После удаления дублей осталось строк: {len(parent_rows)}. "
+        f"Удалено дублей: {parent_duplicates_removed}"
+    )
+
+    task_ids: set[int] = set()
+
+    for row in parent_rows:
+        task_id = normalize_task_id(row.get(PARENT_TASK_ID_COL))
+
+        if task_id is None:
+            continue
+
+        task_ids.add(task_id)
+
+    progress(f"Собрано уникальных taskId: {len(task_ids)}")
+
+    progress("Читаю последние статусы из SQLite TaskStatus")
+    sqlite_statuses = fetch_latest_statuses(db_path, task_ids)
+
+    progress(f"Найдено статусов в SQLite: {len(sqlite_statuses)}")
+
+    progress("Подмешиваю статусы SQLite в родительскую таблицу")
+    sqlite_statuses_applied, external_statuses_kept = apply_sqlite_statuses(
+        parent_rows,
+        sqlite_statuses,
+    )
+
+    progress(
+        f"Статусов взято из SQLite: {sqlite_statuses_applied}; "
+        f"оставлено из внешнего Excel: {external_statuses_kept}"
+    )
+
+    progress("Фильтрую дочернюю таблицу task_mix по taskId")
+    child_rows = filter_child_rows(
+        external_child_rows_all,
+        task_ids,
+    )
+
+    progress(f"Строк task_mix после фильтрации: {len(child_rows)}")
+
+    progress(f"Ищу целевую таблицу Excel: {target_parent_sheet}/{target_parent_table}")
+    target_parent_table_obj = get_list_object(
+        target_book,
+        target_parent_sheet,
+        target_parent_table,
+    )
+
+    progress(f"Ищу целевую таблицу Excel: {target_child_sheet}/{target_child_table}")
+    target_child_table_obj = get_list_object(
+        target_book,
+        target_child_sheet,
+        target_child_table,
+    )
+
+    progress(f"Записываю родительскую таблицу {target_parent_table}: {len(parent_rows)} строк")
+    parent_written = replace_table_rows(target_parent_table_obj, parent_rows)
+
+    progress(f"Записываю дочернюю таблицу {target_child_table}: {len(child_rows)} строк")
+    child_written = replace_table_rows(target_child_table_obj, child_rows)
+
+    progress("Сохраняю книгу с формами")
+    target_book.save()
+
+    progress("Обновление заданий завершено")
+
+    return RefreshTasksReport(
+        ok=True,
+        message=(
+            "Задания успешно обновлены. "
+            f"Дубликатов по taskId удалено: {parent_duplicates_removed}"
+        ),
+        project=project_number,
+        parent_rows_read=len(external_parent_rows_all),
+        parent_rows_written=parent_written,
+        child_rows_read=len(external_child_rows_all),
+        child_rows_written=child_written,
+        sqlite_statuses_applied=sqlite_statuses_applied,
+        external_statuses_kept=external_statuses_kept,
+    )
 ```
 
-будут писать не в `stderr`, а в файл.
+Ещё можно добавить мелкие `progress` внутри `replace_table_rows`, потому что именно запись в Excel иногда самая долгая:
 
-## 2. В VBA больше не читай StdErr в цикле
+```python
+def replace_table_rows(table, rows: list[dict[str, Any]]) -> int:
+    headers = read_headers_from_list_object(table)
+    col_count = len(headers)
+    row_count = len(rows)
 
-В команду добавь временный файл:
+    progress(f"Меняю размер таблицы {table.Name}: строк={row_count}, колонок={col_count}")
+    resize_list_object(table, data_rows=max(row_count, 1), col_count=col_count)
 
-```vba
-Dim progressFile As String
-progressFile = Environ$("TEMP") & "\python_progress_" & Format$(Now, "yyyymmdd_hhnnss") & ".log"
+    body = table.DataBodyRange
+    if body is None:
+        return 0
+
+    if row_count == 0:
+        progress(f"Очищаю таблицу {table.Name}")
+        body.ClearContents()
+        return 0
+
+    progress(f"Готовлю матрицу для записи в {table.Name}")
+    matrix: list[list[Any]] = []
+
+    for row in rows:
+        matrix.append([row.get(header, "") for header in headers])
+
+    progress(f"Записываю данные блоком в {table.Name}")
+    body.Value = matrix
+
+    return row_count
 ```
 
-К команде добавь:
-
-```vba
-cmd = cmd & " --progress-file " & Quote(progressFile)
-```
-
-И замени цикл ожидания на такой:
-
-```vba
-Dim lastProgressLen As Long
-Dim lastPoll As Double
-Dim progressText As String
-Dim newChunk As String
-
-frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
-frmProgress.Show vbModeless
-DoEvents
-
-lastProgressLen = 0
-lastPoll = Timer
-
-Do While exec.Status = 0
-    DoEvents
-    
-    If Timer - lastPoll >= 0.25 Then
-        progressText = ReadUtf8TextFileSafe(progressFile)
-        
-        If Len(progressText) > lastProgressLen Then
-            newChunk = Mid$(progressText, lastProgressLen + 1)
-            lastProgressLen = Len(progressText)
-            UpdateProgressFromText newChunk
-        End If
-        
-        lastPoll = Timer
-    End If
-Loop
-
-progressText = ReadUtf8TextFileSafe(progressFile)
-
-If Len(progressText) > lastProgressLen Then
-    newChunk = Mid$(progressText, lastProgressLen + 1)
-    UpdateProgressFromText newChunk
-End If
-```
-
-После завершения уже спокойно читаешь:
-
-```vba
-stdoutText = exec.StdOut.ReadAll
-stderrText = exec.StdErr.ReadAll
-```
-
-## 3. Добавь VBA helpers
-
-```vba
-Private Function ReadUtf8TextFileSafe(ByVal filePath As String) As String
-
-    On Error GoTo Fail
-    
-    If Len(Dir(filePath)) = 0 Then Exit Function
-    
-    Dim stream As Object
-    Set stream = CreateObject("ADODB.Stream")
-    
-    stream.Type = 2
-    stream.Charset = "utf-8"
-    stream.Open
-    stream.LoadFromFile filePath
-    
-    ReadUtf8TextFileSafe = stream.ReadText
-    
-    stream.Close
-    Exit Function
-
-Fail:
-    ReadUtf8TextFileSafe = ""
-
-End Function
-```
-
-```vba
-Private Sub UpdateProgressFromText(ByVal text As String)
-
-    Dim lines() As String
-    Dim i As Long
-    Dim lineText As String
-    
-    text = Replace(text, vbCrLf, vbLf)
-    text = Replace(text, vbCr, vbLf)
-    
-    lines = Split(text, vbLf)
-    
-    For i = LBound(lines) To UBound(lines)
-        lineText = Trim$(lines(i))
-        
-        If Len(lineText) > 0 Then
-            Debug.Print lineText
-            Application.StatusBar = lineText
-            
-            frmProgress.lblStatus.Caption = lineText
-            frmProgress.Repaint
-        End If
-    Next i
-
-End Sub
-```
-
-## 4. Главное — убери этот блок
-
-Вот это больше не используй во время работы процесса:
-
-```vba
-Do While Not exec.StdErr.AtEndOfStream
-    progressLine = exec.StdErr.ReadLine
-    ...
-Loop
-```
-
-Именно он мог подвесить Excel.
-
-Итоговая схема будет безопаснее:
-
-```text
-Python пишет прогресс в файл
-VBA не блокируется на StdErr
-VBA периодически читает файл
-frmProgress обновляется
-после завершения форма закрывается
-stdout остаётся чистым JSON
-```
+Самые полезные места для прогресса: перед чтением внешних таблиц, после фильтрации, после удаления дублей, перед чтением SQLite, перед каждой записью в Excel и перед сохранением книги.
