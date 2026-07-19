@@ -1,116 +1,38 @@
-Нет, в тот вариант `create_project_forms.py`, который я писал, **unprotect/protect листов не был вставлен**. Там форма просто открывалась, в `OP!B6` записывался проект, потом вызывался `refresh_tasks`, потом макрос и сохранение.
+Вставь целиком в **Расширенный редактор** вместо текущего кода:
 
-Для надёжности лучше добавить прямо туда, потому что этот скрипт сам открывает новую форму и сам в неё пишет.
+```powerquery
+let
+    #"Измененный тип" = Table.TransformColumnTypes(
+        TaskStatus_Table,
+        {
+            {"statusid", Int64.Type},
+            {"status", type text},
+            {"taskid", Int64.Type},
+            {"task_type", type text},
+            {"resultId", Int64.Type},
+            {"dateTime", type datetime}
+        }
+    ),
 
-### 1. Добавь константы
+    #"Сортировка по statusid" = Table.Sort(
+        #"Измененный тип",
+        {
+            {"statusid", Order.Descending}
+        }
+    ),
 
-```python
-UNPROTECT_PASSWORDS = ("1984", "9184", "")
-PROTECT_PASSWORD = "1984"
+    #"Буферизация таблицы" = Table.Buffer(
+        #"Сортировка по statusid"
+    ),
+
+    #"Удаление дубликатов taskid" = Table.Distinct(
+        #"Буферизация таблицы",
+        {
+            "taskid"
+        }
+    )
+in
+    #"Удаление дубликатов taskid"
 ```
 
-### 2. Добавь helpers
-
-```python
-def unprotect_all_sheets(book: xw.Book) -> None:
-    for sheet in book.sheets:
-        for password in UNPROTECT_PASSWORDS:
-            try:
-                sheet.api.Unprotect(Password=password)
-                break
-            except Exception:
-                pass
-
-
-def protect_all_sheets(book: xw.Book) -> None:
-    for sheet in book.sheets:
-        try:
-            sheet.api.Protect(
-                Password=PROTECT_PASSWORD,
-                DrawingObjects=True,
-                Contents=True,
-                Scenarios=True,
-                UserInterfaceOnly=True,
-                AllowFiltering=True,
-            )
-        except Exception as exc:
-            logging.warning("Не удалось защитить лист %s: %s", sheet.name, exc)
-```
-
-### 3. В `create_one_project_form` добавь вызовы
-
-Найди место:
-
-```python
-workbook = app.books.open(
-    str(new_file),
-    update_links=False,
-    ignore_read_only_recommended=True,
-)
-
-progress(f"Записываю номер проекта в {PROJECT_CELL_SHEET}!{PROJECT_CELL_ADDRESS}: {candidate.refresh_project}")
-set_project_cell(workbook, candidate.refresh_project)
-workbook.save()
-
-run_refresh_tasks_for_book(
-    workbook_path=new_file,
-    refresh_project=candidate.refresh_project,
-)
-
-run_after_refresh_macro(
-    app=app,
-    workbook=workbook,
-    addin_book=addin_book,
-)
-
-progress("Сохраняю новую форму")
-workbook.save()
-```
-
-Сделай так:
-
-```python
-workbook = app.books.open(
-    str(new_file),
-    update_links=False,
-    ignore_read_only_recommended=True,
-)
-
-progress("Разблокирую листы новой формы")
-unprotect_all_sheets(workbook)
-
-progress(f"Записываю номер проекта в {PROJECT_CELL_SHEET}!{PROJECT_CELL_ADDRESS}: {candidate.refresh_project}")
-set_project_cell(workbook, candidate.refresh_project)
-workbook.save()
-
-run_refresh_tasks_for_book(
-    workbook_path=new_file,
-    refresh_project=candidate.refresh_project,
-)
-
-run_after_refresh_macro(
-    app=app,
-    workbook=workbook,
-    addin_book=addin_book,
-)
-
-progress("Блокирую листы новой формы")
-protect_all_sheets(workbook)
-
-progress("Сохраняю новую форму")
-workbook.save()
-```
-
-Так будет правильно:
-
-```text
-открыли новую v22
-разблокировали листы
-записали OP!B6
-обновили задания через refresh_tasks
-запустили макрос
-заблокировали листы обратно паролем 1984
-сохранили файл
-```
-
-Если `refresh_tasks.py` тоже уже сам делает `unprotect/protect`, ничего страшного. Двойная разблокировка/блокировка не проблема. Главное, чтобы итоговый файл сохранялся уже защищённым.
+Для каждого `taskid` останется одна строка с наибольшим `statusid`.
