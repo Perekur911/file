@@ -1,94 +1,116 @@
-Это почти точно **гонка доступа к progress-файлу**.
+Нет, в тот вариант `create_project_forms.py`, который я писал, **unprotect/protect листов не был вставлен**. Там форма просто открывалась, в `OP!B6` записывался проект, потом вызывался `refresh_tasks`, потом макрос и сохранение.
 
-Сейчас схема такая:
+Для надёжности лучше добавить прямо туда, потому что этот скрипт сам открывает новую форму и сам в неё пишет.
 
-```text
-Python пишет в C:\Users\...\Temp\python_progress_....log
-VBA каждые 0.25 сек читает этот же файл
-```
-
-Иногда VBA в этот момент держит файл открытым через `ADODB.Stream`, а Python пытается туда дописать:
+### 1. Добавь константы
 
 ```python
-with PROGRESS_FILE_PATH.open("a", encoding="utf-8") as f:
+UNPROTECT_PASSWORDS = ("1984", "9184", "")
+PROTECT_PASSWORD = "1984"
 ```
 
-и получает:
-
-```text
-PermissionError: [Errno 13] Permission denied
-```
-
-То есть проблема не в правах пользователя, а в том, что файл на долю секунды занят. Прогресс-файл вообще не должен валить синхронизацию, поэтому надо сделать запись прогресса “мягкой”: получилось — записали, не получилось — пропустили.
-
-### Исправь `progress()` в Python
-
-Добавь импорт:
+### 2. Добавь helpers
 
 ```python
-import time
-```
-
-И замени функцию `progress` на такую:
-
-```python
-def progress(message: str) -> None:
-    line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
-
-    if PROGRESS_FILE_PATH is not None:
-        for _ in range(5):
+def unprotect_all_sheets(book: xw.Book) -> None:
+    for sheet in book.sheets:
+        for password in UNPROTECT_PASSWORDS:
             try:
-                with PROGRESS_FILE_PATH.open("a", encoding="utf-8") as f:
-                    f.write(line)
-                return
-            except PermissionError:
-                time.sleep(0.05)
-            except OSError:
-                time.sleep(0.05)
+                sheet.api.Unprotect(Password=password)
+                break
+            except Exception:
+                pass
 
-        # Прогресс не критичен. Не даём ему ломать основную синхронизацию.
-        return
 
-    try:
-        print(line, file=sys.stderr, flush=True)
-    except Exception:
-        pass
+def protect_all_sheets(book: xw.Book) -> None:
+    for sheet in book.sheets:
+        try:
+            sheet.api.Protect(
+                Password=PROTECT_PASSWORD,
+                DrawingObjects=True,
+                Contents=True,
+                Scenarios=True,
+                UserInterfaceOnly=True,
+                AllowFiltering=True,
+            )
+        except Exception as exc:
+            logging.warning("Не удалось защитить лист %s: %s", sheet.name, exc)
 ```
 
-Вот это главное:
+### 3. В `create_one_project_form` добавь вызовы
+
+Найди место:
 
 ```python
-return
+workbook = app.books.open(
+    str(new_file),
+    update_links=False,
+    ignore_read_only_recommended=True,
+)
+
+progress(f"Записываю номер проекта в {PROJECT_CELL_SHEET}!{PROJECT_CELL_ADDRESS}: {candidate.refresh_project}")
+set_project_cell(workbook, candidate.refresh_project)
+workbook.save()
+
+run_refresh_tasks_for_book(
+    workbook_path=new_file,
+    refresh_project=candidate.refresh_project,
+)
+
+run_after_refresh_macro(
+    app=app,
+    workbook=workbook,
+    addin_book=addin_book,
+)
+
+progress("Сохраняю новую форму")
+workbook.save()
 ```
 
-после неудачных попыток. Даже если файл занят, синхронизация продолжит работать.
+Сделай так:
 
-### Ещё лучше сделать имя progress-файла более уникальным в VBA
+```python
+workbook = app.books.open(
+    str(new_file),
+    update_links=False,
+    ignore_read_only_recommended=True,
+)
 
-Сейчас у тебя:
+progress("Разблокирую листы новой формы")
+unprotect_all_sheets(workbook)
 
-```vba
-progressFile = Environ$("TEMP") & "\python_progress_" & Format$(Now, "yyyymmdd_hhnnss") & ".log"
+progress(f"Записываю номер проекта в {PROJECT_CELL_SHEET}!{PROJECT_CELL_ADDRESS}: {candidate.refresh_project}")
+set_project_cell(workbook, candidate.refresh_project)
+workbook.save()
+
+run_refresh_tasks_for_book(
+    workbook_path=new_file,
+    refresh_project=candidate.refresh_project,
+)
+
+run_after_refresh_macro(
+    app=app,
+    workbook=workbook,
+    addin_book=addin_book,
+)
+
+progress("Блокирую листы новой формы")
+protect_all_sheets(workbook)
+
+progress("Сохраняю новую форму")
+workbook.save()
 ```
 
-Если два запуска попали в одну секунду, файл может совпасть. Лучше так:
+Так будет правильно:
 
-```vba
-Randomize
-
-progressFile = Environ$("TEMP") & "\python_progress_" & _
-               Format$(Now, "yyyymmdd_hhnnss") & "_" & _
-               CStr(Int(Rnd() * 1000000)) & ".log"
+```text
+открыли новую v22
+разблокировали листы
+записали OP!B6
+обновили задания через refresh_tasks
+запустили макрос
+заблокировали листы обратно паролем 1984
+сохранили файл
 ```
 
-### И можно реже читать файл
-
-Вместо `0.25` поставь `0.5`:
-
-```vba
-If Timer - lastPoll >= 0.5 Then
-```
-
-Это снизит шанс конфликта.
-
-Главное исправление — именно в Python: `progress()` не должен выбрасывать ошибку наружу. Прогресс — вспомогательная штука, он не должен ломать сохранение в БД.
+Если `refresh_tasks.py` тоже уже сам делает `unprotect/protect`, ничего страшного. Двойная разблокировка/блокировка не проблема. Главное, чтобы итоговый файл сохранялся уже защищённым.
