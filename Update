@@ -1,8 +1,16 @@
-Вставь целиком в **Расширенный редактор** вместо текущего кода:
+У тебя сейчас вставлены **два отдельных блока `let … in` подряд**, так нельзя. Удали в расширенном редакторе весь код и вставь этот единый запрос целиком:
 
 ```powerquery
 let
-    #"Измененный тип" = Table.TransformColumnTypes(
+    Источник = Excel.Workbook(
+        File.Contents("L:\LRC\exchange\КСН Лайт\Журнал_заданий_ГТМ.xlsx"),
+        null,
+        true
+    ),
+
+    TaskStatus_Table = Источник{[Item="TaskStatus", Kind="Table"]}[Data],
+
+    #"Измененный тип2" = Table.TransformColumnTypes(
         TaskStatus_Table,
         {
             {"statusid", Int64.Type},
@@ -10,12 +18,12 @@ let
             {"taskid", Int64.Type},
             {"task_type", type text},
             {"resultId", Int64.Type},
-            {"dateTime", type datetime}
+            {"dateTime", type text}
         }
     ),
 
     #"Сортировка по statusid" = Table.Sort(
-        #"Измененный тип",
+        #"Измененный тип2",
         {
             {"statusid", Order.Descending}
         }
@@ -35,4 +43,4 @@ in
     #"Удаление дубликатов taskid"
 ```
 
-Для каждого `taskid` останется одна строка с наибольшим `statusid`.
+То есть второй `let` не добавляется после первого `in`. Новые шаги помещаются **внутрь одного `let`**, а `in` остаётся только один — в самом конце.
