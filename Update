@@ -1,66 +1,160 @@
-OPOH_RESULTS = TableSchema(
-    logical_name="OPOH_RESULTS",
-    db_table="OPOH_results",
-    sheet_name="OPOH_results",
-    excel_table_name="OPOH_results",
-    columns=[
-        _col("resultIdOPOH", "resultIdOPOH", typ="INTEGER", value_type="integer", pk=True),
+Да, именно так и можно сделать: форма сама появится перед запуском Python, будет обновляться строками из `progress(...)`, а после завершения сама закроется.
 
-        _col("taskId", "taskId", typ="INTEGER", value_type="integer"),
-        _col("sampleCode", "sampleCode", typ="TEXT", value_type="text", required=True),
+## 1. Создай UserForm
 
-        _col("openDateTime", "openDateTime", typ="TEXT", value_type="text"),
-        _col("valveState", "valveState", typ="INTEGER", value_type="boolean"),
+В VBA создай форму:
 
-        _col("TColdOpen", "TColdOpen", typ="REAL", value_type="real"),
-        _col("coldCompP", "coldCompP", typ="REAL", value_type="real"),
-        _col("coldPunit", "coldPunit", typ="TEXT", value_type="text"),
-        _col("coldPabs", "coldPabs", typ="INTEGER", value_type="boolean"),
-        _col("coldExpP", "coldExpP", typ="REAL", value_type="real"),
-        _col("coldOpenPMPaAbs", "coldOpenPMPaAbs", typ="REAL", value_type="real"),
+```text
+frmProgress
+```
 
-        _col("THotOpen", "THotOpen", typ="REAL", value_type="real"),
-        _col("hotCompP", "hotCompP", typ="REAL", value_type="real"),
-        _col("hotPunit", "hotPunit", typ="TEXT", value_type="text"),
-        _col("hotPabs", "hotPabs", typ="INTEGER", value_type="boolean"),
-        _col("hotExpP", "hotExpP", typ="REAL", value_type="real"),
-        _col("hotOpenPMPaAbs", "hotOpenPMPaAbs", typ="REAL", value_type="real"),
+На неё добавь `Label`:
 
-        _col("openOperator", "openOperator", typ="TEXT", value_type="text"),
+```text
+Name: lblStatus
+Caption: Подготовка...
+WordWrap: True
+```
 
-        _col("restorationP", "restorationP", typ="REAL", value_type="real"),
-        _col("restorationPunit", "restorationPunit", typ="TEXT", value_type="text"),
-        _col("restorationPabs", "restorationPabs", typ="INTEGER", value_type="boolean"),
-        _col("restorationPMPaAbs", "restorationPMPaAbs", typ="REAL", value_type="real"),
-        _col("restorationT", "restorationT", typ="REAL", value_type="real"),
-        _col("restorationStartDateTime", "restorationStartDateTime", typ="TEXT", value_type="text"),
-        _col("restorationStartOperator", "restorationStartOperator", typ="TEXT", value_type="text"),
-        _col("restorationEndDateTime", "restorationEndDateTime", typ="TEXT", value_type="text"),
-        _col("restorationEndOperator", "restorationEndOperator", typ="TEXT", value_type="text"),
+Можно размер формы небольшой, например 450×120.
 
-        _col("typeSampler", "typeSampler", typ="TEXT", value_type="text"),
-        _col("numberSampler", "numberSampler", typ="TEXT", value_type="text"),
+В код формы можно добавить защиту от случайного закрытия крестиком:
 
-        _col("transferP", "transferP", typ="REAL", value_type="real"),
-        _col("transferPunit", "transferPunit", typ="TEXT", value_type="text"),
-        _col("transferPabs", "transferPabs", typ="INTEGER", value_type="boolean"),
-        _col("transferPMPaAbs", "transferPMPaAbs", typ="REAL", value_type="real"),
-        _col("transferT", "transferT", typ="REAL", value_type="real"),
-        _col("transferVolume", "transferVolume", typ="REAL", value_type="real"),
-        _col("transferDateTime", "transferDateTime", typ="TEXT", value_type="text"),
-        _col("transferOperator", "transferOperator", typ="TEXT", value_type="text"),
+```vba
+Private Sub UserForm_QueryClose(Cancel As Integer, CloseMode As Integer)
+    If CloseMode = vbFormControlMenu Then
+        Cancel = True
+    End If
+End Sub
+```
 
-        _col("phaseDrainDateTime", "phaseDrainDateTime", typ="TEXT", value_type="text"),
+## 2. Добавь общий helper для обновления формы
 
-        _col("sncVolumeHC", "sncVolumeHC", typ="REAL", value_type="real"),
-        _col("sncVolumeDM", "sncVolumeDM", typ="REAL", value_type="real"),
-        _col("sncVolumeW", "sncVolumeW", typ="REAL", value_type="real"),
+В обычный модуль:
 
-        _col("flcVolumeHC", "flcVolumeHC", typ="REAL", value_type="real"),
-        _col("flcVolumeDM", "flcVolumeDM", typ="REAL", value_type="real"),
-        _col("flcVolumeW", "flcVolumeW", typ="REAL", value_type="real"),
+```vba
+Private Sub ShowProgress(ByVal text As String)
 
-        _col("phaseDrainOperator", "phaseDrainOperator", typ="TEXT", value_type="text"),
-        _col("comment", "comment", typ="TEXT", value_type="text"),
-    ],
-)
+    On Error Resume Next
+
+    frmProgress.lblStatus.Caption = text
+    frmProgress.Repaint
+
+    Application.StatusBar = text
+
+    DoEvents
+
+    On Error GoTo 0
+
+End Sub
+```
+
+## 3. В `RunStudySync` замени цикл ожидания
+
+Перед запуском процесса:
+
+```vba
+Set shell = CreateObject("WScript.Shell")
+Set exec = shell.Exec(cmd)
+
+frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
+frmProgress.Show vbModeless
+DoEvents
+```
+
+Потом вместо этого:
+
+```vba
+Do While exec.status = 0
+    DoEvents
+Loop
+```
+
+поставь:
+
+```vba
+Dim progressLine As String
+
+Do While exec.Status = 0
+    DoEvents
+    
+    Do While Not exec.StdErr.AtEndOfStream
+        progressLine = exec.StdErr.ReadLine
+        
+        If Len(Trim$(progressLine)) > 0 Then
+            Debug.Print progressLine
+            ShowProgress progressLine
+        End If
+    Loop
+Loop
+
+Do While Not exec.StdErr.AtEndOfStream
+    progressLine = exec.StdErr.ReadLine
+    
+    If Len(Trim$(progressLine)) > 0 Then
+        Debug.Print progressLine
+        ShowProgress progressLine
+    End If
+Loop
+```
+
+После чтения `stdout/stderr`, перед `MsgBox`, закрывай форму:
+
+```vba
+Application.StatusBar = False
+Unload frmProgress
+```
+
+## 4. Важно: Python запускай с `-u`
+
+В сборке команды должно быть так:
+
+```vba
+cmd = Quote(PYTHON_EXE) & " -u " & _
+      Quote(SYNC_SCRIPT) & " " & _
+      "--mode " & mode & " " & _
+      "--workbook " & Quote(targetWorkbookPath) & " " & _
+      "--db " & Quote(DB_PATH) & " " & _
+      "--studies " & studies
+```
+
+`-u` нужен, чтобы Python сразу отдавал строки прогресса, а не держал их в буфере.
+
+## 5. В Python progress должен писать в stderr
+
+```python
+def progress(message: str) -> None:
+    print(
+        f"[{datetime.now().strftime('%H:%M:%S')}] {message}",
+        file=sys.stderr,
+        flush=True,
+    )
+```
+
+И дальше в коде:
+
+```python
+progress("Читаю таблицу OP_results...")
+progress("Сохраняю строки в БД...")
+progress("Выгружаю TaskStatus в Excel...")
+```
+
+Тогда поведение будет такое:
+
+```text
+VBA запускает Python
+↓
+появляется frmProgress
+↓
+Python печатает progress в stderr
+↓
+VBA читает строки и обновляет lblStatus
+↓
+Python завершился
+↓
+frmProgress закрывается
+↓
+показывается финальный MsgBox с результатом
+```
+
+Лучше потом сделать один общий VBA-метод типа `RunCommandWithProgress(cmd, title)`, чтобы использовать его и для `RunStudySync`, и для `RefreshTasks`, и для создания акта качества.
