@@ -1,46 +1,387 @@
-У тебя сейчас вставлены **два отдельных блока `let … in` подряд**, так нельзя. Удали в расширенном редакторе весь код и вставь этот единый запрос целиком:
+Да, лучше протянуть `status_comment` как **необязательный параметр** через всю цепочку:
 
-```powerquery
-let
-    Источник = Excel.Workbook(
-        File.Contents("L:\LRC\exchange\КСН Лайт\Журнал_заданий_ГТМ.xlsx"),
-        null,
-        true
-    ),
-
-    TaskStatus_Table = Источник{[Item="TaskStatus", Kind="Table"]}[Data],
-
-    #"Измененный тип2" = Table.TransformColumnTypes(
-        TaskStatus_Table,
-        {
-            {"statusid", Int64.Type},
-            {"status", type text},
-            {"taskid", Int64.Type},
-            {"task_type", type text},
-            {"resultId", Int64.Type},
-            {"dateTime", type text}
-        }
-    ),
-
-    #"Сортировка по statusid" = Table.Sort(
-        #"Измененный тип2",
-        {
-            {"statusid", Order.Descending}
-        }
-    ),
-
-    #"Буферизация таблицы" = Table.Buffer(
-        #"Сортировка по statusid"
-    ),
-
-    #"Удаление дубликатов taskid" = Table.Distinct(
-        #"Буферизация таблицы",
-        {
-            "taskid"
-        }
-    )
-in
-    #"Удаление дубликатов taskid"
+```text
+VBA / CLI
+→ sync.py run_json
+→ run_status / run_save
+→ TaskStatusRepository
+→ INSERT/UPDATE TaskStatus.statusComment
 ```
 
-То есть второй `let` не добавляется после первого `in`. Новые шаги помещаются **внутрь одного `let`**, а `in` остаётся только один — в самом конце.
+## 1. Сначала добавить колонку в SQLite
+
+```sql
+ALTER TABLE TaskStatus
+ADD COLUMN statusComment TEXT;
+```
+
+Если таблицу будешь пересоздавать, тогда просто добавь поле в `CREATE TABLE`:
+
+```sql
+statusComment TEXT
+```
+
+---
+
+## 2. В `task_status.py` изменить методы
+
+### `ensure_latest_status_for_result`
+
+Добавь параметр:
+
+```python
+status_comment: str | None = None,
+```
+
+Полный вариант логики можно сделать так:
+
+```python
+def ensure_latest_status_for_result(
+    self,
+    *,
+    taskid: int,
+    task_type: str,
+    status: str,
+    result_id: int | None = None,
+    date_time: Any = None,
+    status_comment: str | None = None,
+) -> bool:
+    status = self._normalize_status(status)
+
+    latest_row = self.get_latest_status_row(
+        taskid=taskid,
+        task_type=task_type,
+    )
+
+    latest_status = None
+    latest_statusid = None
+
+    if latest_row is not None:
+        latest_status = str(latest_row["status"]).strip()
+        latest_statusid = int(latest_row["statusid"])
+
+    # Если последний статус уже такой же
+    if latest_status == status:
+
+        # Для повторной валидации обновляем время/resultId/comment
+        if status == self.VALIDATED_STATUS:
+            if status_comment is None:
+                self.conn.execute(
+                    """
+                    UPDATE TaskStatus
+                    SET resultId = ?,
+                        dateTime = ?
+                    WHERE statusid = ?
+                    """,
+                    (
+                        result_id,
+                        self._to_text(date_time),
+                        latest_statusid,
+                    ),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE TaskStatus
+                    SET resultId = ?,
+                        dateTime = ?,
+                        statusComment = ?
+                    WHERE statusid = ?
+                    """,
+                    (
+                        result_id,
+                        self._to_text(date_time),
+                        status_comment,
+                        latest_statusid,
+                    ),
+                )
+
+            return True
+
+        # Если снова "Завершено" после "Завершено" — TaskStatus не трогаем
+        return False
+
+    self.ensure_can_set_status(
+        taskid=taskid,
+        task_type=task_type,
+        status=status,
+    )
+
+    self.conn.execute(
+        """
+        INSERT INTO TaskStatus (
+            status,
+            taskid,
+            task_type,
+            resultId,
+            dateTime,
+            statusComment
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            status,
+            taskid,
+            task_type,
+            result_id,
+            self._to_text(date_time),
+            status_comment,
+        ),
+    )
+
+    return True
+```
+
+Логика такая:
+
+```text
+status_comment is None  -> комментарий не передан
+status_comment = ""     -> комментарий передан пустой строкой, можно очистить
+status_comment = "..."  -> записать текст
+```
+
+---
+
+## 3. Если есть отдельный `run_status`
+
+В `sync.py` измени сигнатуру:
+
+```python
+def run_status(
+    db_path: str,
+    *,
+    taskid: int,
+    task_type: str,
+    status: str,
+    result_id: int | None = None,
+    date_time: str | None = None,
+    status_comment: str | None = None,
+):
+```
+
+И вызов внутри:
+
+```python
+repo.ensure_latest_status_for_result(
+    taskid=taskid,
+    task_type=task_type,
+    status=status,
+    result_id=result_id,
+    date_time=date_time,
+    status_comment=status_comment,
+)
+```
+
+---
+
+## 4. В `run_json` добавить параметр
+
+В сигнатуру `run_json`:
+
+```python
+status_comment: str | None = None,
+```
+
+Например:
+
+```python
+def run_json(
+    mode: str,
+    workbook: str | None,
+    db_path: str,
+    study_codes: list[str] | None = None,
+    project_number: str | None = None,
+    task_status: str = TaskStatusRepository.COMPLETED_STATUS,
+    taskid: int | None = None,
+    task_type: str | None = None,
+    result_id: int | None = None,
+    date_time: str | None = None,
+    status_comment: str | None = None,
+) -> str:
+```
+
+В режиме `status` передай дальше:
+
+```python
+report = run_status(
+    db_path,
+    taskid=taskid,
+    task_type=task_type,
+    status=task_status,
+    result_id=result_id,
+    date_time=date_time,
+    status_comment=status_comment,
+)
+```
+
+---
+
+## 5. В `argparse` добавить параметр
+
+В `main()`:
+
+```python
+parser.add_argument(
+    "--status-comment",
+    default=None,
+    help="Комментарий к статусу задания, например причина отмены",
+)
+```
+
+И в вызов `run_json`:
+
+```python
+json_result = run_json(
+    mode=args.mode,
+    workbook=args.workbook,
+    db_path=args.db,
+    study_codes=study_codes,
+    project_number=args.project,
+    task_status=args.status,
+    taskid=args.task_id,
+    task_type=args.task_type,
+    result_id=args.result_id,
+    date_time=args.date_time,
+    status_comment=args.status_comment,
+)
+```
+
+---
+
+## 6. Если статус ставится при обычной синхронизации
+
+Если хочешь, чтобы `--status-comment` мог работать не только при `--mode status`, но и при:
+
+```text
+--mode save --status Валидировано --status-comment "..."
+```
+
+тогда надо ещё протянуть `status_comment` в `run_save`, `save_to_db` и `_ensure_task_statuses_for_results`.
+
+### `run_save`
+
+```python
+def run_save(
+    workbook: str,
+    db_path: str,
+    study_codes: list[str] | None = None,
+    task_status: str = TaskStatusRepository.COMPLETED_STATUS,
+    status_comment: str | None = None,
+):
+```
+
+Вызов:
+
+```python
+return service.save_to_db(
+    get_studies(study_codes),
+    task_status=task_status,
+    status_comment=status_comment,
+)
+```
+
+### `save_to_db`
+
+```python
+def save_to_db(
+    self,
+    studies: list[StudySchema],
+    task_status: str = TaskStatusRepository.COMPLETED_STATUS,
+    status_comment: str | None = None,
+):
+```
+
+И дальше во всех местах, где вызывается:
+
+```python
+self._ensure_task_statuses_for_results(...)
+```
+
+добавить:
+
+```python
+status_comment=status_comment,
+```
+
+### `_ensure_task_statuses_for_results`
+
+В сигнатуру:
+
+```python
+status_comment: str | None = None,
+```
+
+И внутрь:
+
+```python
+self.task_status.ensure_latest_status_for_result(
+    taskid=taskid,
+    task_type=study_code,
+    status=status,
+    result_id=result_id,
+    date_time=status_datetime,
+    status_comment=status_comment,
+)
+```
+
+---
+
+## 7. Экспорт `TaskStatus.xlsx`
+
+Если ты уже экспортируешь `TaskStatus` в Excel, добавь новую колонку в список:
+
+```python
+headers = [
+    "statusid",
+    "status",
+    "taskid",
+    "task_type",
+    "resultId",
+    "dateTime",
+    "statusComment",
+]
+```
+
+И SQL:
+
+```sql
+SELECT
+    statusid,
+    status,
+    taskid,
+    task_type,
+    resultId,
+    dateTime,
+    statusComment
+FROM TaskStatus
+ORDER BY statusid
+```
+
+---
+
+## 8. Пример запуска
+
+Отмена задания с причиной:
+
+```bat
+python sync.py ^
+  --mode status ^
+  --db "C:\sqlite\results.db" ^
+  --task-id 123 ^
+  --task-type AP ^
+  --status "Отменено" ^
+  --status-comment "Недостаточно материала для анализа"
+```
+
+Без комментария:
+
+```bat
+python sync.py ^
+  --mode status ^
+  --db "C:\sqlite\results.db" ^
+  --task-id 123 ^
+  --task-type AP ^
+  --status "Отменено"
+```
+
+В этом случае `statusComment` запишется как `NULL`.
