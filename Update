@@ -1,100 +1,278 @@
-По скрину видно, что у тебя **выполнилась только первая строка**:
+Да, такие ошибки **лучше обработать централизованно на уровне `repository.py`**, потому что именно там происходит `INSERT/UPDATE` в SQLite. Сейчас `save_rows()` просто вызывает `_insert_row()` / `_update_row()`, и `sqlite3.IntegrityError` пробрасывается наверх почти как есть, поэтому в Excel ты видишь технический текст `UNIQUE constraint failed...`. При ошибке твой `save_to_db()` всё равно откатывает транзакцию, так что данные не должны частично сохраниться — это хорошо.  
 
-```sql
-PRAGMA foreign_keys = OFF;
+Сделай так.
+
+## 1. В `repository.py` добавь импорт
+
+Вверх:
+
+```python
+import re
 ```
 
-В `Execution Log` справа последняя запись именно такая. То есть DBeaver не выполнил весь скрипт, он выполнил только текущий SQL statement под курсором.
+---
 
-Нужно не `Execute SQL Statement`, а именно **Execute SQL Script**.
+## 2. В `save_rows()` оберни INSERT/UPDATE в `try`
 
-Сделай так:
+Сейчас у тебя внутри цикла примерно так:
 
-1. Выдели весь скрипт целиком `Ctrl+A`.
-2. Нажми кнопку **Execute SQL Script** или `Alt+X`.
-3. После выполнения проверь:
-
-```sql
-PRAGMA table_info(TaskStatus);
+```python
+if pk_value is None:
+    new_id = self._insert_row(schema, row, include_pk=False)
+    result.inserted += 1
+    result.ids.append(new_id)
+else:
+    updated = self._update_row(schema, row)
+    if updated:
+        result.updated += 1
+        result.ids.append(int(pk_value))
+    else:
+        new_id = self._insert_row(schema, row, include_pk=True)
+        result.inserted += 1
+        result.ids.append(new_id)
 ```
 
-У `resultId` должно быть:
+Замени на:
+
+```python
+try:
+    if pk_value is None:
+        new_id = self._insert_row(schema, row, include_pk=False)
+        result.inserted += 1
+        result.ids.append(new_id)
+    else:
+        updated = self._update_row(schema, row)
+
+        if updated:
+            result.updated += 1
+            result.ids.append(int(pk_value))
+        else:
+            new_id = self._insert_row(schema, row, include_pk=True)
+            result.inserted += 1
+            result.ids.append(new_id)
+
+except sqlite3.IntegrityError as exc:
+    raise ValueError(
+        self._build_integrity_error_message(
+            schema=schema,
+            row=row,
+            row_index=index,
+            exc=exc,
+        )
+    ) from exc
+```
+
+То есть полный кусок внутри `save_rows()` будет ловить именно нарушения ограничений SQLite.
+
+---
+
+## 3. Внутрь класса `SQLiteRepository` добавь helpers
+
+Вставь эти методы ниже `save_rows()` или ближе к `_insert_row()`:
+
+```python
+    def _build_integrity_error_message(
+        self,
+        *,
+        schema: TableSchema,
+        row: dict[str, Any],
+        row_index: int,
+        exc: sqlite3.IntegrityError,
+    ) -> str:
+        raw_message = str(exc)
+
+        unique_columns = self._extract_unique_columns_from_integrity_error(
+            raw_message
+        )
+
+        if unique_columns:
+            return self._build_unique_constraint_message(
+                schema=schema,
+                row=row,
+                row_index=row_index,
+                columns=unique_columns,
+                raw_message=raw_message,
+            )
+
+        return (
+            f"Ошибка ограничения БД при сохранении таблицы {schema.db_table}, "
+            f"строка данных №{row_index}.\n\n"
+            f"Техническая ошибка SQLite:\n{raw_message}"
+        )
+
+    @staticmethod
+    def _extract_unique_columns_from_integrity_error(
+        message: str,
+    ) -> list[str]:
+        """
+        Из сообщения SQLite:
+            UNIQUE constraint failed: AP_results.sampleCode, AP_results.analyseNumber
+
+        возвращает:
+            ["sampleCode", "analyseNumber"]
+        """
+        match = re.search(
+            r"UNIQUE constraint failed:\s*(.+)$",
+            message,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            return []
+
+        raw_columns = match.group(1).split(",")
+
+        result: list[str] = []
+
+        for raw_column in raw_columns:
+            raw_column = raw_column.strip()
+
+            if "." in raw_column:
+                _, column_name = raw_column.rsplit(".", 1)
+            else:
+                column_name = raw_column
+
+            column_name = column_name.strip().strip('"').strip("'")
+
+            if column_name:
+                result.append(column_name)
+
+        return result
+
+    def _build_unique_constraint_message(
+        self,
+        *,
+        schema: TableSchema,
+        row: dict[str, Any],
+        row_index: int,
+        columns: list[str],
+        raw_message: str,
+    ) -> str:
+        key_parts: list[str] = []
+
+        for column in columns:
+            excel_name = schema.db_to_excel.get(column, column)
+            value = row.get(column)
+            key_parts.append(f"{excel_name} = {self._format_value_for_message(value)}")
+
+        key_text = ", ".join(key_parts)
+
+        existing = self._find_existing_row_by_columns(
+            schema=schema,
+            columns=columns,
+            row=row,
+        )
+
+        existing_text = ""
+
+        if existing is not None:
+            pk_name = schema.pk.db_name
+            existing_pk = existing.get(pk_name)
+
+            if existing_pk is not None:
+                existing_text = (
+                    f"\n\nВ БД уже есть строка с таким ключом: "
+                    f"{pk_name} = {existing_pk}."
+                )
+
+        # Специальное человекочитаемое сообщение для AP.
+        if (
+            schema.db_table == "AP_results"
+            and [c.lower() for c in columns] == ["samplecode", "analysenumber"]
+        ):
+            return (
+                "Нельзя сохранить AP: в БД уже есть результат с такой же парой "
+                "«шифр пробы + номер анализа».\n\n"
+                f"Проблемная пара:\n{key_text}"
+                f"{existing_text}\n\n"
+                "Проверь поле sampleCode и analyseNumber в форме. "
+                "Для AP эта пара должна быть уникальной."
+            )
+
+        return (
+            f"Нельзя сохранить таблицу {schema.db_table}: нарушено ограничение уникальности.\n\n"
+            f"Проблемная комбинация:\n{key_text}"
+            f"{existing_text}\n\n"
+            f"Строка данных №{row_index}.\n\n"
+            f"Техническая ошибка SQLite:\n{raw_message}"
+        )
+
+    def _find_existing_row_by_columns(
+        self,
+        *,
+        schema: TableSchema,
+        columns: list[str],
+        row: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        where_parts: list[str] = []
+        params: list[Any] = []
+
+        for column in columns:
+            value = self._empty_to_none(row.get(column))
+
+            if value is None:
+                where_parts.append(f"{self._q(column)} IS NULL")
+            else:
+                where_parts.append(f"{self._q(column)} = ?")
+                params.append(value)
+
+        select_columns = [schema.pk.db_name] + [
+            column for column in columns
+            if column != schema.pk.db_name
+        ]
+
+        columns_sql = self._columns_sql(select_columns)
+        where_sql = " AND ".join(where_parts)
+
+        sql = (
+            f"SELECT {columns_sql} "
+            f"FROM {self._q(schema.db_table)} "
+            f"WHERE {where_sql} "
+            f"LIMIT 1"
+        )
+
+        cur = self.conn.execute(sql, params)
+        existing = cur.fetchone()
+
+        if existing is None:
+            return None
+
+        return dict(existing)
+
+    @staticmethod
+    def _format_value_for_message(value: Any) -> str:
+        if value is None:
+            return "<пусто>"
+
+        text = str(value).strip()
+
+        if text == "":
+            return "<пусто>"
+
+        return f"'{text}'"
+```
+
+---
+
+После этого вместо такого сообщения:
 
 ```text
-notnull = 0
+IntegrityError: UNIQUE constraint failed: AP_results.sampleCode, AP_results.analyseNumber
 ```
 
-Вот нормальный скрипт ещё раз, с backup-таблицей:
+пользователь увидит примерно:
 
-```sql
-PRAGMA foreign_keys = OFF;
+```text
+Нельзя сохранить AP: в БД уже есть результат с такой же парой «шифр пробы + номер анализа».
 
-BEGIN IMMEDIATE TRANSACTION;
+Проблемная пара:
+sampleCode = '26-F471-UNK-3R-GS1', analyseNumber = '1'
 
-DROP TABLE IF EXISTS TaskStatus_old;
+В БД уже есть строка с таким ключом: resultIdAP = 123.
 
-ALTER TABLE TaskStatus
-RENAME TO TaskStatus_old;
-
-CREATE TABLE TaskStatus (
-    statusid INTEGER PRIMARY KEY AUTOINCREMENT,
-    status TEXT NOT NULL,
-    taskid INTEGER NOT NULL,
-    task_type TEXT NOT NULL,
-    resultId INTEGER,
-    dateTime TEXT,
-    statusComment TEXT
-);
-
-INSERT INTO TaskStatus (
-    statusid,
-    status,
-    taskid,
-    task_type,
-    resultId,
-    dateTime,
-    statusComment
-)
-SELECT
-    statusid,
-    status,
-    taskid,
-    task_type,
-    resultId,
-    dateTime,
-    statusComment
-FROM TaskStatus_old;
-
-CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid
-    ON TaskStatus (taskid);
-
-CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type
-    ON TaskStatus (taskid, task_type);
-
-CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type_statusid
-    ON TaskStatus (taskid, task_type, statusid);
-
-COMMIT;
-
-PRAGMA foreign_keys = ON;
+Проверь поле sampleCode и analyseNumber в форме. Для AP эта пара должна быть уникальной.
 ```
 
-После выполнения проверь:
+Тут хороший плюс в том, что это будет работать не только для AP. Для других уникальных индексов тоже будет нормальное общее сообщение: какая таблица, какая комбинация колонок и какие значения конфликтуют.
 
-```sql
-PRAGMA table_info(TaskStatus);
-
-SELECT COUNT(*) AS rows_new
-FROM TaskStatus;
-
-SELECT COUNT(*) AS rows_old
-FROM TaskStatus_old;
-```
-
-Если всё ок, можно удалить backup:
-
-```sql
-DROP TABLE TaskStatus_old;
-```
-
-На твоём скрине проблема не в SQL, а именно в том, что DBeaver выполнил **одну команду**, а не весь скрипт.
+Ещё можно потом сделать словарь красивых названий полей, чтобы вместо `sampleCode` писать `Шифр пробы`, а вместо `analyseNumber` — `Номер анализа`, но для первого шага уже будет сильно понятнее.
