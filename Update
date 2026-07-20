@@ -1,139 +1,100 @@
-Да, в SQLite для снятия `NOT NULL` с `resultId` проще всего пересоздать таблицу. У тебя Python уже работает с `TaskStatus` как с таблицей истории статусов: `statusid`, `status`, `taskid`, `task_type`, `resultId`, `dateTime`, плюс новый `statusComment` для причины/комментария статуса. `task_status.py` уже вставляет `statusComment` в `TaskStatus`, а экспорт сейчас читает основные поля `TaskStatus`.  
-
-### Если `statusComment` в таблице уже есть
+По скрину видно, что у тебя **выполнилась только первая строка**:
 
 ```sql
 PRAGMA foreign_keys = OFF;
-
-BEGIN TRANSACTION;
-
--- 1. Делаем полную копию старой таблицы с данными.
-DROP TABLE IF EXISTS TaskStatus_backup_before_nullable_resultId;
-
-CREATE TABLE TaskStatus_backup_before_nullable_resultId AS
-SELECT *
-FROM TaskStatus;
-
--- 2. Удаляем старую таблицу.
-DROP TABLE TaskStatus;
-
--- 3. Создаём новую таблицу.
--- Главное: resultId INTEGER без NOT NULL.
-CREATE TABLE TaskStatus (
-    statusid INTEGER PRIMARY KEY AUTOINCREMENT,
-    status TEXT NOT NULL,
-    taskid INTEGER NOT NULL,
-    task_type TEXT NOT NULL,
-    resultId INTEGER,
-    dateTime TEXT,
-    statusComment TEXT
-);
-
--- 4. Возвращаем данные.
-INSERT INTO TaskStatus (
-    statusid,
-    status,
-    taskid,
-    task_type,
-    resultId,
-    dateTime,
-    statusComment
-)
-SELECT
-    statusid,
-    status,
-    taskid,
-    task_type,
-    resultId,
-    dateTime,
-    statusComment
-FROM TaskStatus_backup_before_nullable_resultId;
-
--- 5. Индексы.
-CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid
-    ON TaskStatus (taskid);
-
-CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type
-    ON TaskStatus (taskid, task_type);
-
-CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type_statusid
-    ON TaskStatus (taskid, task_type, statusid);
-
-COMMIT;
-
-PRAGMA foreign_keys = ON;
 ```
 
-После проверки, что всё нормально, backup-таблицу можно удалить:
+В `Execution Log` справа последняя запись именно такая. То есть DBeaver не выполнил весь скрипт, он выполнил только текущий SQL statement под курсором.
 
-```sql
-DROP TABLE TaskStatus_backup_before_nullable_resultId;
-```
+Нужно не `Execute SQL Statement`, а именно **Execute SQL Script**.
 
-### Если `statusComment` ещё НЕ добавлен в старую таблицу
+Сделай так:
 
-Тогда используй этот вариант:
-
-```sql
-PRAGMA foreign_keys = OFF;
-
-BEGIN TRANSACTION;
-
-DROP TABLE IF EXISTS TaskStatus_backup_before_nullable_resultId;
-
-CREATE TABLE TaskStatus_backup_before_nullable_resultId AS
-SELECT *
-FROM TaskStatus;
-
-DROP TABLE TaskStatus;
-
-CREATE TABLE TaskStatus (
-    statusid INTEGER PRIMARY KEY AUTOINCREMENT,
-    status TEXT NOT NULL,
-    taskid INTEGER NOT NULL,
-    task_type TEXT NOT NULL,
-    resultId INTEGER,
-    dateTime TEXT,
-    statusComment TEXT
-);
-
-INSERT INTO TaskStatus (
-    statusid,
-    status,
-    taskid,
-    task_type,
-    resultId,
-    dateTime,
-    statusComment
-)
-SELECT
-    statusid,
-    status,
-    taskid,
-    task_type,
-    resultId,
-    dateTime,
-    NULL AS statusComment
-FROM TaskStatus_backup_before_nullable_resultId;
-
-CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid
-    ON TaskStatus (taskid);
-
-CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type
-    ON TaskStatus (taskid, task_type);
-
-CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type_statusid
-    ON TaskStatus (taskid, task_type, statusid);
-
-COMMIT;
-
-PRAGMA foreign_keys = ON;
-```
-
-Проверить результат можно так:
+1. Выдели весь скрипт целиком `Ctrl+A`.
+2. Нажми кнопку **Execute SQL Script** или `Alt+X`.
+3. После выполнения проверь:
 
 ```sql
 PRAGMA table_info(TaskStatus);
 ```
 
-У `resultId` в колонке `notnull` должно быть `0`.
+У `resultId` должно быть:
+
+```text
+notnull = 0
+```
+
+Вот нормальный скрипт ещё раз, с backup-таблицей:
+
+```sql
+PRAGMA foreign_keys = OFF;
+
+BEGIN IMMEDIATE TRANSACTION;
+
+DROP TABLE IF EXISTS TaskStatus_old;
+
+ALTER TABLE TaskStatus
+RENAME TO TaskStatus_old;
+
+CREATE TABLE TaskStatus (
+    statusid INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL,
+    taskid INTEGER NOT NULL,
+    task_type TEXT NOT NULL,
+    resultId INTEGER,
+    dateTime TEXT,
+    statusComment TEXT
+);
+
+INSERT INTO TaskStatus (
+    statusid,
+    status,
+    taskid,
+    task_type,
+    resultId,
+    dateTime,
+    statusComment
+)
+SELECT
+    statusid,
+    status,
+    taskid,
+    task_type,
+    resultId,
+    dateTime,
+    statusComment
+FROM TaskStatus_old;
+
+CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid
+    ON TaskStatus (taskid);
+
+CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type
+    ON TaskStatus (taskid, task_type);
+
+CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type_statusid
+    ON TaskStatus (taskid, task_type, statusid);
+
+COMMIT;
+
+PRAGMA foreign_keys = ON;
+```
+
+После выполнения проверь:
+
+```sql
+PRAGMA table_info(TaskStatus);
+
+SELECT COUNT(*) AS rows_new
+FROM TaskStatus;
+
+SELECT COUNT(*) AS rows_old
+FROM TaskStatus_old;
+```
+
+Если всё ок, можно удалить backup:
+
+```sql
+DROP TABLE TaskStatus_old;
+```
+
+На твоём скрине проблема не в SQL, а именно в том, что DBeaver выполнил **одну команду**, а не весь скрипт.
