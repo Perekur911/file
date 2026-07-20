@@ -1,595 +1,139 @@
-Да, ты прав: по актуальным файлам картина такая:
+Да, в SQLite для снятия `NOT NULL` с `resultId` проще всего пересоздать таблицу. У тебя Python уже работает с `TaskStatus` как с таблицей истории статусов: `statusid`, `status`, `taskid`, `task_type`, `resultId`, `dateTime`, плюс новый `statusComment` для причины/комментария статуса. `task_status.py` уже вставляет `statusComment` в `TaskStatus`, а экспорт сейчас читает основные поля `TaskStatus`.  
 
-`task_status.py` у тебя **уже частично переделан**: `ensure_latest_status_for_result(...)` уже принимает `status_comment` и вставляет его в `TaskStatus.statusComment`. 
-
-А вот в `sync.py` этот параметр **ещё не протянут** через `set_task_status`, `run_status`, `run_json`, `run_save`, `_ensure_task_statuses_for_results` и экспорт `TaskStatus.xlsx`. 
-
-Ниже что именно надо изменить.
-
----
-
-## 1. SQLite: добавить колонку
-
-Один раз выполнить в DBeaver:
+### Если `statusComment` в таблице уже есть
 
 ```sql
-ALTER TABLE TaskStatus
-ADD COLUMN statusComment TEXT;
-```
+PRAGMA foreign_keys = OFF;
 
----
+BEGIN TRANSACTION;
 
-## 2. `task_status.py`: немного поправить повторный статус
+-- 1. Делаем полную копию старой таблицы с данными.
+DROP TABLE IF EXISTS TaskStatus_backup_before_nullable_resultId;
 
-Сейчас у тебя комментарий обновляется только если повторно ставишь `Валидировано`. Я бы сделал, чтобы и повторная `Отменено` тоже обновляла дату/комментарий.
+CREATE TABLE TaskStatus_backup_before_nullable_resultId AS
+SELECT *
+FROM TaskStatus;
 
-В `ensure_latest_status_for_result` замени блок:
+-- 2. Удаляем старую таблицу.
+DROP TABLE TaskStatus;
 
-```python
-# Если последний статус уже такой же
-if latest_status == status:
+-- 3. Создаём новую таблицу.
+-- Главное: resultId INTEGER без NOT NULL.
+CREATE TABLE TaskStatus (
+    statusid INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL,
+    taskid INTEGER NOT NULL,
+    task_type TEXT NOT NULL,
+    resultId INTEGER,
+    dateTime TEXT,
+    statusComment TEXT
+);
 
-    # Для повторной валидации обновляем время/resultId/comment
-    if status == self.VALIDATED_STATUS:
-```
-
-на:
-
-```python
-# Если последний статус уже такой же
-if latest_status == status:
-
-    # Для повторной валидации/отмены обновляем время/resultId/comment
-    if status in (self.VALIDATED_STATUS, self.CANCELED_STATUS):
-```
-
-Остальной код внутри можешь оставить как есть.
-
-Логика будет такая:
-
-```text
-повторно Завершено   -> TaskStatus не трогаем
-повторно Валидировано -> обновляем dateTime/resultId/statusComment
-повторно Отменено     -> обновляем dateTime/resultId/statusComment
-```
-
----
-
-## 3. `sync.py`: протянуть `status_comment`
-
-### 3.1. `save_to_db`
-
-Было:
-
-```python
-def save_to_db(
-        self,
-        studies: list[StudySchema],
-        *,
-        task_status: str = TaskStatusRepository.COMPLETED_STATUS,
-) -> SyncReport:
-```
-
-Сделай:
-
-```python
-def save_to_db(
-        self,
-        studies: list[StudySchema],
-        *,
-        task_status: str = TaskStatusRepository.COMPLETED_STATUS,
-        status_comment: str | None = None,
-) -> SyncReport:
-```
-
-Ниже в вызовах добавить:
-
-```python
-self._save_single_table(
-    study.result_table,
-    task_status=task_status,
-    status_comment=status_comment,
+-- 4. Возвращаем данные.
+INSERT INTO TaskStatus (
+    statusid,
+    status,
+    taskid,
+    task_type,
+    resultId,
+    dateTime,
+    statusComment
 )
+SELECT
+    statusid,
+    status,
+    taskid,
+    task_type,
+    resultId,
+    dateTime,
+    statusComment
+FROM TaskStatus_backup_before_nullable_resultId;
+
+-- 5. Индексы.
+CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid
+    ON TaskStatus (taskid);
+
+CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type
+    ON TaskStatus (taskid, task_type);
+
+CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type_statusid
+    ON TaskStatus (taskid, task_type, statusid);
+
+COMMIT;
+
+PRAGMA foreign_keys = ON;
 ```
 
-и:
+После проверки, что всё нормально, backup-таблицу можно удалить:
 
-```python
-parent_report, child_report = self._save_parent_and_child(
-    study,
-    task_status=task_status,
-    status_comment=status_comment,
+```sql
+DROP TABLE TaskStatus_backup_before_nullable_resultId;
+```
+
+### Если `statusComment` ещё НЕ добавлен в старую таблицу
+
+Тогда используй этот вариант:
+
+```sql
+PRAGMA foreign_keys = OFF;
+
+BEGIN TRANSACTION;
+
+DROP TABLE IF EXISTS TaskStatus_backup_before_nullable_resultId;
+
+CREATE TABLE TaskStatus_backup_before_nullable_resultId AS
+SELECT *
+FROM TaskStatus;
+
+DROP TABLE TaskStatus;
+
+CREATE TABLE TaskStatus (
+    statusid INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL,
+    taskid INTEGER NOT NULL,
+    task_type TEXT NOT NULL,
+    resultId INTEGER,
+    dateTime TEXT,
+    statusComment TEXT
+);
+
+INSERT INTO TaskStatus (
+    statusid,
+    status,
+    taskid,
+    task_type,
+    resultId,
+    dateTime,
+    statusComment
 )
+SELECT
+    statusid,
+    status,
+    taskid,
+    task_type,
+    resultId,
+    dateTime,
+    NULL AS statusComment
+FROM TaskStatus_backup_before_nullable_resultId;
+
+CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid
+    ON TaskStatus (taskid);
+
+CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type
+    ON TaskStatus (taskid, task_type);
+
+CREATE INDEX IF NOT EXISTS idx_TaskStatus_taskid_task_type_statusid
+    ON TaskStatus (taskid, task_type, statusid);
+
+COMMIT;
+
+PRAGMA foreign_keys = ON;
 ```
 
----
+Проверить результат можно так:
 
-### 3.2. `_save_single_table`
-
-Было:
-
-```python
-def _save_single_table(
-        self,
-        schema: TableSchema,
-        *,
-        task_status: str,
-) -> SyncTableReport:
+```sql
+PRAGMA table_info(TaskStatus);
 ```
 
-Сделай:
-
-```python
-def _save_single_table(
-        self,
-        schema: TableSchema,
-        *,
-        task_status: str,
-        status_comment: str | None = None,
-) -> SyncTableReport:
-```
-
-И в `_ensure_task_statuses_for_results` добавить:
-
-```python
-status_comment=status_comment,
-```
-
-То есть:
-
-```python
-self._ensure_task_statuses_for_results(
-    study_code=schema.logical_name.replace("_RESULTS", ""),
-    result_schema=schema,
-    rows=prepared_rows,
-    saved_ids=save_result.ids or [],
-    status=task_status,
-    status_comment=status_comment,
-)
-```
-
----
-
-### 3.3. `_save_parent_and_child`
-
-Было:
-
-```python
-def _save_parent_and_child(
-        self,
-        study: StudySchema,
-        *,
-        task_status: str,
-) -> tuple[SyncTableReport, SyncTableReport]:
-```
-
-Сделай:
-
-```python
-def _save_parent_and_child(
-        self,
-        study: StudySchema,
-        *,
-        task_status: str,
-        status_comment: str | None = None,
-) -> tuple[SyncTableReport, SyncTableReport]:
-```
-
-И в `_ensure_task_statuses_for_results` добавить:
-
-```python
-status_comment=status_comment,
-```
-
-То есть:
-
-```python
-self._ensure_task_statuses_for_results(
-    study_code=study.code,
-    result_schema=parent_schema,
-    rows=parent_rows,
-    saved_ids=parent_ids,
-    status=task_status,
-    status_comment=status_comment,
-)
-```
-
----
-
-### 3.4. `_ensure_task_statuses_for_results`
-
-Было:
-
-```python
-def _ensure_task_statuses_for_results(
-        self,
-        *,
-        study_code: str,
-        result_schema: TableSchema,
-        rows: list[dict[str, Any]],
-        saved_ids: list[int],
-        status: str,
-) -> int:
-```
-
-Сделай:
-
-```python
-def _ensure_task_statuses_for_results(
-        self,
-        *,
-        study_code: str,
-        result_schema: TableSchema,
-        rows: list[dict[str, Any]],
-        saved_ids: list[int],
-        status: str,
-        status_comment: str | None = None,
-) -> int:
-```
-
-И в вызов `ensure_latest_status_for_result` добавить:
-
-```python
-status_comment=status_comment,
-```
-
-Полный кусок:
-
-```python
-was_created = self.task_status.ensure_latest_status_for_result(
-    taskid=taskid,
-    task_type=study_code,
-    status=status,
-    result_id=int(result_id),
-    date_time=self._get_status_datetime(
-        status=status,
-        result_schema=result_schema,
-        row=row,
-    ),
-    status_comment=status_comment,
-)
-```
-
----
-
-## 4. `sync.py`: режим `status`
-
-### 4.1. `set_task_status`
-
-Было:
-
-```python
-def set_task_status(
-        self,
-        *,
-        taskid: int,
-        task_type: str,
-        status: str,
-        result_id: int | None = None,
-        date_time: Any = None,
-) -> SyncReport:
-```
-
-Сделай:
-
-```python
-def set_task_status(
-        self,
-        *,
-        taskid: int,
-        task_type: str,
-        status: str,
-        result_id: int | None = None,
-        date_time: Any = None,
-        status_comment: str | None = None,
-) -> SyncReport:
-```
-
-И в вызов добавить:
-
-```python
-status_comment=status_comment,
-```
-
-```python
-created = self.task_status.ensure_latest_status_for_result(
-    taskid=taskid,
-    task_type=task_type,
-    status=status,
-    result_id=result_id,
-    date_time=self._get_status_datetime(
-        status=status,
-        explicit_date_time=date_time,
-    ),
-    status_comment=status_comment,
-)
-```
-
----
-
-### 4.2. `run_status`
-
-Было:
-
-```python
-def run_status(
-    db_path: str,
-    *,
-    taskid: int,
-    task_type: str,
-    status: str,
-    result_id: int | None = None,
-    date_time: Any = None,
-) -> SyncReport:
-```
-
-Сделай:
-
-```python
-def run_status(
-    db_path: str,
-    *,
-    taskid: int,
-    task_type: str,
-    status: str,
-    result_id: int | None = None,
-    date_time: Any = None,
-    status_comment: str | None = None,
-) -> SyncReport:
-```
-
-И передай дальше:
-
-```python
-return service.set_task_status(
-    taskid=taskid,
-    task_type=task_type,
-    status=status,
-    result_id=result_id,
-    date_time=date_time,
-    status_comment=status_comment,
-)
-```
-
----
-
-## 5. `run_save`
-
-Было:
-
-```python
-def run_save(
-    workbook: str,
-    db_path: str,
-    study_codes: list[str] | None = None,
-    task_status: str = TaskStatusRepository.COMPLETED_STATUS,
-) -> SyncReport:
-```
-
-Сделай:
-
-```python
-def run_save(
-    workbook: str,
-    db_path: str,
-    study_codes: list[str] | None = None,
-    task_status: str = TaskStatusRepository.COMPLETED_STATUS,
-    status_comment: str | None = None,
-) -> SyncReport:
-```
-
-И передай:
-
-```python
-return service.save_to_db(
-    get_studies(study_codes),
-    task_status=task_status,
-    status_comment=status_comment,
-)
-```
-
----
-
-## 6. `run_json`
-
-В сигнатуру добавить:
-
-```python
-status_comment: str | None = None,
-```
-
-Было:
-
-```python
-def run_json(
-    mode: str,
-    workbook: str | None,
-    db_path: str,
-    study_codes: list[str] | None = None,
-    project_number: str | None = None,
-    task_status: str = TaskStatusRepository.COMPLETED_STATUS,
-    taskid: int | None = None,
-    task_type: str | None = None,
-    result_id: int | None = None,
-    date_time: str | None = None,
-) -> str:
-```
-
-Сделай:
-
-```python
-def run_json(
-    mode: str,
-    workbook: str | None,
-    db_path: str,
-    study_codes: list[str] | None = None,
-    project_number: str | None = None,
-    task_status: str = TaskStatusRepository.COMPLETED_STATUS,
-    taskid: int | None = None,
-    task_type: str | None = None,
-    result_id: int | None = None,
-    date_time: str | None = None,
-    status_comment: str | None = None,
-) -> str:
-```
-
-В `mode == "save"`:
-
-```python
-report = run_save(
-    workbook,
-    db_path,
-    study_codes,
-    task_status=task_status,
-    status_comment=status_comment,
-)
-```
-
-В `mode == "status"`:
-
-```python
-report = run_status(
-    db_path,
-    taskid=taskid,
-    task_type=task_type,
-    status=task_status,
-    result_id=result_id,
-    date_time=date_time,
-    status_comment=status_comment,
-)
-```
-
----
-
-## 7. `main`: добавить CLI-аргумент
-
-После `--date-time` добавь:
-
-```python
-parser.add_argument(
-    "--status-comment",
-    default=None,
-    help="Комментарий к статусу задания, например причина отмены",
-)
-```
-
-И в `run_json(...)` добавить:
-
-```python
-status_comment=args.status_comment,
-```
-
-Итоговый кусок:
-
-```python
-json_result = run_json(
-    mode=args.mode,
-    workbook=args.workbook,
-    db_path=args.db,
-    study_codes=args.studies,
-    project_number=args.project,
-    task_status=args.status,
-    taskid=args.task_id,
-    task_type=args.task_type,
-    result_id=args.result_id,
-    date_time=args.date_time,
-    status_comment=args.status_comment,
-)
-```
-
----
-
-## 8. Экспорт `TaskStatus.xlsx`
-
-В `export_task_status_to_excel` сейчас `statusComment` ещё не выгружается. Нужно добавить.
-
-### Было:
-
-```python
-headers = [
-    "statusid",
-    "status",
-    "taskid",
-    "task_type",
-    "resultId",
-    "dateTime",
-]
-```
-
-Сделай:
-
-```python
-headers = [
-    "statusid",
-    "status",
-    "taskid",
-    "task_type",
-    "resultId",
-    "dateTime",
-    "statusComment",
-]
-```
-
-И SQL:
-
-```python
-rows = conn.execute(
-    """
-    SELECT
-        statusid,
-        status,
-        taskid,
-        task_type,
-        resultId,
-        dateTime,
-        statusComment
-    FROM TaskStatus
-    ORDER BY statusid
-    """
-).fetchall()
-```
-
-Ширины колонок можно расширить:
-
-```python
-column_widths = {
-    "A": 12,
-    "B": 18,
-    "C": 12,
-    "D": 14,
-    "E": 12,
-    "F": 22,
-    "G": 45,
-}
-```
-
----
-
-## 9. Пример запуска
-
-Отмена с причиной:
-
-```bat
-python sync.py ^
-  --mode status ^
-  --db "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" ^
-  --task-id 123 ^
-  --task-type AP ^
-  --status "Отменено" ^
-  --status-comment "Недостаточно материала для анализа"
-```
-
-Без комментария:
-
-```bat
-python sync.py ^
-  --mode status ^
-  --db "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" ^
-  --task-id 123 ^
-  --task-type AP ^
-  --status "Отменено"
-```
-
-Тогда `statusComment` будет `NULL`.
-
-Главное: в `task_status.py` ты уже сделал основную часть. Сейчас нужно в основном **протянуть параметр через `sync.py`** и добавить колонку в SQLite/экспорт.
+У `resultId` в колонке `notnull` должно быть `0`.
