@@ -1,289 +1,655 @@
-Да, ты правильно заметил нюанс.
+Да. Взял структуру проверки из `Validate_GOR_Form`, а набор полей — из фактической структуры `SSF_results`: у SSF вместо GOR-оборудования используются `ssfEquipment`, две ловушки `m0Trap1...m1Trap2`, а среди полученных проб нет `TedlarBag`.  
 
-Сейчас `RefreshTasks_SelectFile` после макроса **не вызовется**, если внутри вызванного макроса возникнет необработанная ошибка: `CallMacroCore` сразу уйдёт в `CleanFail`.
-
-Но если `Save_AP`, `Save_CCE` и т. п. завершаются так:
+Метод самостоятельный: дополнительные `SSF_AddError`, `SSF_IsBooleanLike` и другие хелперы создавать не нужно.
 
 ```vba
-If Not Validate_AP_Form(i) Then
-    Exit Sub
-End If
-```
-
-или:
-
-```vba
-If syncFailed Then
-    MsgBox "Ошибка сохранения"
-    Exit Sub
-End If
-```
-
-для `CallMacroCore` это выглядит как **нормальное успешное завершение**, поэтому блок `REFRESH_TASKS_AFTER` выполнится.
-
-## Лучше возвращать `Boolean`
-
-Глобальную переменную я бы точно не заводил. Она легко останется в старом состоянии после ошибки, особенно при вложенных вызовах.
-
-При этом превращать вообще все процедуры в `Function` не нужно. Достаточно процедур верхнего уровня, результат которых важен для дальнейшего сценария:
-
-* `Save_AP`;
-* `Validate_AP`;
-* `Save_CCE`;
-* `Save_All`;
-* аналогичные Save/Validate других исследований;
-* возможно, `RefreshTasks_SelectFile`, если её отмена или ошибка тоже должна останавливать цепочку.
-
-Обёртки для Ribbon спокойно остаются `Sub`.
-
-## Обновлённый `CallMacroCore`
-
-Он совместим и со старыми `Sub`, и с новыми `Function As Boolean`:
-
-* обычный `Sub` считается успешно выполненным;
-* функция, вернувшая `False`, останавливает цепочку;
-* функция, вернувшая `True`, разрешает `AFTER`;
-* необработанная ошибка по-прежнему уходит в `CleanFail`.
-
-```vba
-Private Function CallMacroCore( _
-    ByVal macroName As String, _
-    ByVal hasMacroParam As Boolean, _
-    ByVal macroParam As Variant, _
-    ByVal refreshTasksMode As Long, _
-    ByVal studies As Variant _
+Private Function Validate_SSF_Form( _
+    ByVal formIndex As Long _
 ) As Boolean
 
-    CallMacroCore = False
+    Validate_SSF_Form = False
 
     Dim wb As Workbook
     Set wb = ActiveWorkbook
 
-    On Error GoTo CleanFail
+    Dim sheetSSF As Worksheet
+    Set sheetSSF = wb.Worksheets("SSF")
 
-    StartMacro wb, studies
+    Dim SSFTable As ListObject
+    Set SSFTable = wb.Worksheets("SSF_results") _
+                     .ListObjects("SSF_results")
 
-    If refreshTasksMode = REFRESH_TASKS_BEFORE _
-       Or refreshTasksMode = REFRESH_TASKS_BEFORE_AND_AFTER Then
+    Dim errors As String
+    Dim errorCount As Long
 
-        Call RefreshTasks_SelectFile
+    If formIndex <= 0 Then
+        MsgBox _
+            "Некорректный номер формы SSF: " & formIndex, _
+            vbExclamation
+        Exit Function
+    End If
+
+    If Not NamedRangeExists( _
+        wb, _
+        "SSF_" & formIndex & "_sampleCode" _
+    ) Then
+
+        MsgBox _
+            "Форма SSF_" & formIndex & " не найдена.", _
+            vbExclamation
+        Exit Function
 
     End If
 
-    Dim macroResult As Variant
-    Dim macroSucceeded As Boolean
+    If Not ListObjectExists( _
+        sheetSSF, _
+        "SSF_source_" & formIndex _
+    ) Then
 
-    ' Старые процедуры Sub ничего не возвращают.
-    ' Поэтому по умолчанию считаем вызов успешным.
-    macroSucceeded = True
-
-    If hasMacroParam Then
-        macroResult = Application.Run(macroName, macroParam)
-    Else
-        macroResult = Application.Run(macroName)
-    End If
-
-    ' Только явный Boolean влияет на продолжение цепочки.
-    If VarType(macroResult) = vbBoolean Then
-        macroSucceeded = CBool(macroResult)
-    End If
-
-    If Not macroSucceeded Then
-        GoTo CleanExit
-    End If
-
-    If refreshTasksMode = REFRESH_TASKS_AFTER _
-       Or refreshTasksMode = REFRESH_TASKS_BEFORE_AND_AFTER Then
-
-        Call RefreshTasks_SelectFile
+        MsgBox _
+            "Таблица SSF_source_" & formIndex & _
+            " не найдена.", _
+            vbExclamation
+        Exit Function
 
     End If
 
-    CallMacroCore = True
+    Dim headerCell As Range
+    Dim fieldName As String
+    Dim rangeName As String
 
-CleanExit:
+    Dim rng As Range
+    Dim valueText As String
+    Dim fieldError As String
 
-    EndMacro wb, studies
+    Dim hasVialCount As Boolean
+    Dim hasBottleCount As Boolean
+    Dim hasPicsCount As Boolean
+    Dim countFieldsSeen As Long
 
-    If HasAnyStudy(studies) Then
-        wb.Worksheets(CStr(studies(0))).Activate
+    For Each headerCell In SSFTable.HeaderRowRange.Cells
+
+        fieldName = CStr(headerCell.Value)
+
+        If fieldName = "dateTimeSync" Then
+            GoTo next_header
+        End If
+
+        rangeName = _
+            "SSF_" & formIndex & "_" & fieldName
+
+        If Not NamedRangeExists(wb, rangeName) Then
+
+            errorCount = errorCount + 1
+
+            errors = errors & errorCount & _
+                     ". Не найден именованный диапазон: " & _
+                     rangeName & vbCrLf
+
+            GoTo next_header
+
+        End If
+
+        Set rng = sheetSSF.Range(rangeName)
+
+        If IsError(rng.Value) Then
+
+            errorCount = errorCount + 1
+
+            errors = errors & errorCount & _
+                     ". " & rangeName & _
+                     " содержит ошибку Excel: " & _
+                     rng.Text & _
+                     " (" & rng.Worksheet.Name & _
+                     "!" & rng.Address(False, False) & ")" & _
+                     vbCrLf
+
+            GoTo next_header
+
+        End If
+
+        valueText = Trim$(CStr(rng.Value))
+        fieldError = ""
+
+        Select Case fieldName
+
+            Case "resultIdSSF"
+
+                ' До первого сохранения может быть пустым.
+
+
+            Case "TaskId"
+
+                If valueText <> "" Then
+
+                    If Not IsNumeric(rng.Value) Then
+
+                        fieldError = _
+                            "Номер задания должен быть числом: " & _
+                            rangeName
+
+                    ElseIf CDbl(rng.Value) < 0 Then
+
+                        fieldError = _
+                            "Номер задания не может быть отрицательным: " & _
+                            rangeName
+
+                    End If
+
+                End If
+
+
+            Case "page"
+
+                If valueText <> "" Then
+
+                    If Not IsNumeric(rng.Value) Then
+
+                        fieldError = _
+                            "Номер страницы должен быть числом: " & _
+                            rangeName
+
+                    ElseIf CDbl(rng.Value) <= 0 Then
+
+                        fieldError = _
+                            "Номер страницы должен быть больше нуля: " & _
+                            rangeName
+
+                    ElseIf CDbl(rng.Value) <> Fix(CDbl(rng.Value)) Then
+
+                        fieldError = _
+                            "Номер страницы должен быть целым числом: " & _
+                            rangeName
+
+                    End If
+
+                End If
+
+
+            Case "sampleCode"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не заполнен шифр исходной пробы: " & _
+                        rangeName
+
+                End If
+
+
+            Case "Correct"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не заполнено поле корректности расчёта: " & _
+                        rangeName
+
+                ElseIf VarType(rng.Value) <> vbBoolean Then
+
+                    Select Case LCase$(valueText)
+
+                        Case "true", "false", _
+                             "истина", "ложь", _
+                             "1", "0", _
+                             "да", "нет", _
+                             "+", "-"
+
+                            ' Допустимое логическое значение.
+
+                        Case Else
+
+                            fieldError = _
+                                "Поле корректности должно содержать " & _
+                                "True/False: " & rangeName
+
+                    End Select
+
+                End If
+
+
+            Case "dateStart"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не заполнена дата начала: " & _
+                        rangeName
+
+                ElseIf Not IsDate(rng.Value) Then
+
+                    fieldError = _
+                        "Дата начала должна быть датой: " & _
+                        rangeName
+
+                End If
+
+
+            Case "dateEnd"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не заполнена дата окончания: " & _
+                        rangeName
+
+                ElseIf Not IsDate(rng.Value) Then
+
+                    fieldError = _
+                        "Дата окончания должна быть датой: " & _
+                        rangeName
+
+                End If
+
+
+            Case "timeStart"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не заполнено время начала: " & _
+                        rangeName
+
+                ElseIf Not rng.Text Like "##:##" _
+                   And Not rng.Text Like "#:##" Then
+
+                    fieldError = _
+                        "Время начала должно быть временем: " & _
+                        rangeName
+
+                End If
+
+
+            Case "timeEnd"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не заполнено время окончания: " & _
+                        rangeName
+
+                ElseIf Not rng.Text Like "##:##" _
+                   And Not rng.Text Like "#:##" Then
+
+                    fieldError = _
+                        "Время окончания должно быть временем: " & _
+                        rangeName
+
+                End If
+
+
+            Case "operator"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не указан исполнитель: " & _
+                        rangeName
+
+                ElseIf Not IsValidExecutor(rng.Value) Then
+
+                    fieldError = _
+                        "Неверно указан исполнитель: " & _
+                        rangeName
+
+                End If
+
+
+            Case "analyseNumber"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не указан номер анализа: " & _
+                        rangeName
+
+                End If
+
+
+            Case "equipmentForTransfer"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не указано оборудование переноса пробы: " & _
+                        rangeName
+
+                End If
+
+
+            Case "equipForTransferNumber"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не указан номер оборудования переноса пробы: " & _
+                        rangeName
+
+                End If
+
+
+            Case "ssfEquipment"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не указано оборудование SSF: " & _
+                        rangeName
+
+                End If
+
+
+            Case "ssfEquipmentNumber"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не указан номер оборудования SSF: " & _
+                        rangeName
+
+                End If
+
+
+            Case "Ppic"
+
+                If valueText <> "" Then
+
+                    If Not valueText Like "20##-P##" Then
+
+                        fieldError = _
+                            "Формат номера пикнометра должен быть " & _
+                            "20##-P##: " & rangeName
+
+                    End If
+
+                End If
+
+
+            Case "PtransferMPa"
+
+                If valueText <> "" Then
+
+                    If Not IsNumeric(rng.Value) Then
+
+                        fieldError = _
+                            "Давление переноса, МПа, должно быть числом: " & _
+                            rangeName
+
+                    ElseIf CDbl(rng.Value) < 0 Then
+
+                        fieldError = _
+                            "Давление переноса, МПа, " & _
+                            "не может быть отрицательным: " & _
+                            rangeName
+
+                    End If
+
+                End If
+
+
+            Case "Ptransfer"
+
+                If valueText <> "" Then
+
+                    If Not IsNumeric(rng.Value) Then
+
+                        fieldError = _
+                            "Давление переноса должно быть числом: " & _
+                            rangeName
+
+                    ElseIf CDbl(rng.Value) < 0 Then
+
+                        fieldError = _
+                            "Давление переноса не может быть отрицательным: " & _
+                            rangeName
+
+                    End If
+
+                End If
+
+
+            Case "Tfact"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не указана фактическая температура: " & _
+                        rangeName
+
+                ElseIf Not IsNumeric(rng.Value) Then
+
+                    fieldError = _
+                        "Фактическая температура должна быть числом: " & _
+                        rangeName
+
+                ElseIf CDbl(rng.Value) < -20 _
+                   Or CDbl(rng.Value) > 140 Then
+
+                    fieldError = _
+                        "Фактическая температура должна быть " & _
+                        "от -20 до 140 °C: " & rangeName
+
+                End If
+
+
+            Case "T"
+
+                If valueText <> "" Then
+
+                    If Not IsNumeric(rng.Value) Then
+
+                        fieldError = _
+                            "Температура должна быть числом: " & _
+                            rangeName
+
+                    ElseIf CDbl(rng.Value) < -20 _
+                       Or CDbl(rng.Value) > 140 Then
+
+                        fieldError = _
+                            "Температура должна быть " & _
+                            "от -20 до 140 °C: " & rangeName
+
+                    End If
+
+                End If
+
+
+            Case "VGTot"
+
+                If valueText = "" Then
+
+                    fieldError = _
+                        "Не указан общий объём газа VGTot: " & _
+                        rangeName
+
+                ElseIf Not IsNumeric(rng.Value) Then
+
+                    fieldError = _
+                        "VGTot должен быть числом: " & _
+                        rangeName
+
+                ElseIf CDbl(rng.Value) <= 0 Then
+
+                    fieldError = _
+                        "VGTot должен быть больше нуля: " & _
+                        rangeName
+
+                End If
+
+
+            Case "V1", _
+                 "V2", _
+                 "Patm", _
+                 "circ2", _
+                 "VHeTot", _
+                 "VHeCyl", _
+                 "VGCyl", _
+                 "m0Trap1", _
+                 "m1Trap1", _
+                 "m0Trap2", _
+                 "m1Trap2", _
+                 "d20", _
+                 "Vtransfer", _
+                 "Vgas", _
+                 "VgasSt", _
+                 "mLiq", _
+                 "VLiq", _
+                 "GF"
+
+                If valueText <> "" Then
+
+                    If Not IsNumeric(rng.Value) Then
+
+                        fieldError = _
+                            fieldName & _
+                            " должен быть числом: " & _
+                            rangeName
+
+                    ElseIf CDbl(rng.Value) < 0 Then
+
+                        fieldError = _
+                            fieldName & _
+                            " не может быть отрицательным: " & _
+                            rangeName
+
+                    End If
+
+                End If
+
+
+            Case "deltaMatBalance", _
+                 "AP"
+
+                If valueText <> "" Then
+
+                    If Not IsNumeric(rng.Value) Then
+
+                        fieldError = _
+                            fieldName & _
+                            " должен быть числом: " & _
+                            rangeName
+
+                    End If
+
+                End If
+
+
+            Case "vial", _
+                 "bottle", _
+                 "pics"
+
+                countFieldsSeen = countFieldsSeen + 1
+
+                If valueText <> "" Then
+
+                    If Not IsNumeric(rng.Value) Then
+
+                        If valueText <> "-" Then
+
+                            fieldError = _
+                                "Количество " & fieldName & _
+                                " должно быть целым числом или '-': " & _
+                                rangeName
+
+                        End If
+
+                    ElseIf CDbl(rng.Value) < 0 Then
+
+                        fieldError = _
+                            "Количество " & fieldName & _
+                            " не может быть отрицательным: " & _
+                            rangeName
+
+                    ElseIf CDbl(rng.Value) <> _
+                           Fix(CDbl(rng.Value)) Then
+
+                        fieldError = _
+                            "Количество " & fieldName & _
+                            " должно быть целым числом: " & _
+                            rangeName
+
+                    ElseIf CDbl(rng.Value) > 0 Then
+
+                        Select Case fieldName
+
+                            Case "vial"
+                                hasVialCount = True
+
+                            Case "bottle"
+                                hasBottleCount = True
+
+                            Case "pics"
+                                hasPicsCount = True
+
+                        End Select
+
+                    End If
+
+                End If
+
+        End Select
+
+        If fieldError <> "" Then
+
+            errorCount = errorCount + 1
+
+            errors = errors & errorCount & _
+                     ". " & fieldError & vbCrLf
+
+        End If
+
+next_header:
+    Next headerCell
+
+    If countFieldsSeen = 3 Then
+
+        If Not hasVialCount _
+           And Not hasBottleCount _
+           And Not hasPicsCount Then
+
+            errorCount = errorCount + 1
+
+            errors = errors & errorCount & _
+                     ". Не указана ни одна полученная проба: " & _
+                     "vial / bottle / pics." & vbCrLf
+
+        End If
+
     End If
 
-    Exit Function
+    If errorCount > 0 Then
 
-CleanFail:
+        MsgBox _
+            "SSF_" & formIndex & _
+            " не сохранена. Исправьте ошибки:" & _
+            vbCrLf & vbCrLf & errors, _
+            vbExclamation
 
-    Dim errNumber As Long
-    Dim errSource As String
-    Dim errDescription As String
+        Exit Function
 
-    errNumber = Err.Number
-    errSource = Err.Source
-    errDescription = Err.Description
+    End If
 
-    On Error Resume Next
-    EndMacro wb, studies
-    On Error GoTo 0
-
-    Err.Raise errNumber, errSource, errDescription
+    Validate_SSF_Form = True
 
 End Function
 ```
 
-Твои внешние методы могут остаться почти без изменений:
+В `Save_SSF` вызов нужно поставить после автоматического определения `analyseNumber`, но до `CheckSSFTask` и `CreateSampleCodeSSF3`:
 
 ```vba
-Public Sub CallMacro(ByVal macroName As String, ParamArray studies() As Variant)
-
-    Call CallMacroCore( _
-        macroName, _
-        False, _
-        Empty, _
-        REFRESH_TASKS_NONE, _
-        studies _
+If sheetSSF.Range("SSF_" & i & "_analyseNumber").Value = "" Then
+    Call checkNumberAnalys2( _
+        sheetSSF.Range("SSF_" & i & "_sampleCode").Value, _
+        "SSF" _
     )
-
-End Sub
-```
-
-```vba
-Public Sub CallMacroEx( _
-    ByVal macroName As String, _
-    ByVal refreshTasksMode As Long, _
-    ParamArray studies() As Variant _
-)
-
-    Call CallMacroCore( _
-        macroName, _
-        False, _
-        Empty, _
-        refreshTasksMode, _
-        studies _
-    )
-
-End Sub
-```
-
-## Как переделать `Save_AP`
-
-Было:
-
-```vba
-Public Sub Save_AP(Optional ByVal taskStatus As String = "")
-```
-
-Станет:
-
-```vba
-Public Function Save_AP( _
-    Optional ByVal taskStatus As String = "" _
-) As Boolean
-
-    Save_AP = False
-```
-
-Все места, где сейчас неудачное завершение:
-
-```vba
-If Not Validate_AP_Form(i) Then
-    Exit Sub
 End If
-```
 
-заменяются на:
-
-```vba
-If Not Validate_AP_Form(i) Then
+If Not Validate_SSF_Form(i) Then
     Exit Function
 End If
+
+Dim curTask As Variant
+curTask = sheetSSF.Range("SSF_" & i & "_TaskId").Value
 ```
 
-В месте проверки Python:
-
-```vba
-If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
-
-    Call DeleteEmptyRowsByColumns( _
-        APSourceDataTable, _
-        COL_ROW_ID_DB, _
-        Array(COL_PRESSURE_DB, COL_DENSITY_DB) _
-    )
-
-    Call Load_AP_results_to_forms("by_key", "resultIdAP")
-
-Else
-
-    MsgBox _
-        "Python-синхронизация AP не подтвердила успешное сохранение." & _
-        vbCrLf & vbCrLf & syncResult, _
-        vbExclamation
-
-    Exit Function
-
-End If
-```
-
-И только в самом конце успешного метода:
-
-```vba
-    Save_AP = True
-
-End Function
-```
-
-Если сохранять было нечего, нужно заранее решить семантику. Обычно я бы считал это успешным штатным завершением:
-
-```vba
-If parentRows.Count = 0 Then
-    Save_AP = True
-    Exit Function
-End If
-```
-
-## `Validate_AP`
-
-Сейчас он вызывает `Save_AP` как обычный `Sub`. Его тоже нужно сделать функцией:
-
-```vba
-Public Function Validate_AP() As Boolean
-
-    Validate_AP = Save_AP("Валидировано")
-
-End Function
-```
-
-## `Save_All`
-
-Это особенно важно: он должен остановиться на первом неудачном исследовании.
-
-```vba
-Public Function Save_All() As Boolean
-
-    Save_All = False
-
-    If Not Save_OP() Then Exit Function
-    If Not Save_OPOH() Then Exit Function
-    If Not Save_GC() Then Exit Function
-    If Not Save_BP() Then Exit Function
-    If Not Save_AP() Then Exit Function
-    If Not Save_GOR() Then Exit Function
-    If Not Save_SSF() Then Exit Function
-    If Not Save_REC() Then Exit Function
-    If Not Save_EMV() Then Exit Function
-    If Not Save_JOIN() Then Exit Function
-    If Not Save_CCE() Then Exit Function
-
-    Save_All = True
-
-End Function
-```
-
-Таким образом, при неудачной валидации или неподтверждённой Python-синхронизации:
-
-1. конкретный `Save_*` вернёт `False`;
-2. `CallMacroCore` увидит `False`;
-3. `RefreshTasks_SelectFile` после сохранения не запустится;
-4. `EndMacro` всё равно выполнится;
-5. лист исследования активируется обратно.
-
-Это намного надёжнее глобального флага. Для ожидаемых ситуаций вроде неудачной валидации используем `False`, а реальные неожиданные ошибки продолжаем передавать через `Err.Raise`.
+То есть при ошибке одной заполненной формы весь `Save_SSF` вернёт оставленный по умолчанию `MACRO_FAILED`, и последующее обновление заданий не запустится.
