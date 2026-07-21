@@ -1,388 +1,289 @@
-Public Sub RemoveCCEFormFromCharts(ByVal formIndex As Long)
+Да, ты правильно заметил нюанс.
+
+Сейчас `RefreshTasks_SelectFile` после макроса **не вызовется**, если внутри вызванного макроса возникнет необработанная ошибка: `CallMacroCore` сразу уйдёт в `CleanFail`.
+
+Но если `Save_AP`, `Save_CCE` и т. п. завершаются так:
+
+```vba
+If Not Validate_AP_Form(i) Then
+    Exit Sub
+End If
+```
+
+или:
+
+```vba
+If syncFailed Then
+    MsgBox "Ошибка сохранения"
+    Exit Sub
+End If
+```
+
+для `CallMacroCore` это выглядит как **нормальное успешное завершение**, поэтому блок `REFRESH_TASKS_AFTER` выполнится.
+
+## Лучше возвращать `Boolean`
+
+Глобальную переменную я бы точно не заводил. Она легко останется в старом состоянии после ошибки, особенно при вложенных вызовах.
+
+При этом превращать вообще все процедуры в `Function` не нужно. Достаточно процедур верхнего уровня, результат которых важен для дальнейшего сценария:
+
+* `Save_AP`;
+* `Validate_AP`;
+* `Save_CCE`;
+* `Save_All`;
+* аналогичные Save/Validate других исследований;
+* возможно, `RefreshTasks_SelectFile`, если её отмена или ошибка тоже должна останавливать цепочку.
+
+Обёртки для Ribbon спокойно остаются `Sub`.
+
+## Обновлённый `CallMacroCore`
+
+Он совместим и со старыми `Sub`, и с новыми `Function As Boolean`:
+
+* обычный `Sub` считается успешно выполненным;
+* функция, вернувшая `False`, останавливает цепочку;
+* функция, вернувшая `True`, разрешает `AFTER`;
+* необработанная ошибка по-прежнему уходит в `CleanFail`.
+
+```vba
+Private Function CallMacroCore( _
+    ByVal macroName As String, _
+    ByVal hasMacroParam As Boolean, _
+    ByVal macroParam As Variant, _
+    ByVal refreshTasksMode As Long, _
+    ByVal studies As Variant _
+) As Boolean
+
+    CallMacroCore = False
 
     Dim wb As Workbook
     Set wb = ActiveWorkbook
-
-    Dim ws As Worksheet
-    Set ws = wb.Worksheets("CCE")
-
-    Dim tableName As String
-    tableName = "CCE_source_" & formIndex
-
-    Dim sourceTable As ListObject
-
-    On Error Resume Next
-    Set sourceTable = ws.ListObjects(tableName)
-    On Error GoTo 0
-
-    Dim matchTokens(0 To 7) As String
-    Dim columnRange As Range
-
-    If Not sourceTable Is Nothing Then
-
-        If Not sourceTable.DataBodyRange Is Nothing Then
-
-            Set columnRange = sourceTable _
-                .ListColumns("Давление, МПа, абс.") _
-                .DataBodyRange
-
-            matchTokens(0) = columnRange.Address
-            matchTokens(1) = columnRange.Cells(1, 1).Address & ":"
-
-            Set columnRange = sourceTable _
-                .ListColumns("Доля жидкости, график") _
-                .DataBodyRange
-
-            matchTokens(2) = columnRange.Address
-            matchTokens(3) = columnRange.Cells(1, 1).Address & ":"
-
-            Set columnRange = sourceTable _
-                .ListColumns("Объем ячейки, график") _
-                .DataBodyRange
-
-            matchTokens(4) = columnRange.Address
-            matchTokens(5) = columnRange.Cells(1, 1).Address & ":"
-
-            Set columnRange = sourceTable _
-                .ListColumns("Доля газа, график") _
-                .DataBodyRange
-
-            matchTokens(6) = columnRange.Address
-            matchTokens(7) = columnRange.Cells(1, 1).Address & ":"
-
-        End If
-
-    End If
-
-    Dim chartNames As Variant
-
-    chartNames = Array( _
-        "CCE_ch_GasLiqPct", _
-        "CCE_ch_GasVcell", _
-        "CCE_ch_LiqGasPct" _
-    )
-
-    Dim chartIndex As Long
-    Dim seriesIndex As Long
-    Dim tokenIndex As Long
-
-    Dim targetChart As Chart
-    Dim currentSeries As Series
-
-    Dim seriesFormula As String
-    Dim needDelete As Boolean
-
-    For chartIndex = LBound(chartNames) To UBound(chartNames)
-
-        Set targetChart = Nothing
-
-        On Error Resume Next
-        Set targetChart = ws.ChartObjects(CStr(chartNames(chartIndex))).Chart
-        On Error GoTo 0
-
-        If Not targetChart Is Nothing Then
-
-            For seriesIndex = targetChart.SeriesCollection.Count To 1 Step -1
-
-                Set currentSeries = targetChart.SeriesCollection(seriesIndex)
-
-                seriesFormula = ""
-
-                On Error Resume Next
-                seriesFormula = currentSeries.Formula
-                On Error GoTo 0
-
-                needDelete = False
-
-                ' На случай, если Excel сохранил в формуле
-                ' структурную ссылку на таблицу.
-                If InStr( _
-                    1, _
-                    seriesFormula, _
-                    tableName, _
-                    vbTextCompare _
-                ) > 0 Then
-
-                    needDelete = True
-
-                End If
-
-                ' На случай, если Excel преобразовал ссылку
-                ' на таблицу в обычные адреса диапазонов.
-                If Not needDelete Then
-
-                    For tokenIndex = _
-                        LBound(matchTokens) To UBound(matchTokens)
-
-                        If matchTokens(tokenIndex) <> "" Then
-
-                            If InStr( _
-                                1, _
-                                seriesFormula, _
-                                matchTokens(tokenIndex), _
-                                vbTextCompare _
-                            ) > 0 Then
-
-                                needDelete = True
-                                Exit For
-
-                            End If
-
-                        End If
-
-                    Next tokenIndex
-
-                End If
-
-                If needDelete Then
-
-                    On Error Resume Next
-                    currentSeries.Delete
-                    On Error GoTo 0
-
-                End If
-
-            Next seriesIndex
-
-        End If
-
-    Next chartIndex
-
-End Sub
-
-
-Public Sub AddCCEFormToCharts(ByVal formIndex As Long)
 
     On Error GoTo CleanFail
 
-    Dim wb As Workbook
-    Set wb = ActiveWorkbook
+    StartMacro wb, studies
 
-    Dim ws As Worksheet
-    Set ws = wb.Worksheets("CCE")
+    If refreshTasksMode = REFRESH_TASKS_BEFORE _
+       Or refreshTasksMode = REFRESH_TASKS_BEFORE_AND_AFTER Then
 
-    Dim tableName As String
-    tableName = "CCE_source_" & formIndex
+        Call RefreshTasks_SelectFile
 
-    Dim sourceTable As ListObject
-    Set sourceTable = ws.ListObjects(tableName)
-
-    If sourceTable.DataBodyRange Is Nothing Then
-        Exit Sub
     End If
 
-    Dim typeSample As String
+    Dim macroResult As Variant
+    Dim macroSucceeded As Boolean
 
-    typeSample = Trim$(CStr( _
-        wb.Names("CCE_" & formIndex & "_typeSample") _
-            .RefersToRange.Cells(1, 1).Value _
-    ))
+    ' Старые процедуры Sub ничего не возвращают.
+    ' Поэтому по умолчанию считаем вызов успешным.
+    macroSucceeded = True
 
-    Dim sampleCode As String
-    Dim analyseNumber As String
-    Dim Tfact As String
-    Dim legendText As String
-
-    sampleCode = Trim$(CStr( _
-        wb.Names("CCE_" & formIndex & "_sampleCode") _
-            .RefersToRange.Cells(1, 1).Value _
-    ))
-
-    analyseNumber = Trim$(CStr( _
-        wb.Names("CCE_" & formIndex & "_analyseNumber") _
-            .RefersToRange.Cells(1, 1).Value _
-    ))
-
-    Tfact = Trim$(CStr( _
-        wb.Names("CCE_" & formIndex & "_Tfact") _
-            .RefersToRange.Cells(1, 1).Value _
-    ))
-
-    legendText = sampleCode & " CCE"
-
-    If analyseNumber <> "" Then
-        legendText = legendText & " " & analyseNumber
+    If hasMacroParam Then
+        macroResult = Application.Run(macroName, macroParam)
+    Else
+        macroResult = Application.Run(macroName)
     End If
 
-    If Tfact <> "" Then
-        legendText = legendText & " " & Tfact
+    ' Только явный Boolean влияет на продолжение цепочки.
+    If VarType(macroResult) = vbBoolean Then
+        macroSucceeded = CBool(macroResult)
     End If
 
-    Dim pressureRange As Range
-    Dim liquidPctRange As Range
-    Dim VcellRange As Range
-    Dim gasPctRange As Range
+    If Not macroSucceeded Then
+        GoTo CleanExit
+    End If
 
-    Set pressureRange = sourceTable _
-        .ListColumns("Давление, МПа, абс.") _
-        .DataBodyRange
+    If refreshTasksMode = REFRESH_TASKS_AFTER _
+       Or refreshTasksMode = REFRESH_TASKS_BEFORE_AND_AFTER Then
 
-    Set liquidPctRange = sourceTable _
-        .ListColumns("Доля жидкости, график") _
-        .DataBodyRange
+        Call RefreshTasks_SelectFile
 
-    Set VcellRange = sourceTable _
-        .ListColumns("Объем ячейки, график") _
-        .DataBodyRange
+    End If
 
-    Set gasPctRange = sourceTable _
-        .ListColumns("Доля газа, график") _
-        .DataBodyRange
+    CallMacroCore = True
 
-    ' Сначала проверяем все три графика.
-    ' Если эта форма уже где-то добавлена — ничего не делаем.
-    Dim chartNames As Variant
+CleanExit:
 
-    chartNames = Array( _
-        "CCE_ch_GasLiqPct", _
-        "CCE_ch_GasVcell", _
-        "CCE_ch_LiqGasPct" _
-    )
+    EndMacro wb, studies
 
-    Dim matchTokens(0 To 7) As String
+    If HasAnyStudy(studies) Then
+        wb.Worksheets(CStr(studies(0))).Activate
+    End If
 
-    matchTokens(0) = pressureRange.Address
-    matchTokens(1) = pressureRange.Cells(1, 1).Address & ":"
-
-    matchTokens(2) = liquidPctRange.Address
-    matchTokens(3) = liquidPctRange.Cells(1, 1).Address & ":"
-
-    matchTokens(4) = VcellRange.Address
-    matchTokens(5) = VcellRange.Cells(1, 1).Address & ":"
-
-    matchTokens(6) = gasPctRange.Address
-    matchTokens(7) = gasPctRange.Cells(1, 1).Address & ":"
-
-    Dim chartIndex As Long
-    Dim seriesIndex As Long
-    Dim tokenIndex As Long
-
-    Dim targetChart As Chart
-    Dim currentSeries As Series
-
-    Dim seriesFormula As String
-
-    For chartIndex = LBound(chartNames) To UBound(chartNames)
-
-        Set targetChart = Nothing
-
-        On Error Resume Next
-        Set targetChart = ws.ChartObjects(CStr(chartNames(chartIndex))).Chart
-        On Error GoTo CleanFail
-
-        If Not targetChart Is Nothing Then
-
-            For seriesIndex = 1 To targetChart.SeriesCollection.Count
-
-                Set currentSeries = _
-                    targetChart.SeriesCollection(seriesIndex)
-
-                seriesFormula = ""
-
-                On Error Resume Next
-                seriesFormula = currentSeries.Formula
-                On Error GoTo CleanFail
-
-                If InStr( _
-                    1, _
-                    seriesFormula, _
-                    tableName, _
-                    vbTextCompare _
-                ) > 0 Then
-
-                    Exit Sub
-
-                End If
-
-                For tokenIndex = _
-                    LBound(matchTokens) To UBound(matchTokens)
-
-                    If matchTokens(tokenIndex) <> "" Then
-
-                        If InStr( _
-                            1, _
-                            seriesFormula, _
-                            matchTokens(tokenIndex), _
-                            vbTextCompare _
-                        ) > 0 Then
-
-                            Exit Sub
-
-                        End If
-
-                    End If
-
-                Next tokenIndex
-
-            Next seriesIndex
-
-        End If
-
-    Next chartIndex
-
-    Dim newSeries As Series
-
-    Select Case UCase$(typeSample)
-
-        Case "GAS"
-
-            Set targetChart = _
-                ws.ChartObjects("CCE_ch_GasLiqPct").Chart
-
-            Set newSeries = _
-                targetChart.SeriesCollection.NewSeries
-
-            With newSeries
-                .Name = legendText
-                .XValues = pressureRange
-                .Values = liquidPctRange
-            End With
-
-            Set targetChart = _
-                ws.ChartObjects("CCE_ch_GasVcell").Chart
-
-            Set newSeries = _
-                targetChart.SeriesCollection.NewSeries
-
-            With newSeries
-                .Name = legendText
-                .XValues = pressureRange
-                .Values = VcellRange
-            End With
-
-
-        Case "LIQUID"
-
-            Set targetChart = _
-                ws.ChartObjects("CCE_ch_LiqGasPct").Chart
-
-            Set newSeries = _
-                targetChart.SeriesCollection.NewSeries
-
-            With newSeries
-                .Name = legendText
-                .XValues = pressureRange
-                .Values = gasPctRange
-            End With
-
-
-        Case Else
-
-            MsgBox _
-                "Неизвестный тип пробы в диапазоне CCE_" & _
-                formIndex & "_typeSample: " & typeSample, _
-                vbExclamation
-
-    End Select
-
-    Exit Sub
+    Exit Function
 
 CleanFail:
 
-    MsgBox _
-        "Не удалось добавить данные формы CCE_" & _
-        formIndex & " на графики." & vbCrLf & vbCrLf & _
-        Err.Description, _
-        vbExclamation
+    Dim errNumber As Long
+    Dim errSource As String
+    Dim errDescription As String
+
+    errNumber = Err.Number
+    errSource = Err.Source
+    errDescription = Err.Description
+
+    On Error Resume Next
+    EndMacro wb, studies
+    On Error GoTo 0
+
+    Err.Raise errNumber, errSource, errDescription
+
+End Function
+```
+
+Твои внешние методы могут остаться почти без изменений:
+
+```vba
+Public Sub CallMacro(ByVal macroName As String, ParamArray studies() As Variant)
+
+    Call CallMacroCore( _
+        macroName, _
+        False, _
+        Empty, _
+        REFRESH_TASKS_NONE, _
+        studies _
+    )
 
 End Sub
+```
+
+```vba
+Public Sub CallMacroEx( _
+    ByVal macroName As String, _
+    ByVal refreshTasksMode As Long, _
+    ParamArray studies() As Variant _
+)
+
+    Call CallMacroCore( _
+        macroName, _
+        False, _
+        Empty, _
+        refreshTasksMode, _
+        studies _
+    )
+
+End Sub
+```
+
+## Как переделать `Save_AP`
+
+Было:
+
+```vba
+Public Sub Save_AP(Optional ByVal taskStatus As String = "")
+```
+
+Станет:
+
+```vba
+Public Function Save_AP( _
+    Optional ByVal taskStatus As String = "" _
+) As Boolean
+
+    Save_AP = False
+```
+
+Все места, где сейчас неудачное завершение:
+
+```vba
+If Not Validate_AP_Form(i) Then
+    Exit Sub
+End If
+```
+
+заменяются на:
+
+```vba
+If Not Validate_AP_Form(i) Then
+    Exit Function
+End If
+```
+
+В месте проверки Python:
+
+```vba
+If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
+
+    Call DeleteEmptyRowsByColumns( _
+        APSourceDataTable, _
+        COL_ROW_ID_DB, _
+        Array(COL_PRESSURE_DB, COL_DENSITY_DB) _
+    )
+
+    Call Load_AP_results_to_forms("by_key", "resultIdAP")
+
+Else
+
+    MsgBox _
+        "Python-синхронизация AP не подтвердила успешное сохранение." & _
+        vbCrLf & vbCrLf & syncResult, _
+        vbExclamation
+
+    Exit Function
+
+End If
+```
+
+И только в самом конце успешного метода:
+
+```vba
+    Save_AP = True
+
+End Function
+```
+
+Если сохранять было нечего, нужно заранее решить семантику. Обычно я бы считал это успешным штатным завершением:
+
+```vba
+If parentRows.Count = 0 Then
+    Save_AP = True
+    Exit Function
+End If
+```
+
+## `Validate_AP`
+
+Сейчас он вызывает `Save_AP` как обычный `Sub`. Его тоже нужно сделать функцией:
+
+```vba
+Public Function Validate_AP() As Boolean
+
+    Validate_AP = Save_AP("Валидировано")
+
+End Function
+```
+
+## `Save_All`
+
+Это особенно важно: он должен остановиться на первом неудачном исследовании.
+
+```vba
+Public Function Save_All() As Boolean
+
+    Save_All = False
+
+    If Not Save_OP() Then Exit Function
+    If Not Save_OPOH() Then Exit Function
+    If Not Save_GC() Then Exit Function
+    If Not Save_BP() Then Exit Function
+    If Not Save_AP() Then Exit Function
+    If Not Save_GOR() Then Exit Function
+    If Not Save_SSF() Then Exit Function
+    If Not Save_REC() Then Exit Function
+    If Not Save_EMV() Then Exit Function
+    If Not Save_JOIN() Then Exit Function
+    If Not Save_CCE() Then Exit Function
+
+    Save_All = True
+
+End Function
+```
+
+Таким образом, при неудачной валидации или неподтверждённой Python-синхронизации:
+
+1. конкретный `Save_*` вернёт `False`;
+2. `CallMacroCore` увидит `False`;
+3. `RefreshTasks_SelectFile` после сохранения не запустится;
+4. `EndMacro` всё равно выполнится;
+5. лист исследования активируется обратно.
+
+Это намного надёжнее глобального флага. Для ожидаемых ситуаций вроде неудачной валидации используем `False`, а реальные неожиданные ошибки продолжаем передавать через `Err.Raise`.
