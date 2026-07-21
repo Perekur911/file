@@ -1,1 +1,388 @@
+Public Sub RemoveCCEFormFromCharts(ByVal formIndex As Long)
 
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim ws As Worksheet
+    Set ws = wb.Worksheets("CCE")
+
+    Dim tableName As String
+    tableName = "CCE_source_" & formIndex
+
+    Dim sourceTable As ListObject
+
+    On Error Resume Next
+    Set sourceTable = ws.ListObjects(tableName)
+    On Error GoTo 0
+
+    Dim matchTokens(0 To 7) As String
+    Dim columnRange As Range
+
+    If Not sourceTable Is Nothing Then
+
+        If Not sourceTable.DataBodyRange Is Nothing Then
+
+            Set columnRange = sourceTable _
+                .ListColumns("Давление, МПа, абс.") _
+                .DataBodyRange
+
+            matchTokens(0) = columnRange.Address
+            matchTokens(1) = columnRange.Cells(1, 1).Address & ":"
+
+            Set columnRange = sourceTable _
+                .ListColumns("Доля жидкости, график") _
+                .DataBodyRange
+
+            matchTokens(2) = columnRange.Address
+            matchTokens(3) = columnRange.Cells(1, 1).Address & ":"
+
+            Set columnRange = sourceTable _
+                .ListColumns("Объем ячейки, график") _
+                .DataBodyRange
+
+            matchTokens(4) = columnRange.Address
+            matchTokens(5) = columnRange.Cells(1, 1).Address & ":"
+
+            Set columnRange = sourceTable _
+                .ListColumns("Доля газа, график") _
+                .DataBodyRange
+
+            matchTokens(6) = columnRange.Address
+            matchTokens(7) = columnRange.Cells(1, 1).Address & ":"
+
+        End If
+
+    End If
+
+    Dim chartNames As Variant
+
+    chartNames = Array( _
+        "CCE_ch_GasLiqPct", _
+        "CCE_ch_GasVcell", _
+        "CCE_ch_LiqGasPct" _
+    )
+
+    Dim chartIndex As Long
+    Dim seriesIndex As Long
+    Dim tokenIndex As Long
+
+    Dim targetChart As Chart
+    Dim currentSeries As Series
+
+    Dim seriesFormula As String
+    Dim needDelete As Boolean
+
+    For chartIndex = LBound(chartNames) To UBound(chartNames)
+
+        Set targetChart = Nothing
+
+        On Error Resume Next
+        Set targetChart = ws.ChartObjects(CStr(chartNames(chartIndex))).Chart
+        On Error GoTo 0
+
+        If Not targetChart Is Nothing Then
+
+            For seriesIndex = targetChart.SeriesCollection.Count To 1 Step -1
+
+                Set currentSeries = targetChart.SeriesCollection(seriesIndex)
+
+                seriesFormula = ""
+
+                On Error Resume Next
+                seriesFormula = currentSeries.Formula
+                On Error GoTo 0
+
+                needDelete = False
+
+                ' На случай, если Excel сохранил в формуле
+                ' структурную ссылку на таблицу.
+                If InStr( _
+                    1, _
+                    seriesFormula, _
+                    tableName, _
+                    vbTextCompare _
+                ) > 0 Then
+
+                    needDelete = True
+
+                End If
+
+                ' На случай, если Excel преобразовал ссылку
+                ' на таблицу в обычные адреса диапазонов.
+                If Not needDelete Then
+
+                    For tokenIndex = _
+                        LBound(matchTokens) To UBound(matchTokens)
+
+                        If matchTokens(tokenIndex) <> "" Then
+
+                            If InStr( _
+                                1, _
+                                seriesFormula, _
+                                matchTokens(tokenIndex), _
+                                vbTextCompare _
+                            ) > 0 Then
+
+                                needDelete = True
+                                Exit For
+
+                            End If
+
+                        End If
+
+                    Next tokenIndex
+
+                End If
+
+                If needDelete Then
+
+                    On Error Resume Next
+                    currentSeries.Delete
+                    On Error GoTo 0
+
+                End If
+
+            Next seriesIndex
+
+        End If
+
+    Next chartIndex
+
+End Sub
+
+
+Public Sub AddCCEFormToCharts(ByVal formIndex As Long)
+
+    On Error GoTo CleanFail
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim ws As Worksheet
+    Set ws = wb.Worksheets("CCE")
+
+    Dim tableName As String
+    tableName = "CCE_source_" & formIndex
+
+    Dim sourceTable As ListObject
+    Set sourceTable = ws.ListObjects(tableName)
+
+    If sourceTable.DataBodyRange Is Nothing Then
+        Exit Sub
+    End If
+
+    Dim typeSample As String
+
+    typeSample = Trim$(CStr( _
+        wb.Names("CCE_" & formIndex & "_typeSample") _
+            .RefersToRange.Cells(1, 1).Value _
+    ))
+
+    Dim sampleCode As String
+    Dim analyseNumber As String
+    Dim Tfact As String
+    Dim legendText As String
+
+    sampleCode = Trim$(CStr( _
+        wb.Names("CCE_" & formIndex & "_sampleCode") _
+            .RefersToRange.Cells(1, 1).Value _
+    ))
+
+    analyseNumber = Trim$(CStr( _
+        wb.Names("CCE_" & formIndex & "_analyseNumber") _
+            .RefersToRange.Cells(1, 1).Value _
+    ))
+
+    Tfact = Trim$(CStr( _
+        wb.Names("CCE_" & formIndex & "_Tfact") _
+            .RefersToRange.Cells(1, 1).Value _
+    ))
+
+    legendText = sampleCode & " CCE"
+
+    If analyseNumber <> "" Then
+        legendText = legendText & " " & analyseNumber
+    End If
+
+    If Tfact <> "" Then
+        legendText = legendText & " " & Tfact
+    End If
+
+    Dim pressureRange As Range
+    Dim liquidPctRange As Range
+    Dim VcellRange As Range
+    Dim gasPctRange As Range
+
+    Set pressureRange = sourceTable _
+        .ListColumns("Давление, МПа, абс.") _
+        .DataBodyRange
+
+    Set liquidPctRange = sourceTable _
+        .ListColumns("Доля жидкости, график") _
+        .DataBodyRange
+
+    Set VcellRange = sourceTable _
+        .ListColumns("Объем ячейки, график") _
+        .DataBodyRange
+
+    Set gasPctRange = sourceTable _
+        .ListColumns("Доля газа, график") _
+        .DataBodyRange
+
+    ' Сначала проверяем все три графика.
+    ' Если эта форма уже где-то добавлена — ничего не делаем.
+    Dim chartNames As Variant
+
+    chartNames = Array( _
+        "CCE_ch_GasLiqPct", _
+        "CCE_ch_GasVcell", _
+        "CCE_ch_LiqGasPct" _
+    )
+
+    Dim matchTokens(0 To 7) As String
+
+    matchTokens(0) = pressureRange.Address
+    matchTokens(1) = pressureRange.Cells(1, 1).Address & ":"
+
+    matchTokens(2) = liquidPctRange.Address
+    matchTokens(3) = liquidPctRange.Cells(1, 1).Address & ":"
+
+    matchTokens(4) = VcellRange.Address
+    matchTokens(5) = VcellRange.Cells(1, 1).Address & ":"
+
+    matchTokens(6) = gasPctRange.Address
+    matchTokens(7) = gasPctRange.Cells(1, 1).Address & ":"
+
+    Dim chartIndex As Long
+    Dim seriesIndex As Long
+    Dim tokenIndex As Long
+
+    Dim targetChart As Chart
+    Dim currentSeries As Series
+
+    Dim seriesFormula As String
+
+    For chartIndex = LBound(chartNames) To UBound(chartNames)
+
+        Set targetChart = Nothing
+
+        On Error Resume Next
+        Set targetChart = ws.ChartObjects(CStr(chartNames(chartIndex))).Chart
+        On Error GoTo CleanFail
+
+        If Not targetChart Is Nothing Then
+
+            For seriesIndex = 1 To targetChart.SeriesCollection.Count
+
+                Set currentSeries = _
+                    targetChart.SeriesCollection(seriesIndex)
+
+                seriesFormula = ""
+
+                On Error Resume Next
+                seriesFormula = currentSeries.Formula
+                On Error GoTo CleanFail
+
+                If InStr( _
+                    1, _
+                    seriesFormula, _
+                    tableName, _
+                    vbTextCompare _
+                ) > 0 Then
+
+                    Exit Sub
+
+                End If
+
+                For tokenIndex = _
+                    LBound(matchTokens) To UBound(matchTokens)
+
+                    If matchTokens(tokenIndex) <> "" Then
+
+                        If InStr( _
+                            1, _
+                            seriesFormula, _
+                            matchTokens(tokenIndex), _
+                            vbTextCompare _
+                        ) > 0 Then
+
+                            Exit Sub
+
+                        End If
+
+                    End If
+
+                Next tokenIndex
+
+            Next seriesIndex
+
+        End If
+
+    Next chartIndex
+
+    Dim newSeries As Series
+
+    Select Case UCase$(typeSample)
+
+        Case "GAS"
+
+            Set targetChart = _
+                ws.ChartObjects("CCE_ch_GasLiqPct").Chart
+
+            Set newSeries = _
+                targetChart.SeriesCollection.NewSeries
+
+            With newSeries
+                .Name = legendText
+                .XValues = pressureRange
+                .Values = liquidPctRange
+            End With
+
+            Set targetChart = _
+                ws.ChartObjects("CCE_ch_GasVcell").Chart
+
+            Set newSeries = _
+                targetChart.SeriesCollection.NewSeries
+
+            With newSeries
+                .Name = legendText
+                .XValues = pressureRange
+                .Values = VcellRange
+            End With
+
+
+        Case "LIQUID"
+
+            Set targetChart = _
+                ws.ChartObjects("CCE_ch_LiqGasPct").Chart
+
+            Set newSeries = _
+                targetChart.SeriesCollection.NewSeries
+
+            With newSeries
+                .Name = legendText
+                .XValues = pressureRange
+                .Values = gasPctRange
+            End With
+
+
+        Case Else
+
+            MsgBox _
+                "Неизвестный тип пробы в диапазоне CCE_" & _
+                formIndex & "_typeSample: " & typeSample, _
+                vbExclamation
+
+    End Select
+
+    Exit Sub
+
+CleanFail:
+
+    MsgBox _
+        "Не удалось добавить данные формы CCE_" & _
+        formIndex & " на графики." & vbCrLf & vbCrLf & _
+        Err.Description, _
+        vbExclamation
+
+End Sub
