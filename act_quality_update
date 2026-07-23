@@ -1,0 +1,203 @@
+Да, тут причина понятная: `create_quality_act.py` сейчас берёт значения из таблиц формы, складывает их в `gas_act_tbl` / `liq_act_tbl`, а потом `write_defined_range_table()` просто пишет `cell.value = value` без преобразования. Поэтому если из формы прилетело `"7,184"` или `"21.063"` строкой, в акт оно тоже попадает строкой. 
+
+Я бы не конвертировал **вообще все строки, похожие на числа**, потому что можно случайно сломать шифры проб, номера скважин, номера контейнеров и т.д. Лучше конвертировать числовые строки только для колонок результатов `OP_...`, `BP_...`, `GC_...`.
+
+### 1. Добавь импорт `re`
+
+Вверху `create_quality_act.py`:
+
+```python
+import re
+```
+
+---
+
+### 2. Добавь helpers рядом с `to_float_or_none`
+
+```python
+def parse_number_for_excel(value: Any) -> Any:
+    """
+    Преобразует строковые числа в int/float для записи в Excel.
+
+    '7,184'  -> 7.184
+    '21.063' -> 21.063
+    '5'      -> 5
+    '-'      -> '-'
+    '25-F123-GS1' -> без изменений
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return value
+
+    if not isinstance(value, str):
+        return value
+
+    original = value
+    text = value.strip()
+
+    if text == "" or text == "-":
+        return original
+
+    # убираем обычные и неразрывные пробелы внутри числа
+    compact = text.replace("\xa0", "").replace(" ", "")
+
+    # только простое число, без букв/шифров/дат
+    if not re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", compact):
+        return original
+
+    normalized = compact.replace(",", ".")
+
+    try:
+        number = float(normalized)
+    except ValueError:
+        return original
+
+    # если было целое число без десятичного разделителя — пишем int
+    if "," not in compact and "." not in compact and number.is_integer():
+        return int(number)
+
+    return number
+
+
+def should_convert_act_column_to_number(header_name: Any) -> bool:
+    """
+    Конвертируем в число только результатные блоки OP/BP/GC.
+
+    LIF-часть не трогаем, чтобы случайно не превратить шифры/номера/коды в числа.
+    """
+    if header_name is None:
+        return False
+
+    text = str(header_name).strip()
+
+    if "_" not in text:
+        return False
+
+    prefix, field = text.split("_", 1)
+
+    prefix = prefix.strip().upper()
+    field = field.strip().lower()
+
+    if prefix not in {"OP", "BP", "GC"}:
+        return False
+
+    # Явно текстовые поля результатов.
+    if field in {
+        "samplecode",
+        "date",
+        "operator",
+        "comment",
+        "punit",
+        "equipment",
+        "equipmentnumber",
+        "presence",
+        "phase",
+    }:
+        return False
+
+    return True
+
+
+def normalize_act_table_value(value: Any, header_name: Any) -> Any:
+    if should_convert_act_column_to_number(header_name):
+        return parse_number_for_excel(value)
+
+    return value
+```
+
+---
+
+### 3. Замени `write_defined_range_table`
+
+Было:
+
+```python
+def write_defined_range_table(
+    wb,
+    defined_name: str,
+    data: list[list[Any]],
+    data_row_count: int,
+) -> None:
+    dn = wb.defined_names[defined_name]
+
+    for sheet_name, coord in dn.destinations:
+        ws = wb[sheet_name]
+        cell_range = ws[coord]
+
+        for idx, (row_cells, row_data) in enumerate(zip(cell_range, data)):
+            if idx == 0:
+                continue
+
+            if idx > data_row_count:
+                break
+
+            for cell, value in zip(row_cells, row_data):
+                if value is not None:
+                    cell.value = value
+```
+
+Сделай так:
+
+```python
+def write_defined_range_table(
+    wb,
+    defined_name: str,
+    data: list[list[Any]],
+    data_row_count: int,
+) -> None:
+    dn = wb.defined_names[defined_name]
+
+    headers = data[0] if data else []
+
+    for sheet_name, coord in dn.destinations:
+        ws = wb[sheet_name]
+        cell_range = ws[coord]
+
+        for idx, (row_cells, row_data) in enumerate(zip(cell_range, data)):
+            if idx == 0:
+                continue
+
+            if idx > data_row_count:
+                break
+
+            for col_idx, (cell, value) in enumerate(zip(row_cells, row_data)):
+                if value is None:
+                    continue
+
+                header_name = headers[col_idx] if col_idx < len(headers) else ""
+
+                cell.value = normalize_act_table_value(
+                    value,
+                    header_name,
+                )
+```
+
+---
+
+После этого колонки типа:
+
+```text
+OP_deltaPopenPCT
+OP_PopenMPa
+BP_bpMPa
+GC_gasvolumePCT
+```
+
+будут записываться числами, даже если из формы прилетели строками `"7,184"`.
+
+А вот такие поля не будут случайно превращаться в числа:
+
+```text
+LIF_sampleCode
+LIF_Project
+LIF_Field
+OP_operator
+OP_comment
+```
+
+Если окажется, что в `LIF` тоже есть числовые поля, которые должны быть именно числами, их лучше добавить отдельным белым списком, а не конвертировать весь `LIF` подряд.
