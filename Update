@@ -1,27 +1,124 @@
-Да, верно, `dateTimeSync` нужно исключить, иначе в шапку `dates` может попасть дата синхронизации, а не дата выполнения работ.
+Да, можно. Почти наверняка картинку ломает **не копирование файла**, а последующее открытие/сохранение акта через `openpyxl`.
 
-В `create_opoh_quality_act.py` в функции `collect_opoh_datetime_values` нужно заменить блок:
+`shutil.copy2(...)` должен копировать файл 1-в-1 вместе с картинками. А вот `openpyxl.load_workbook(...); wb.save(...)` может потерять картинки/фигуры/объекты Excel, особенно если это не обычная вставленная картинка, а shape, camera picture, объект, логотип и т.п.
 
-```python
-for key, value in opoh_row.items():
-    if "datetime" in normalize_text(key).lower() and not is_empty(value):
-        result.append(value)
-```
+Лучшее решение: **созданный акт заполнять через `xlwings`, а не через `openpyxl`**. Excel сам сохранит файл и не потеряет картинку.
 
-на такой:
+То есть в `create_opoh_quality_act.py` надо заменить логику:
 
 ```python
-for key, value in opoh_row.items():
-    key_text = normalize_text(key).lower()
+act_wb = load_workbook(new_act_path)
 
-    # dateTimeSync — служебная дата синхронизации,
-    # в диапазон дат выполнения ОПОХ её включать нельзя.
-    if key_text == "datetimesync":
-        continue
+# заполнение
+# ...
 
-    if "datetime" in key_text and not is_empty(value):
-        result.append(value)
+act_wb.save(new_act_path)
+act_wb.close()
 ```
 
-Я поправил файл здесь:
-[Скачать обновлённый create_opoh_quality_act.py](sandbox:/mnt/data/create_opoh_quality_act.py)
+на открытие через Excel:
+
+```python
+app = xw.App(visible=False, add_book=False)
+app.display_alerts = False
+app.screen_updating = False
+
+try:
+    act_book = app.books.open(str(new_act_path), update_links=False, read_only=False)
+
+    # заполнение шапки, таблицы, скрытие строк
+
+    act_book.save()
+    act_book.close()
+finally:
+    app.quit()
+```
+
+Для именованных диапазонов через `xlwings` helper такой:
+
+```python
+def write_named_value_xw(book: xw.Book, name: str, value: Any) -> None:
+    if value is None:
+        return
+
+    try:
+        book.names[name].refers_to_range.value = value
+    except Exception:
+        # если какого-то имени нет в шаблоне — можно молча пропустить
+        # или raise, если хочешь строгую проверку
+        pass
+```
+
+Для записи таблицы с `A18`:
+
+```python
+def write_act_table_xw(
+    book: xw.Book,
+    *,
+    sheet_name: str,
+    start_cell: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    max_hide_row: int = 32,
+) -> None:
+    sheet = book.sheets[sheet_name]
+
+    matrix = []
+
+    for row in rows:
+        matrix_row = []
+
+        for column in columns:
+            if is_blank_act_column(column):
+                matrix_row.append(None)
+            else:
+                matrix_row.append(row.get(column))
+
+        matrix.append(matrix_row)
+
+    if matrix:
+        sheet.range(start_cell).resize(len(matrix), len(columns)).value = matrix
+
+    start_row = sheet.range(start_cell).row
+    used_last_row = start_row + len(matrix) - 1
+
+    if used_last_row < max_hide_row:
+        sheet.range(f"{used_last_row + 1}:{max_hide_row}").api.EntireRow.Hidden = True
+```
+
+А чтение логических заголовков из строки 17 можно тоже через `xlwings`:
+
+```python
+XL_TO_LEFT = -4159
+
+
+def read_act_headers_xw(
+    book: xw.Book,
+    *,
+    sheet_name: str = "Акт качества",
+    header_row: int = 17,
+) -> list[str]:
+    sheet = book.sheets[sheet_name]
+
+    last_col = sheet.api.Cells(header_row, sheet.api.Columns.Count).End(XL_TO_LEFT).Column
+    values = sheet.range((header_row, 1), (header_row, last_col)).value
+
+    if not isinstance(values, list):
+        values = [values]
+
+    result = []
+
+    for idx, value in enumerate(values, start=1):
+        text = normalize_text(value)
+
+        if text:
+            result.append(text)
+        else:
+            result.append(f"__blank_{idx}")
+
+    return result
+```
+
+Главное правило: **не сохранять шаблонный акт через `openpyxl`**, если в нём есть картинки/фигуры. Можно читать данные из рабочей формы как угодно, но итоговый файл акта лучше открывать, заполнять и сохранять через Excel/xlwings.
+
+Быстрая проверка: временно закомментируй всё после `shutil.copy2(...)`. Если в просто скопированном файле картинка есть, значит виноват точно `openpyxl.save()`.
