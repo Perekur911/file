@@ -14,8 +14,6 @@ from pathlib import Path
 from typing import Any
 
 import xlwings as xw
-from openpyxl import load_workbook
-from openpyxl.utils.cell import coordinate_from_string
 
 
 # =============================================================================
@@ -203,100 +201,197 @@ class ResultTable:
 
 
 # =============================================================================
-# openpyxl named ranges / template helpers
+# xlwings named ranges / template helpers
 # =============================================================================
 
-def read_defined_range_table(wb, defined_name: str) -> list[list[Any]]:
-    dn = wb.defined_names[defined_name]
+def _short_defined_name(name: Any) -> str:
+    """Возвращает имя без префикса листа, например Sheet1!MyName -> MyName."""
+    text = str(name).strip()
 
-    for sheet_name, coord in dn.destinations:
-        ws = wb[sheet_name]
-        cell_range = ws[coord]
-        return [[cell.value for cell in row] for row in cell_range]
+    if "!" in text:
+        text = text.rsplit("!", 1)[-1]
 
-    raise ValueError(f"Не найден именованный диапазон '{defined_name}'")
+    return text.strip("'")
+
+
+def try_get_defined_range(
+    book: xw.Book,
+    defined_name: str,
+) -> xw.Range | None:
+    """Ищет книжный или локальный именованный диапазон."""
+    try:
+        return book.names[defined_name].refers_to_range
+    except Exception:
+        pass
+
+    target = defined_name.strip().lower()
+
+    for name in book.names:
+        if _short_defined_name(name.name).lower() != target:
+            continue
+
+        try:
+            return name.refers_to_range
+        except Exception:
+            continue
+
+    for sheet in book.sheets:
+        for name in sheet.names:
+            if _short_defined_name(name.name).lower() != target:
+                continue
+
+            try:
+                return name.refers_to_range
+            except Exception:
+                continue
+
+    return None
+
+
+def get_defined_range(book: xw.Book, defined_name: str) -> xw.Range:
+    target_range = try_get_defined_range(book, defined_name)
+
+    if target_range is None:
+        raise ValueError(f"Не найден именованный диапазон '{defined_name}'")
+
+    return target_range
+
+
+def _range_data_to_2d(
+    value: Any,
+    row_count: int,
+    column_count: int,
+) -> list[list[Any]]:
+    """Нормализует результат xlwings Range.formula до двумерного списка."""
+    if row_count == 1 and column_count == 1:
+        return [[value]]
+
+    if row_count == 1:
+        if isinstance(value, (list, tuple)):
+            if value and isinstance(value[0], (list, tuple)):
+                return [list(value[0])]
+
+            return [list(value)]
+
+        return [[value]]
+
+    if column_count == 1:
+        if not isinstance(value, (list, tuple)):
+            return [[value]]
+
+        if value and isinstance(value[0], (list, tuple)):
+            return [list(row) for row in value]
+
+        return [[item] for item in value]
+
+    if not isinstance(value, (list, tuple)):
+        return [[value]]
+
+    return [
+        list(row) if isinstance(row, (list, tuple)) else [row]
+        for row in value
+    ]
+
+
+def read_defined_range_table(
+    book: xw.Book,
+    defined_name: str,
+) -> list[list[Any]]:
+    target_range = get_defined_range(book, defined_name)
+
+    # Formula используется намеренно: для формульных ячеек получаем саму формулу,
+    # а для обычных ячеек — их значения. Это соответствует cell.value в openpyxl.
+    raw_data = target_range.formula
+
+    return _range_data_to_2d(
+        raw_data,
+        target_range.rows.count,
+        target_range.columns.count,
+    )
 
 
 def write_defined_range_table(
-    wb,
+    book: xw.Book,
     defined_name: str,
     data: list[list[Any]],
     data_row_count: int,
 ) -> None:
-    dn = wb.defined_names[defined_name]
-
+    target_range = get_defined_range(book, defined_name)
     headers = data[0] if data else []
 
-    for sheet_name, coord in dn.destinations:
-        ws = wb[sheet_name]
-        cell_range = ws[coord]
+    max_data_rows = min(
+        data_row_count,
+        max(len(data) - 1, 0),
+        max(target_range.rows.count - 1, 0),
+    )
 
-        for idx, (row_cells, row_data) in enumerate(zip(cell_range, data)):
-            if idx == 0:
+    for row_idx in range(1, max_data_rows + 1):
+        row_data = data[row_idx]
+        max_columns = min(len(row_data), target_range.columns.count)
+
+        for col_idx in range(max_columns):
+            value = row_data[col_idx]
+
+            # Как и раньше, None не записываем, чтобы не затирать содержимое шаблона.
+            if value is None:
                 continue
 
-            if idx > data_row_count:
-                break
+            header_name = headers[col_idx] if col_idx < len(headers) else ""
+            value = normalize_act_table_value(value, header_name)
 
-            for col_idx, (cell, value) in enumerate(zip(row_cells, row_data)):
-                if value is None:
-                    continue
+            cell = target_range.offset(row_idx, col_idx).resize(1, 1)
 
-                header_name = headers[col_idx] if col_idx < len(headers) else ""
-
-                cell.value = normalize_act_table_value(
-                    value,
-                    header_name,
-                )
+            if isinstance(value, str) and value.startswith("="):
+                cell.formula = value
+            else:
+                cell.value = value
 
 
-def write_defined_name_value(wb, defined_name: str, value: Any) -> None:
+def write_defined_name_value(
+    book: xw.Book,
+    defined_name: str,
+    value: Any,
+) -> None:
     if value is None:
         return
 
-    if defined_name not in wb.defined_names:
+    target_range = try_get_defined_range(book, defined_name)
+
+    # Сохраняем прежнее поведение: отсутствующее необязательное имя просто пропускаем.
+    if target_range is None:
         return
 
-    dn = wb.defined_names[defined_name]
-
-    for sheet_name, coord in dn.destinations:
-        top_left = coord.split(":")[0]
-        ws = wb[sheet_name]
-        ws[top_left] = value
+    target_range.resize(1, 1).value = value
 
 
 def hide_unused_rows_for_defined_table(
-    wb,
+    book: xw.Book,
     sheet_name: str,
     defined_name: str,
     used_data_rows: int,
 ) -> None:
-    ws = wb[sheet_name]
-    dn = wb.defined_names[defined_name]
+    try:
+        sheet = book.sheets[sheet_name]
+    except Exception as exc:
+        raise ValueError(f"В книге '{book.name}' нет листа '{sheet_name}'") from exc
 
-    min_row = 0
-    max_row = 0
+    target_range = get_defined_range(book, defined_name)
 
-    for _, coord in dn.destinations:
-        start, *rest = coord.replace("$", "").split(":")
-        end = rest[-1] if rest else start
+    min_row = target_range.row
+    max_row = target_range.row + target_range.rows.count - 1
 
-        _, r1 = coordinate_from_string(start)
-        _, r2 = coordinate_from_string(end)
-
-        if min_row == 0 or r1 < min_row:
-            min_row = r1
-
-        if max_row == 0 or r2 > max_row:
-            max_row = r2
-
-    if min_row == 0:
+    if min_row <= 0:
         return
 
-    ws.row_dimensions[min_row].hidden = True
+    # Полностью повторяет прежнюю логику: скрывается строка заголовка диапазона.
+    sheet.range(f"{min_row}:{min_row}").api.EntireRow.Hidden = True
 
-    for r in range(min_row + used_data_rows + 1, max_row + 1):
-        ws.row_dimensions[r].hidden = True
+    first_unused_row = min_row + used_data_rows + 1
+
+    if first_unused_row <= max_row:
+        sheet.range(
+            f"{first_unused_row}:{max_row}"
+        ).api.EntireRow.Hidden = True
 
 
 # =============================================================================
@@ -680,173 +775,204 @@ def create_quality_act(
 
     shutil.copy2(template_path, new_act_path)
 
-    act_wb = load_workbook(new_act_path)
-    act_sheet = act_wb["Акт качества"]
+    excel_app = target_book.app
+    act_wb: xw.Book | None = None
 
-    gas_act_tbl = read_defined_range_table(act_wb, "GasActTable")
-    liq_act_tbl = read_defined_range_table(act_wb, "LiquidActTable")
+    previous_display_alerts = excel_app.display_alerts
+    previous_screen_updating = excel_app.screen_updating
 
-    gas_map = build_act_map(gas_act_tbl)
-    liq_map = build_act_map(liq_act_tbl)
+    try:
+        excel_app.display_alerts = False
+        excel_app.screen_updating = False
 
-    min_result_date = None
-    max_result_date = None
-
-    gas_cur_row = 0
-    liq_cur_row = 0
-
-    # -------------------------------------------------------------------------
-    # 1. Заполняем LIF-часть из All_samples / Append1
-    # -------------------------------------------------------------------------
-
-    for lif_row in lif_rows:
-        sample_type = normalize_text(
-            get_row_value(lif_row, lif_map, "typeSampleShort")
+        # Открываем созданную копию шаблона через Excel/xlwings
+        # в том же экземпляре Excel, где открыта исходная книга.
+        act_wb = excel_app.books.open(
+            str(new_act_path),
+            update_links=False,
+            read_only=False,
         )
 
-        if sample_type in GAS_SAMPLE_TYPES:
-            gas_cur_row += 1
+        try:
+            act_wb.sheets["Акт качества"]
+        except Exception as exc:
+            raise ValueError(
+                f"В шаблоне '{new_act_path}' нет листа 'Акт качества'"
+            ) from exc
 
-            if gas_cur_row >= len(gas_act_tbl):
-                raise ValueError("В GasActTable не хватает строк под газовые пробы")
+        gas_act_tbl = read_defined_range_table(act_wb, "GasActTable")
+        liq_act_tbl = read_defined_range_table(act_wb, "LiquidActTable")
 
-            for col_name, act_col_idx in gas_map["LIF"].items():
-                gas_act_tbl[gas_cur_row][act_col_idx] = get_row_value(
-                    lif_row,
-                    lif_map,
-                    col_name,
-                )
+        gas_map = build_act_map(gas_act_tbl)
+        liq_map = build_act_map(liq_act_tbl)
 
-        elif sample_type in LIQ_SAMPLE_TYPES:
-            liq_cur_row += 1
+        min_result_date = None
+        max_result_date = None
 
-            if liq_cur_row >= len(liq_act_tbl):
-                raise ValueError("В LiquidActTable не хватает строк под жидкостные пробы")
+        gas_cur_row = 0
+        liq_cur_row = 0
 
-            for col_name, act_col_idx in liq_map["LIF"].items():
-                liq_act_tbl[liq_cur_row][act_col_idx] = get_row_value(
-                    lif_row,
-                    lif_map,
-                    col_name,
-                )
+        # -------------------------------------------------------------------------
+        # 1. Заполняем LIF-часть из All_samples / Append1
+        # -------------------------------------------------------------------------
 
-    # -------------------------------------------------------------------------
-    # 2. Подмешиваем результаты OP/BP/GC по sampleCode
-    # -------------------------------------------------------------------------
+        for lif_row in lif_rows:
+            sample_type = normalize_text(
+                get_row_value(lif_row, lif_map, "typeSampleShort")
+            )
 
-    min_result_date, max_result_date = fill_result_blocks(
-        act_table=gas_act_tbl,
-        act_map=gas_map,
-        row_count=gas_cur_row,
-        results=results,
-        min_date=min_result_date,
-        max_date=max_result_date,
-    )
+            if sample_type in GAS_SAMPLE_TYPES:
+                gas_cur_row += 1
 
-    min_result_date, max_result_date = fill_result_blocks(
-        act_table=liq_act_tbl,
-        act_map=liq_map,
-        row_count=liq_cur_row,
-        results=results,
-        min_date=min_result_date,
-        max_date=max_result_date,
-    )
+                if gas_cur_row >= len(gas_act_tbl):
+                    raise ValueError("В GasActTable не хватает строк под газовые пробы")
 
-    # -------------------------------------------------------------------------
-    # 3. Расчёт качества
-    # -------------------------------------------------------------------------
+                for col_name, act_col_idx in gas_map["LIF"].items():
+                    gas_act_tbl[gas_cur_row][act_col_idx] = get_row_value(
+                        lif_row,
+                        lif_map,
+                        col_name,
+                    )
 
-    calculate_gas_quality(gas_act_tbl, gas_map, gas_cur_row)
-    calculate_liquid_quality(liq_act_tbl, liq_map, liq_cur_row)
+            elif sample_type in LIQ_SAMPLE_TYPES:
+                liq_cur_row += 1
 
-    # -------------------------------------------------------------------------
-    # 4. Записываем таблицы в акт
-    # -------------------------------------------------------------------------
+                if liq_cur_row >= len(liq_act_tbl):
+                    raise ValueError("В LiquidActTable не хватает строк под жидкостные пробы")
 
-    write_defined_range_table(
-        act_wb,
-        "GasActTable",
-        gas_act_tbl,
-        gas_cur_row,
-    )
+                for col_name, act_col_idx in liq_map["LIF"].items():
+                    liq_act_tbl[liq_cur_row][act_col_idx] = get_row_value(
+                        lif_row,
+                        lif_map,
+                        col_name,
+                    )
 
-    write_defined_range_table(
-        act_wb,
-        "LiquidActTable",
-        liq_act_tbl,
-        liq_cur_row,
-    )
+        # -------------------------------------------------------------------------
+        # 2. Подмешиваем результаты OP/BP/GC по sampleCode
+        # -------------------------------------------------------------------------
 
-    # -------------------------------------------------------------------------
-    # 5. Заполняем именованные диапазоны шапки
-    # -------------------------------------------------------------------------
+        min_result_date, max_result_date = fill_result_blocks(
+            act_table=gas_act_tbl,
+            act_map=gas_map,
+            row_count=gas_cur_row,
+            results=results,
+            min_date=min_result_date,
+            max_date=max_result_date,
+        )
 
-    write_defined_name_value(
-        act_wb,
-        "dates",
-        format_date_range(min_result_date, max_result_date),
-    )
+        min_result_date, max_result_date = fill_result_blocks(
+            act_table=liq_act_tbl,
+            act_map=liq_map,
+            row_count=liq_cur_row,
+            results=results,
+            min_date=min_result_date,
+            max_date=max_result_date,
+        )
 
-    write_defined_name_value(act_wb, "project", project_str)
+        # -------------------------------------------------------------------------
+        # 3. Расчёт качества
+        # -------------------------------------------------------------------------
 
-    delivery_min, delivery_max = min_max_dates(lif_rows, lif_map, "deliveryDate")
-    write_defined_name_value(
-        act_wb,
-        "dateDelivery",
-        format_date_range(delivery_min, delivery_max),
-    )
+        calculate_gas_quality(gas_act_tbl, gas_map, gas_cur_row)
+        calculate_liquid_quality(liq_act_tbl, liq_map, liq_cur_row)
 
-    transfer_min, transfer_max = min_max_dates(lif_rows, lif_map, "transferDate")
-    write_defined_name_value(
-        act_wb,
-        "dateSampling",
-        format_date_range(transfer_min, transfer_max),
-    )
+        # -------------------------------------------------------------------------
+        # 4. Записываем таблицы в акт
+        # -------------------------------------------------------------------------
 
-    write_defined_name_value(
-        act_wb,
-        "reservoir",
-        first_non_empty(lif_rows, lif_map, "reservoir"),
-    )
+        write_defined_range_table(
+            act_wb,
+            "GasActTable",
+            gas_act_tbl,
+            gas_cur_row,
+        )
 
-    write_defined_name_value(
-        act_wb,
-        "FullNameDZO",
-        first_non_empty(lif_rows, lif_map, "FullNameDZO"),
-    )
+        write_defined_range_table(
+            act_wb,
+            "LiquidActTable",
+            liq_act_tbl,
+            liq_cur_row,
+        )
 
-    write_defined_name_value(
-        act_wb,
-        "LU",
-        first_non_empty(lif_rows, lif_map, "LU"),
-    )
+        # -------------------------------------------------------------------------
+        # 5. Заполняем именованные диапазоны шапки
+        # -------------------------------------------------------------------------
 
-    write_defined_name_value(
-        act_wb,
-        "Well",
-        well,
-    )
+        write_defined_name_value(
+            act_wb,
+            "dates",
+            format_date_range(min_result_date, max_result_date),
+        )
 
-    # -------------------------------------------------------------------------
-    # 6. Скрываем лишние строки
-    # -------------------------------------------------------------------------
+        write_defined_name_value(act_wb, "project", project_str)
 
-    hide_unused_rows_for_defined_table(
-        act_wb,
-        "Акт качества",
-        "LiquidActTable",
-        liq_cur_row,
-    )
+        delivery_min, delivery_max = min_max_dates(lif_rows, lif_map, "deliveryDate")
+        write_defined_name_value(
+            act_wb,
+            "dateDelivery",
+            format_date_range(delivery_min, delivery_max),
+        )
 
-    hide_unused_rows_for_defined_table(
-        act_wb,
-        "Акт качества",
-        "GasActTable",
-        gas_cur_row,
-    )
+        transfer_min, transfer_max = min_max_dates(lif_rows, lif_map, "transferDate")
+        write_defined_name_value(
+            act_wb,
+            "dateSampling",
+            format_date_range(transfer_min, transfer_max),
+        )
 
-    act_wb.save(new_act_path)
-    act_wb.close()
+        write_defined_name_value(
+            act_wb,
+            "reservoir",
+            first_non_empty(lif_rows, lif_map, "reservoir"),
+        )
+
+        write_defined_name_value(
+            act_wb,
+            "FullNameDZO",
+            first_non_empty(lif_rows, lif_map, "FullNameDZO"),
+        )
+
+        write_defined_name_value(
+            act_wb,
+            "LU",
+            first_non_empty(lif_rows, lif_map, "LU"),
+        )
+
+        write_defined_name_value(
+            act_wb,
+            "Well",
+            well,
+        )
+
+        # -------------------------------------------------------------------------
+        # 6. Скрываем лишние строки
+        # -------------------------------------------------------------------------
+
+        hide_unused_rows_for_defined_table(
+            act_wb,
+            "Акт качества",
+            "LiquidActTable",
+            liq_cur_row,
+        )
+
+        hide_unused_rows_for_defined_table(
+            act_wb,
+            "Акт качества",
+            "GasActTable",
+            gas_cur_row,
+        )
+
+        act_wb.save()
+
+    finally:
+        if act_wb is not None:
+            try:
+                act_wb.close()
+            except Exception:
+                pass
+
+        excel_app.display_alerts = previous_display_alerts
+        excel_app.screen_updating = previous_screen_updating
 
     elapsed = time.time() - start_time
     logging.info("[Act] Готово: %s, %.2f сек", new_act_path, elapsed)
