@@ -1,1 +1,62 @@
+Private Const OPOH_QUALITY_ACT_SCRIPT As String = _
+    "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\create_opoh_quality_act.py"
 
+Private Const OPOH_QUALITY_ACT_TEMPLATE As String = _
+    "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\Акт качества глубинок.xlsx"
+
+
+Public Sub CreateOPOHQualityAct()
+
+    Dim targetBook As Workbook
+    Dim targetWorkbookPath As String
+
+    Dim shell As Object
+    Dim exec As Object
+    Dim cmd As String
+    Dim stdoutText As String
+    Dim stderrText As String
+
+    If ActiveWorkbook Is Nothing Then
+        MsgBox "Нет активной книги с данными.", vbExclamation
+        Exit Sub
+    End If
+
+    If ActiveWorkbook.Name = ThisWorkbook.Name Then
+        MsgBox "Активна книга-надстройка, а не книга с данными.", vbExclamation
+        Exit Sub
+    End If
+
+    If Len(ActiveWorkbook.Path) = 0 Then
+        MsgBox "Книга с данными должна быть сохранена перед созданием акта.", vbExclamation
+        Exit Sub
+    End If
+
+    Set targetBook = ActiveWorkbook
+    targetWorkbookPath = targetBook.FullName
+
+    cmd = Quote(PYTHON_EXE) & " -u " & _
+          Quote(OPOH_QUALITY_ACT_SCRIPT) & " " & _
+          "--workbook " & Quote(targetWorkbookPath) & " " & _
+          "--template " & Quote(OPOH_QUALITY_ACT_TEMPLATE)
+
+    Debug.Print cmd
+
+    Set shell = CreateObject("WScript.Shell")
+    Set exec = shell.Exec(cmd)
+
+    Do While exec.Status = 0
+        DoEvents
+    Loop
+
+    stdoutText = exec.StdOut.ReadAll
+    stderrText = exec.StdErr.ReadAll
+
+    If exec.ExitCode <> 0 Then
+        MsgBox "Ошибка создания акта качества глубинных проб:" & vbCrLf & vbCrLf & _
+               stdoutText & vbCrLf & stderrText, vbCritical
+    Else
+        MsgBox "Акт качества глубинных проб создан:" & vbCrLf & vbCrLf & _
+               stdoutText, vbInformation
+    End If
+
+End Sub
