@@ -1,301 +1,40 @@
-Да, давай проще и строго по шагам. Смысл такой: **не сохранять акт через `openpyxl`**, потому что он может терять картинки/shape-объекты. Копируем шаблон как раньше через `shutil.copy2`, но открываем созданный акт через настоящий Excel через `xlwings`.
+Поменял. Теперь `dates` всегда записывается строкой в формате:
 
-Я уже поправил файл целиком:
-[Скачать обновлённый create_opoh_quality_act.py](sandbox:/mnt/data/create_opoh_quality_act.py)
-
-А вручную поменять надо вот так.
-
-## 1. Убрать импорты openpyxl
-
-Найди вверху:
-
-```python
-from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
+```text
+15.07.2026 - 18.07.2026
 ```
 
-Удали обе строки.
+Обновлённый файл:
 
----
+[Скачать create_quality_act_xlwings.py](sandbox:/mnt/data/create_quality_act_xlwings.py)
 
-## 2. Добавить helper для пустых колонок
-
-После функции `value_for_excel(...)`, перед блоком `# XLWINGS READERS`, добавь:
+Заменена функция `format_date_range`:
 
 ```python
-BLANK_COLUMN_PREFIX = "__blank_"
+def format_date_range(min_date: Any, max_date: Any) -> str | None:
+    min_date = normalize_excel_date(min_date)
+    max_date = normalize_excel_date(max_date)
 
+    if min_date is None and max_date is None:
+        return None
 
-def is_blank_act_column(column_name: str) -> bool:
-    return normalize_text(column_name).startswith(BLANK_COLUMN_PREFIX)
+    if min_date is None:
+        return max_date.strftime("%d.%m.%Y")
+
+    if max_date is None:
+        return min_date.strftime("%d.%m.%Y")
+
+    min_text = min_date.strftime("%d.%m.%Y")
+    max_text = max_date.strftime("%d.%m.%Y")
+
+    if min_text == max_text:
+        return min_text
+
+    return f"{min_text} - {max_text}"
 ```
 
----
+Она теперь корректно обрабатывает и настоящие Excel-даты, и строки вида `2026-07-15`. Если начальная и конечная даты совпадают, будет записано просто:
 
-## 3. Полностью заменить блок `ACT TEMPLATE HELPERS`
-
-Найди блок от:
-
-```python
-def get_act_columns(act_wb) -> list[str]:
+```text
+15.07.2026
 ```
-
-и до конца функции:
-
-```python
-def clear_and_write_act_table(...)
-```
-
-Замени весь этот кусок на:
-
-```python
-def get_act_columns(act_book: xw.Book) -> list[str]:
-    sheet = act_book.sheets[ACT_SHEET]
-
-    # xlToLeft = -4159.
-    # Так находим последний реально используемый столбец в строке логических заголовков.
-    # Пустые столбцы внутри диапазона сохраняются.
-    last_col = sheet.api.Cells(ACT_HEADER_ROW, sheet.api.Columns.Count).End(-4159).Column
-
-    values = sheet.range(
-        (ACT_HEADER_ROW, ACT_DATA_START_COL),
-        (ACT_HEADER_ROW, last_col),
-    ).value
-
-    if not isinstance(values, list):
-        values = [values]
-
-    headers: list[str] = []
-
-    for col_offset, value in enumerate(values, start=ACT_DATA_START_COL):
-        text = normalize_text(value)
-
-        if text:
-            headers.append(text)
-        else:
-            headers.append(f"{BLANK_COLUMN_PREFIX}{col_offset}")
-
-    # служебный столбец, в шаблоне его нет
-    headers.append("sampleCode")
-
-    return headers
-
-
-def write_defined_name_value(book: xw.Book, name: str, value: Any) -> None:
-    try:
-        book.names[name].refers_to_range.value = value_for_excel(value)
-    except Exception as exc:
-        raise ValueError(f"В шаблоне акта нет именованного диапазона {name!r}") from exc
-
-
-def clear_and_write_act_table(
-    act_book: xw.Book,
-    act_rows: list[dict[str, Any]],
-    columns: list[str],
-) -> None:
-    sheet = act_book.sheets[ACT_SHEET]
-
-    available_rows = ACT_MAX_TEMPLATE_ROW - ACT_DATA_START_ROW + 1
-
-    if len(act_rows) > available_rows:
-        raise ValueError(
-            f"В шаблоне акта хватает строк только на {available_rows} проб, "
-            f"а нужно записать {len(act_rows)}. Добавь строки в шаблон или расширь скрипт."
-        )
-
-    col_count = len(columns)
-    start_col = ACT_DATA_START_COL
-    end_col = start_col + col_count - 1
-
-    # Очищаем только значения. Форматирование, картинки и фигуры не трогаем.
-    sheet.range(
-        (ACT_DATA_START_ROW, start_col),
-        (ACT_MAX_TEMPLATE_ROW, end_col),
-    ).clear_contents()
-
-    # Раскрываем строки шаблона перед заполнением.
-    for row_idx in range(ACT_DATA_START_ROW, ACT_MAX_TEMPLATE_ROW + 1):
-        sheet.range(f"{row_idx}:{row_idx}").api.EntireRow.Hidden = False
-
-    matrix: list[list[Any]] = []
-
-    for row_data in act_rows:
-        matrix_row: list[Any] = []
-
-        for column_name in columns:
-            # Пустые технические колонки шаблона оставляем пустыми.
-            if is_blank_act_column(column_name):
-                matrix_row.append(None)
-            else:
-                matrix_row.append(value_for_excel(row_data.get(column_name)))
-
-        matrix.append(matrix_row)
-
-    if matrix:
-        sheet.range((ACT_DATA_START_ROW, start_col)).resize(
-            len(matrix),
-            col_count,
-        ).value = matrix
-
-    # Скрываем неиспользуемые строки до 32 включительно.
-    first_unused = ACT_DATA_START_ROW + len(act_rows)
-
-    for row_idx in range(first_unused, ACT_MAX_TEMPLATE_ROW + 1):
-        sheet.range(f"{row_idx}:{row_idx}").api.EntireRow.Hidden = True
-
-    # Последний служебный столбец sampleCode скрываем.
-    sample_code_col = start_col + len(columns) - 1
-    sheet.range((1, sample_code_col)).api.EntireColumn.Hidden = True
-```
-
----
-
-## 4. Исправить замену пустых значений
-
-Найди:
-
-```python
-def replace_empty_with_dash(act_rows: list[dict[str, Any]], columns: list[str]) -> None:
-    for row in act_rows:
-        for column in columns:
-            if is_empty(row.get(column)):
-                row[column] = "-"
-```
-
-Замени на:
-
-```python
-def replace_empty_with_dash(act_rows: list[dict[str, Any]], columns: list[str]) -> None:
-    for row in act_rows:
-        for column in columns:
-            # Пустые технические колонки шаблона не заполняем даже прочерком.
-            if is_blank_act_column(column):
-                continue
-
-            if is_empty(row.get(column)):
-                row[column] = "-"
-```
-
----
-
-## 5. В основном методе заменить открытие/сохранение акта
-
-Найди в `create_opoh_quality_act()` кусок:
-
-```python
-progress("Открываю созданный акт")
-act_wb = load_workbook(output_path)
-
-columns = get_act_columns(act_wb)
-
-progress("Создаю таблицу акта в памяти")
-...
-progress("Сохраняю акт")
-act_wb.save(output_path)
-act_wb.close()
-```
-
-То есть весь блок от:
-
-```python
-progress("Открываю созданный акт")
-```
-
-до:
-
-```python
-act_wb.close()
-```
-
-замени на этот:
-
-```python
-progress("Открываю созданный акт через Excel/xlwings")
-act_book = book.app.books.open(
-    str(output_path),
-    update_links=False,
-    read_only=False,
-)
-
-try:
-    columns = get_act_columns(act_book)
-
-    progress("Создаю таблицу акта в памяти")
-    opoh_index = build_index_by_sample_code(opoh_rows)
-    app_index = build_index_by_sample_code(app_rows)
-
-    act_rows = create_initial_act_rows(
-        columns=columns,
-        opoh_rows=opoh_rows,
-    )
-
-    if not act_rows:
-        raise ValueError("Не найдено ни одной строки OPOH_results с заполненным sampleCode")
-
-    progress("Заполняю LIF-данные")
-    fill_lif_columns(
-        act_rows=act_rows,
-        columns=columns,
-        app_index=app_index,
-    )
-
-    progress("Заполняю расчетные поля")
-    fill_calc_columns(
-        act_rows=act_rows,
-        opoh_index=opoh_index,
-        app_index=app_index,
-    )
-
-    progress("Заполняю пустые значения прочерками")
-    replace_empty_with_dash(act_rows, columns)
-
-    progress("Заполняю шапку акта")
-    fill_header(
-        act_wb=act_book,
-        act_rows=act_rows,
-        app_rows=app_rows,
-        app_index=app_index,
-        opoh_index=opoh_index,
-        project_name=project_name,
-    )
-
-    progress(f"Записываю таблицу в акт: {len(act_rows)} строк")
-    clear_and_write_act_table(act_book, act_rows, columns)
-
-    progress("Сохраняю акт")
-    act_book.save()
-
-finally:
-    act_book.close()
-```
-
----
-
-## 6. Если ещё не исправил `dateTimeSync`
-
-В функции `collect_opoh_datetime_values` найди:
-
-```python
-for key, value in opoh_row.items():
-    if "datetime" in normalize_text(key).lower() and not is_empty(value):
-        result.append(value)
-```
-
-Замени на:
-
-```python
-for key, value in opoh_row.items():
-    key_text = normalize_text(key).lower()
-
-    # dateTimeSync — служебная дата синхронизации,
-    # в акт её включать нельзя.
-    if key_text == "datetimesync":
-        continue
-
-    if "datetime" in key_text and not is_empty(value):
-        result.append(value)
-```
-
----
-
-После этих замен `openpyxl` больше не будет сохранять акт. Созданный файл будет открываться и сохраняться самим Excel через `xlwings`, поэтому картинка должна сохраниться.
