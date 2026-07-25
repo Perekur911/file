@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import shutil
 import sys
 import time
@@ -224,6 +225,8 @@ def write_defined_range_table(
 ) -> None:
     dn = wb.defined_names[defined_name]
 
+    headers = data[0] if data else []
+
     for sheet_name, coord in dn.destinations:
         ws = wb[sheet_name]
         cell_range = ws[coord]
@@ -235,9 +238,16 @@ def write_defined_range_table(
             if idx > data_row_count:
                 break
 
-            for cell, value in zip(row_cells, row_data):
-                if value is not None:
-                    cell.value = value
+            for col_idx, (cell, value) in enumerate(zip(row_cells, row_data)):
+                if value is None:
+                    continue
+
+                header_name = headers[col_idx] if col_idx < len(headers) else ""
+
+                cell.value = normalize_act_table_value(
+                    value,
+                    header_name,
+                )
 
 
 def write_defined_name_value(wb, defined_name: str, value: Any) -> None:
@@ -352,6 +362,21 @@ def normalize_text(value: Any) -> str:
         return ""
     return str(value).strip()
 
+INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def make_safe_filename_part(value: Any, fallback: str = "Проект") -> str:
+    text = normalize_text(value)
+
+    if not text:
+        text = fallback
+
+    text = INVALID_FILENAME_CHARS_RE.sub("_", text)
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip(" .")
+
+    return text or fallback
+
 def normalize_excel_date(value: Any) -> datetime | None:
     if value is None:
         return None
@@ -400,6 +425,99 @@ def to_float_or_none(value: Any) -> float | None:
     except Exception:
         return None
 
+def parse_number_for_excel(value: Any) -> Any:
+    """
+    Преобразует строковые числа в int/float для записи в Excel.
+
+    '7,184'  -> 7.184
+    '21.063' -> 21.063
+    '5'      -> 5
+    '-'      -> '-'
+    '25-F123-GS1' -> без изменений
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return value
+
+    if not isinstance(value, str):
+        return value
+
+    original = value
+    text = value.strip()
+
+    if text == "" or text == "-":
+        return original
+
+    # убираем обычные и неразрывные пробелы внутри числа
+    compact = text.replace("\xa0", "").replace(" ", "")
+
+    # только простое число, без букв/шифров/дат
+    if not re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", compact):
+        return original
+
+    normalized = compact.replace(",", ".")
+
+    try:
+        number = float(normalized)
+    except ValueError:
+        return original
+
+    # если было целое число без десятичного разделителя — пишем int
+    if "," not in compact and "." not in compact and number.is_integer():
+        return int(number)
+
+    return number
+
+
+def should_convert_act_column_to_number(header_name: Any) -> bool:
+    """
+    Конвертируем в число только результатные блоки OP/BP/GC.
+
+    LIF-часть не трогаем, чтобы случайно не превратить шифры/номера/коды в числа.
+    """
+    if header_name is None:
+        return False
+
+    text = str(header_name).strip()
+
+    if "_" not in text:
+        return False
+
+    prefix, field = text.split("_", 1)
+
+    prefix = prefix.strip().upper()
+    field = field.strip().lower()
+
+    if prefix not in {"OP", "BP", "GC"}:
+        return False
+
+    # Явно текстовые поля результатов.
+    if field in {
+        "samplecode",
+        "date",
+        "operator",
+        "comment",
+        "punit",
+        "equipment",
+        "equipmentnumber",
+        "presence",
+        "phase",
+    }:
+        return False
+
+    return True
+
+
+def normalize_act_table_value(value: Any, header_name: Any) -> Any:
+    if should_convert_act_column_to_number(header_name):
+        return parse_number_for_excel(value)
+
+    return value
 
 def get_row_value(row: list[Any], col_map: dict[str, int], column_name: str) -> Any:
     idx = col_map.get(column_name.lower())
@@ -501,11 +619,6 @@ def create_quality_act(
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents=True, exist_ok=True)
 
-    today_str = datetime.today().strftime("%d-%m-%Y, %H-%M")
-    new_act_path = output_dir_path / f"Акт качества {today_str}.xlsx"
-
-    shutil.copy2(template_path, new_act_path)
-
     logging.info("[Act] Читаем текущую книгу")
 
     op_headers, op_rows = read_xlwings_table(
@@ -549,6 +662,23 @@ def create_quality_act(
         ],
         "All_samples/Append1",
     )
+
+    project = first_non_empty(lif_rows, lif_map, "Project")
+    field = first_non_empty(lif_rows, lif_map, "Field")
+    well = first_non_empty(lif_rows, lif_map, "Well")
+
+    if isinstance(well, float) and well.is_integer():
+        well_text = str(int(well))
+    else:
+        well_text = normalize_text(well)
+
+    project_str = f"{project}-{field}-{well_text}" if project and field and well_text else None
+    project_file_part = make_safe_filename_part(project_str)
+
+    today_str = datetime.today().strftime("%d-%m-%Y, %H-%M")
+    new_act_path = output_dir_path / f"{project_file_part}_Акт качества {today_str}.xlsx"
+
+    shutil.copy2(template_path, new_act_path)
 
     act_wb = load_workbook(new_act_path)
     act_sheet = act_wb["Акт качества"]
@@ -657,16 +787,6 @@ def create_quality_act(
         format_date_range(min_result_date, max_result_date),
     )
 
-    project = first_non_empty(lif_rows, lif_map, "Project")
-    field = first_non_empty(lif_rows, lif_map, "Field")
-    well = first_non_empty(lif_rows, lif_map, "Well")
-
-    if isinstance(well, float) and well.is_integer():
-        well_text = str(int(well))
-    else:
-        well_text = normalize_text(well)
-
-    project_str = f"{project}-{field}-{well_text}" if project and field and well_text else None
     write_defined_name_value(act_wb, "project", project_str)
 
     delivery_min, delivery_max = min_max_dates(lif_rows, lif_map, "deliveryDate")
