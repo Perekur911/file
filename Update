@@ -1,62 +1,27 @@
-Private Const OPOH_QUALITY_ACT_SCRIPT As String = _
-    "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\create_opoh_quality_act.py"
+Да, верно, `dateTimeSync` нужно исключить, иначе в шапку `dates` может попасть дата синхронизации, а не дата выполнения работ.
 
-Private Const OPOH_QUALITY_ACT_TEMPLATE As String = _
-    "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\Акт качества глубинок.xlsx"
+В `create_opoh_quality_act.py` в функции `collect_opoh_datetime_values` нужно заменить блок:
 
+```python
+for key, value in opoh_row.items():
+    if "datetime" in normalize_text(key).lower() and not is_empty(value):
+        result.append(value)
+```
 
-Public Sub CreateOPOHQualityAct()
+на такой:
 
-    Dim targetBook As Workbook
-    Dim targetWorkbookPath As String
+```python
+for key, value in opoh_row.items():
+    key_text = normalize_text(key).lower()
 
-    Dim shell As Object
-    Dim exec As Object
-    Dim cmd As String
-    Dim stdoutText As String
-    Dim stderrText As String
+    # dateTimeSync — служебная дата синхронизации,
+    # в диапазон дат выполнения ОПОХ её включать нельзя.
+    if key_text == "datetimesync":
+        continue
 
-    If ActiveWorkbook Is Nothing Then
-        MsgBox "Нет активной книги с данными.", vbExclamation
-        Exit Sub
-    End If
+    if "datetime" in key_text and not is_empty(value):
+        result.append(value)
+```
 
-    If ActiveWorkbook.Name = ThisWorkbook.Name Then
-        MsgBox "Активна книга-надстройка, а не книга с данными.", vbExclamation
-        Exit Sub
-    End If
-
-    If Len(ActiveWorkbook.Path) = 0 Then
-        MsgBox "Книга с данными должна быть сохранена перед созданием акта.", vbExclamation
-        Exit Sub
-    End If
-
-    Set targetBook = ActiveWorkbook
-    targetWorkbookPath = targetBook.FullName
-
-    cmd = Quote(PYTHON_EXE) & " -u " & _
-          Quote(OPOH_QUALITY_ACT_SCRIPT) & " " & _
-          "--workbook " & Quote(targetWorkbookPath) & " " & _
-          "--template " & Quote(OPOH_QUALITY_ACT_TEMPLATE)
-
-    Debug.Print cmd
-
-    Set shell = CreateObject("WScript.Shell")
-    Set exec = shell.Exec(cmd)
-
-    Do While exec.Status = 0
-        DoEvents
-    Loop
-
-    stdoutText = exec.StdOut.ReadAll
-    stderrText = exec.StdErr.ReadAll
-
-    If exec.ExitCode <> 0 Then
-        MsgBox "Ошибка создания акта качества глубинных проб:" & vbCrLf & vbCrLf & _
-               stdoutText & vbCrLf & stderrText, vbCritical
-    Else
-        MsgBox "Акт качества глубинных проб создан:" & vbCrLf & vbCrLf & _
-               stdoutText, vbInformation
-    End If
-
-End Sub
+Я поправил файл здесь:
+[Скачать обновлённый create_opoh_quality_act.py](sandbox:/mnt/data/create_opoh_quality_act.py)
