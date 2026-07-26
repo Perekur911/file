@@ -6,6 +6,7 @@ import logging
 import re
 import shutil
 import sys
+import time
 import traceback
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -19,8 +20,11 @@ import xlwings as xw
 # Настройки
 # =============================================================================
 
-BASE_PROJECTS_DIR = r"L:\LRC\common_data\ФЛЮИДЫ\ПТИ\PROJECTS"
-CLEAN_V22_TEMPLATE = r"L:\LRC\common_data\ФЛЮИДЫ\ПТИ\sqlite-excel\clean_form_v22.xlsx"
+BASE_PROJECTS_DIR = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\Работа\2026"
+CLEAN_V22_TEMPLATE = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\XX-FXXX-XXX-XXX_Форма_v22 чистая бол.xlsx"
+
+PROJECT_CELL_SHEET = "OP"
+PROJECT_CELL_ADDRESS = "B6"
 
 PROJECT_DIR = Path(__file__).resolve().parent
 LOG_PATH = PROJECT_DIR / "migrate_v21_to_v22.log"
@@ -33,6 +37,8 @@ PROTECT_PASSWORD = "1984"
 SKIP_RESULT_FIELDS = {
     "datetimesync",
     "page",
+    "analysenumber",
+    "gorEquipment",
 }
 
 SKIP_FIELD_PREFIXES = (
@@ -215,17 +221,17 @@ def find_v21_file(project_folder: Path) -> Path:
 
         name_lower = path.name.lower()
 
-        if name_lower.startswith(folder_name) and "_v21" in name_lower:
+        if name_lower.startswith(folder_name) and (("_v21" in name_lower) or ("_v20" in name_lower)):
             files.append(path)
 
     if not files:
         raise FileNotFoundError(
-            f"В папке '{project_folder}' не найден файл, начинающийся с имени папки и содержащий '_v21'"
+            f"В папке '{project_folder}' не найден файл, начинающийся с имени папки и содержащий '_v21' или '_v21'"
         )
 
     if len(files) > 1:
         raise ValueError(
-            f"В папке '{project_folder}' найдено несколько v21-файлов: {files}"
+            f"В папке '{project_folder}' найдено несколько v20/v21-файлов: {files}"
         )
 
     return files[0]
@@ -260,6 +266,9 @@ def open_book(app: xw.App, path: Path, read_only: bool) -> xw.Book:
         ignore_read_only_recommended=True,
     )
 
+def set_current_project_in_form(book: xw.Book, project_code: str) -> None:
+    sheet = book.sheets[PROJECT_CELL_SHEET]
+    sheet.range(PROJECT_CELL_ADDRESS).value = project_code
 
 def unprotect_all_sheets(book: xw.Book) -> None:
     for sheet in book.sheets:
@@ -297,6 +306,8 @@ def get_named_range(book: xw.Book, name: str):
 def named_range_exists(book: xw.Book, name: str) -> bool:
     return get_named_range(book, name) is not None
 
+def progress(message: str) -> None:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
 
 def get_list_object(book: xw.Book, sheet_name: str, table_name: str):
     try:
@@ -481,10 +492,14 @@ def copy_table_values_by_common_columns(
 # Study migration
 # =============================================================================
 
-def source_form_table_name(study: str, form_index: int) -> str:
+def old_source_form_table_name(study: str, form_index: int) -> str:
     if study in ("GOR", "SSF"):
         return f"{study}_{form_index}"
 
+    return f"{study}_source_{form_index}"
+
+
+def new_source_form_table_name(study: str, form_index: int) -> str:
     return f"{study}_source_{form_index}"
 
 
@@ -545,8 +560,8 @@ def migrate_named_range_study(
                 named_values_copied += 1
                 form_has_any_data = True
 
-        old_src_table_name = source_form_table_name(study, form_index)
-        new_src_table_name = source_form_table_name(study, form_index)
+        old_src_table_name = old_source_form_table_name(study, form_index)
+        new_src_table_name = new_source_form_table_name(study, form_index)
 
         old_src_table = try_get_list_object(old_book, study, old_src_table_name)
         new_src_table = try_get_list_object(new_book, study, new_src_table_name)
@@ -661,6 +676,8 @@ def migrate_one_project(
     recursive: bool,
     overwrite: bool,
 ) -> ProjectMigrationReport:
+    project_start = time.perf_counter()
+    progress(f"{project_code}: начинаю перенос")
     warnings: list[str] = []
 
     old_book = None
@@ -678,14 +695,21 @@ def migrate_one_project(
         old_book = open_book(app, old_file, read_only=True)
         new_book = open_book(app, new_file, read_only=False)
 
+        unprotect_all_sheets(new_book)
+
+        set_current_project_in_form(new_book, project_code)
+
         forms, named_values, table_values, warnings = migrate_workbook_data(
             old_book=old_book,
             new_book=new_book,
         )
 
-        protect_all_sheets(new_book)
+        #protect_all_sheets(new_book)
 
         new_book.save()
+
+        elapsed = time.perf_counter() - project_start
+        progress(f"{project_code}: перенос завершён за {elapsed:.2f} сек")
 
         return ProjectMigrationReport(
             project=project_code,
@@ -702,6 +726,9 @@ def migrate_one_project(
 
     except Exception as exc:
         logging.exception("Ошибка миграции проекта %s", project_code)
+
+        elapsed = time.perf_counter() - project_start
+        progress(f"{project_code}: ошибка переноса через {elapsed:.2f} сек")
 
         return ProjectMigrationReport(
             project=project_code,
