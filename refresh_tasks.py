@@ -2,17 +2,77 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import math
 import sqlite3
 import sys
 import traceback
+import time as time_module
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date, time as dt_time
 
 import openpyxl
 import xlwings as xw
 
+LOG_PATH = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\task_refresh.log"
+
+PROJECT_DIR = Path(__file__).resolve().parent
+ERROR_LOG_PATH = PROJECT_DIR / "refresh_tasks_errors.log"
+
+PROGRESS_FILE_PATH: Path | None = None
+
+def set_progress_file(path: str | None) -> None:
+    global PROGRESS_FILE_PATH
+
+    if not path:
+        PROGRESS_FILE_PATH = None
+        return
+
+    PROGRESS_FILE_PATH = Path(path)
+    PROGRESS_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PROGRESS_FILE_PATH.write_text("", encoding="utf-8")
+
+
+def progress(message: str) -> None:
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
+
+    if PROGRESS_FILE_PATH is not None:
+        for _ in range(5):
+            try:
+                with PROGRESS_FILE_PATH.open("a", encoding="utf-8") as f:
+                    f.write(line)
+                return
+            except PermissionError:
+                time_module.sleep(0.05)
+            except OSError:
+                time_module.sleep(0.05)
+
+        # Прогресс не критичен. Не даём ему ломать основную синхронизацию.
+        return
+
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+def write_error_log(
+    *,
+    message: str,
+    error_type: str,
+    traceback_text: str,
+) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with ERROR_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write("\n" + "=" * 100 + "\n")
+        f.write(f"datetime: {now}\n")
+        f.write(f"error_type: {error_type}\n")
+        f.write(f"message: {message}\n")
+        f.write("-" * 100 + "\n")
+        f.write(traceback_text)
+        f.write("\n")
 
 # =============================================================================
 # Настройки колонок
@@ -30,6 +90,14 @@ CHILD_TASK_ID_COL = "Номер ГТИ"
 # =============================================================================
 # Отчёт
 # =============================================================================
+
+logging.basicConfig(
+    filename=LOG_PATH,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    filemode="a",
+    encoding="utf-8",
+)
 
 @dataclass
 class RefreshTasksReport:
@@ -51,10 +119,10 @@ class RefreshTasksReport:
 # =============================================================================
 
 def read_excel_table_openpyxl(
-    workbook_path: str,
-    *,
-    sheet_name: str,
-    table_name: str,
+        workbook_path: str,
+        *,
+        sheet_name: str,
+        table_name: str,
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """
     Читает умную таблицу из внешней Excel-книги через openpyxl.
@@ -140,8 +208,14 @@ def find_open_book(workbook: str) -> xw.Book:
     for app in xw.apps:
         for book in app.books:
             full_name = str(book.fullname).lower() if book.fullname else ""
+            logging.info(full_name)
+        for book in app.books:
+            full_name = str(book.fullname).lower() if book.fullname else ""
             book_name = book.name.lower()
 
+            logging.info(f"target: {target}")
+            logging.info(f"full_name == target: {full_name == target}")
+            logging.info(f"book_name == target_name: {book_name == target_name}")
             if full_name == target or book_name == target_name:
                 return book
 
@@ -204,6 +278,44 @@ def resize_list_object(table, data_rows: int, col_count: int) -> None:
     new_range = start_cell.Worksheet.Range(start_cell, end_cell)
     table.Resize(new_range)
 
+def sanitize_value_for_excel(value: Any) -> Any:
+    if value is None:
+        return ""
+
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+
+    if isinstance(value, dt_time):
+        return value.strftime("%H:%M:%S")
+
+    if isinstance(value, timedelta):
+        return value.total_seconds() / 86400
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return ""
+        return value
+
+    if isinstance(value, (list, tuple, dict, set)):
+        return json.dumps(value, ensure_ascii=False)
+
+    if isinstance(value, str):
+        # Excel не любит управляющие символы, кроме таба/переноса строки.
+        value = "".join(
+            ch for ch in value
+            if ch in ("\t", "\n", "\r") or ord(ch) >= 32
+        )
+
+        # Максимальная длина текста в ячейке Excel — 32767 символов.
+        if len(value) > 32767:
+            value = value[:32767]
+
+        return value
+
+    return value
 
 def replace_table_rows(table, rows: list[dict[str, Any]]) -> int:
     """
@@ -228,9 +340,34 @@ def replace_table_rows(table, rows: list[dict[str, Any]]) -> int:
     matrix: list[list[Any]] = []
 
     for row in rows:
-        matrix.append([row.get(header, "") for header in headers])
+        matrix.append([
+            sanitize_value_for_excel(row.get(header, ""))
+            for header in headers
+        ])
 
-    body.Value = matrix
+    try:
+        body.Value = matrix
+    except Exception as block_exc:
+        # Диагностика: ищем конкретную ячейку/значение, на котором падает Excel COM.
+        for row_idx, row_values in enumerate(matrix, start=1):
+            for col_idx, value in enumerate(row_values, start=1):
+                try:
+                    body.Cells(row_idx, col_idx).Value = value
+                except Exception as cell_exc:
+                    header = headers[col_idx - 1] if col_idx - 1 < len(headers) else f"col_{col_idx}"
+
+                    raise ValueError(
+                        "Не удалось записать значение в Excel.\n"
+                        f"Таблица: {table.Name}\n"
+                        f"Строка данных: {row_idx}\n"
+                        f"Колонка: {header}\n"
+                        f"Значение: {repr(value)}\n"
+                        f"Тип значения: {type(value).__name__}"
+                    ) from cell_exc
+
+        # Если по ячейкам всё записалось, значит проблема была именно в блочной COM-записи.
+        # В таком случае считаем запись успешной.
+        return row_count
 
     return row_count
 
@@ -259,6 +396,7 @@ def normalize_task_id(value: Any) -> int | None:
 
     return int(float(text.replace(",", ".")))
 
+
 def normalize_excel_datetime(value: Any) -> datetime | None:
     if value is None:
         return None
@@ -277,12 +415,12 @@ def normalize_excel_datetime(value: Any) -> datetime | None:
         return None
 
     for fmt in (
-        "%d.%m.%Y %H:%M:%S",
-        "%d.%m.%Y %H:%M",
-        "%d.%m.%Y",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
+            "%d.%m.%Y %H:%M:%S",
+            "%d.%m.%Y %H:%M",
+            "%d.%m.%Y",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
     ):
         try:
             return datetime.strptime(text, fmt)
@@ -291,9 +429,10 @@ def normalize_excel_datetime(value: Any) -> datetime | None:
 
     return None
 
+
 def external_parent_latest_sort_key(
-    row: dict[str, Any],
-    original_index: int,
+        row: dict[str, Any],
+        original_index: int,
 ) -> tuple[int, float, int]:
     """
     Чем больше ключ — тем строка считается новее.
@@ -313,7 +452,7 @@ def external_parent_latest_sort_key(
 
 
 def keep_latest_parent_rows_by_task_id(
-    rows: list[dict[str, Any]],
+        rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
     Во внешней таблице заданий может быть несколько строк с одним taskId.
@@ -348,9 +487,10 @@ def keep_latest_parent_rows_by_task_id(
 
     return [row for _, row in selected]
 
+
 def filter_parent_rows(
-    rows: list[dict[str, Any]],
-    project_number: str,
+        rows: list[dict[str, Any]],
+        project_number: str,
 ) -> list[dict[str, Any]]:
     """
     Родительскую таблицу фильтруем по колонке 'Код проекта'.
@@ -371,8 +511,8 @@ def filter_parent_rows(
 
 
 def filter_child_rows(
-    rows: list[dict[str, Any]],
-    task_ids: set[int],
+        rows: list[dict[str, Any]],
+        task_ids: set[int],
 ) -> list[dict[str, Any]]:
     """
     Дочернюю таблицу фильтруем по 'Номер ГТИ',
@@ -394,8 +534,8 @@ def filter_child_rows(
 # =============================================================================
 
 def fetch_latest_statuses(
-    db_path: str,
-    task_ids: set[int],
+        db_path: str,
+        task_ids: set[int],
 ) -> dict[int, str]:
     """
     Возвращает последний статус из SQLite TaskStatus по taskid.
@@ -437,8 +577,8 @@ def fetch_latest_statuses(
 
 
 def apply_sqlite_statuses(
-    parent_rows: list[dict[str, Any]],
-    sqlite_statuses: dict[int, str],
+        parent_rows: list[dict[str, Any]],
+        sqlite_statuses: dict[int, str],
 ) -> tuple[int, int]:
     """
     Заменяет только колонку 'Статус' в родительских строках.
@@ -472,34 +612,39 @@ def apply_sqlite_statuses(
 # =============================================================================
 
 def refresh_tasks(
-    *,
-    workbook: str,
-    db_path: str,
-    source_workbook: str,
-    project_number: str,
-    source_parent_sheet: str,
-    source_parent_table: str,
-    source_child_sheet: str,
-    source_child_table: str,
-    target_parent_sheet: str,
-    target_parent_table: str,
-    target_child_sheet: str,
-    target_child_table: str,
+        *,
+        workbook: str,
+        db_path: str,
+        source_workbook: str,
+        project_number: str,
+        source_parent_sheet: str,
+        source_parent_table: str,
+        source_child_sheet: str,
+        source_child_table: str,
+        target_parent_sheet: str,
+        target_parent_table: str,
+        target_child_sheet: str,
+        target_child_table: str,
 ) -> RefreshTasksReport:
+
+    progress(f"Ищу открытую книгу с формами: {Path(workbook).name}")
     target_book = find_open_book(workbook)
 
+    progress(f"Читаю внешнюю родительскую таблицу: {source_parent_sheet}/{source_parent_table}")
     parent_headers, external_parent_rows_all = read_excel_table_openpyxl(
         source_workbook,
         sheet_name=source_parent_sheet,
         table_name=source_parent_table,
     )
 
+    progress(f"Читаю внешнюю дочернюю таблицу: {source_child_sheet}/{source_child_table}")
     child_headers, external_child_rows_all = read_excel_table_openpyxl(
         source_workbook,
         sheet_name=source_child_sheet,
         table_name=source_child_table,
     )
 
+    progress("Проверяю обязательные колонки родительской таблицы")
     require_columns(
         parent_headers,
         [
@@ -511,6 +656,7 @@ def refresh_tasks(
         f"внешняя таблица {source_parent_table}",
     )
 
+    progress("Проверяю обязательные колонки дочерней таблицы")
     require_columns(
         child_headers,
         [
@@ -519,17 +665,24 @@ def refresh_tasks(
         f"внешняя таблица {source_child_table}",
     )
 
+    progress(f"Фильтрую задания по проекту: {project_number}")
     parent_rows = filter_parent_rows(
         external_parent_rows_all,
         project_number,
     )
 
+    progress(f"Найдено строк родительской таблицы по проекту: {len(parent_rows)}")
     parent_rows_before_dedupe = len(parent_rows)
 
+    progress("Удаляю дубли родительской таблицы по taskId, оставляю последний статус")
     parent_rows = keep_latest_parent_rows_by_task_id(parent_rows)
 
     parent_duplicates_removed = parent_rows_before_dedupe - len(parent_rows)
 
+    progress(
+        f"После удаления дублей осталось строк: {len(parent_rows)}. "
+        f"Удалено дублей: {parent_duplicates_removed}"
+    )
     task_ids: set[int] = set()
 
     for row in parent_rows:
@@ -540,33 +693,51 @@ def refresh_tasks(
 
         task_ids.add(task_id)
 
+    progress(f"Собрано уникальных taskId: {len(task_ids)}")
+
+    progress("Читаю последние статусы из SQLite TaskStatus")
     sqlite_statuses = fetch_latest_statuses(db_path, task_ids)
 
+    progress(f"Найдено статусов в SQLite: {len(sqlite_statuses)}")
+
+    progress("Подмешиваю статусы SQLite в родительскую таблицу")
     sqlite_statuses_applied, external_statuses_kept = apply_sqlite_statuses(
         parent_rows,
         sqlite_statuses,
     )
 
+    progress(
+        f"Статусов взято из SQLite: {sqlite_statuses_applied}; "
+        f"оставлено из внешнего Excel: {external_statuses_kept}"
+    )
+
+    progress("Фильтрую дочернюю таблицу task_mix по taskId")
     child_rows = filter_child_rows(
         external_child_rows_all,
         task_ids,
     )
 
+    progress(f"Строк task_mix после фильтрации: {len(child_rows)}")
+
+    progress(f"Ищу целевую таблицу Excel: {target_parent_sheet}/{target_parent_table}")
     target_parent_table_obj = get_list_object(
         target_book,
         target_parent_sheet,
         target_parent_table,
     )
-
+    progress(f"Ищу целевую таблицу Excel: {target_child_sheet}/{target_child_table}")
     target_child_table_obj = get_list_object(
         target_book,
         target_child_sheet,
         target_child_table,
     )
 
+    progress(f"Записываю родительскую таблицу {target_parent_table}: {len(parent_rows)} строк")
     parent_written = replace_table_rows(target_parent_table_obj, parent_rows)
+    progress(f"Записываю дочернюю таблицу {target_child_table}: {len(child_rows)} строк")
     child_written = replace_table_rows(target_child_table_obj, child_rows)
 
+    progress("Сохраняю книгу с формами")
     target_book.save()
 
     return RefreshTasksReport(
@@ -586,9 +757,9 @@ def refresh_tasks(
 
 
 def require_columns(
-    actual_headers: list[str],
-    required_headers: list[str],
-    source_name: str,
+        actual_headers: list[str],
+        required_headers: list[str],
+        source_name: str,
 ) -> None:
     missing = [
         header
@@ -609,13 +780,27 @@ def run_json(**kwargs: Any) -> str:
         return json.dumps(asdict(report), ensure_ascii=False, indent=2)
 
     except Exception as exc:
+        traceback_text = traceback.format_exc()
+        error_type = type(exc).__name__
+        message = str(exc)
+
+        write_error_log(
+            message=message,
+            error_type=error_type,
+            traceback_text=traceback_text,
+        )
+
         report = RefreshTasksReport(
             ok=False,
-            message=str(exc),
+            message=(
+                f"{error_type}: {message}\n\n"
+                f"Полный traceback записан в лог:\n{ERROR_LOG_PATH}"
+            ),
             project=str(kwargs.get("project_number", "")),
-            error_type=type(exc).__name__,
-            traceback=traceback.format_exc(),
+            error_type=error_type,
+            traceback=None,
         )
+
         return json.dumps(asdict(report), ensure_ascii=False, indent=2)
 
 
@@ -626,7 +811,7 @@ def main(argv: list[str] | None = None) -> int:
             "с подмешиванием последних статусов из SQLite"
         )
     )
-
+    parser.add_argument("--progress-file", default=None)
     parser.add_argument(
         "--workbook",
         required=True,
@@ -662,6 +847,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target-child-table", default="Task_mix")
 
     args = parser.parse_args(argv)
+    set_progress_file(args.progress_file)
 
     json_result = run_json(
         workbook=args.workbook,
