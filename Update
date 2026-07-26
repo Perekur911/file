@@ -1,307 +1,297 @@
-Да, тогда **локальную копию основной надстройки делать не надо**. Ты прав: Excel способен записать в форму что-то вроде:
+Вот теперь диагноз меняется: **это не проблема сетевого диска вообще**. Excel иногда не загружает ни основную `.xlam`, ни локальный загрузчик. Значит ломается сам стартовый механизм Excel.
+
+И, судя по симптомам, наиболее вероятно одно из двух:
+
+1. Excel запускается в режиме, где стартовые надстройки пропускаются.
+2. В пользовательском профиле Excel повреждены записи автозагрузки надстроек.
+
+### Сначала проверь одну очень важную вещь
+
+Когда надстройки не загрузились, выполни:
+
+```vba
+? Application.AutomationSecurity
+? Application.EnableEvents
+```
+
+Нормально должно быть примерно:
 
 ```text
-'C:\Users\Иван\AppData\Local\...\PVTResults.xlam'!SomeMacro
+2
+True
 ```
 
-или добавить локальный путь в формулу внешней функции. После сохранения формы другим пользователям станет весело.
+Но главное — `EnableEvents`. Если оно оказалось `False`, то Excel мог открыть `.xlam`, но не выполнить `Workbook_Open`. Хотя у тебя книги вообще нет в `Workbooks`, поэтому это, скорее всего, не основной случай.
 
-Но результат проверки всё равно очень показательный:
-
-```vba
-AddIns("...").Installed = True
-```
-
-при этом:
-
-```vba
-Workbooks("PVTResults.xlam")
-```
-
-не существует.
-
-То есть Excel сохранил надстройку в списке установленных, но на этом конкретном запуске **физически не открыл файл**. `AddIns` — это список элементов в окне «Надстройки», а не список реально загруженных книг. ([Microsoft Learn][1])
-
-А нормальный результат `Dir(...)`, выполненный уже после запуска Excel, не опровергает проблему: в момент автоматической загрузки путь мог быть ещё недоступен или Excel мог просто пропустить загрузку по другой внутренней ошибке. Через несколько секунд, когда ты проверил `Dir`, всё уже работало.
-
-## Оптимальное решение для твоего случая
-
-Локально размещается **не сама рабочая надстройка**, а крошечный `Loader.xlam`, который:
-
-1. автоматически открывается из `XLSTART`;
-2. проверяет, загружена ли сетевая надстройка;
-3. если нет — принудительно перезапускает её через `Installed = False / True`;
-4. при неудаче повторяет попытку через несколько секунд.
-
-Основная надстройка по-прежнему остаётся здесь:
-
-```text
-L:\...\PVTResults.xlam
-```
-
-Поэтому все формулы, кнопки и ссылки продолжают указывать на один общий сетевой файл. Локальный загрузчик вообще нигде в рабочих формах не упоминается.
-
-Excel автоматически открывает файлы, помещённые в пользовательскую папку `XLSTART`. ([Поддержка Microsoft][2])
-
-## Код локального загрузчика
-
-Создай пустую надстройку, например:
-
-```text
-PVTResultsLoader.xlam
-```
-
-В обычный модуль помести:
-
-```vba
-Option Explicit
-
-Private Const MAIN_ADDIN_NAME As String = "PVTResults.xlam"
-Private Const MAIN_ADDIN_TITLE As String = "PVTResults"
-
-Private mAttempt As Long
-Private mNextAttempt As Date
-
-Public Sub StartMainAddinLoading()
-
-    mAttempt = 0
-    TryLoadMainAddin
-
-End Sub
-
-Public Sub TryLoadMainAddin()
-
-    Const MAX_ATTEMPTS As Long = 10
-    Const RETRY_SECONDS As Long = 5
-
-    Dim addinItem As AddIn
-
-    On Error GoTo LoadFailed
-
-    ' Надстройка уже реально открыта.
-    If IsWorkbookLoaded(MAIN_ADDIN_NAME) Then
-        mAttempt = 0
-        Exit Sub
-    End If
-
-    mAttempt = mAttempt + 1
-
-    Set addinItem = FindMainAddin()
-
-    If addinItem Is Nothing Then
-        GoTo LoadFailed
-    End If
-
-    ' Excel может считать надстройку установленной,
-    ' хотя её книга фактически не загружена.
-    If addinItem.Installed Then
-        addinItem.Installed = False
-        DoEvents
-    End If
-
-    addinItem.Installed = True
-    DoEvents
-
-    If IsWorkbookLoaded(MAIN_ADDIN_NAME) Then
-        mAttempt = 0
-        Exit Sub
-    End If
-
-LoadFailed:
-
-    If mAttempt < MAX_ATTEMPTS Then
-
-        mNextAttempt = Now + TimeSerial(0, 0, RETRY_SECONDS)
-
-        Application.OnTime _
-            EarliestTime:=mNextAttempt, _
-            Procedure:="'" & ThisWorkbook.Name & "'!TryLoadMainAddin"
-
-    Else
-
-        MsgBox _
-            "Не удалось загрузить надстройку:" & vbCrLf & _
-            MAIN_ADDIN_NAME & vbCrLf & vbCrLf & _
-            "Проверьте доступность сетевого диска.", _
-            vbExclamation, _
-            "PVT Results"
-
-    End If
-
-End Sub
-
-Private Function IsWorkbookLoaded( _
-    ByVal workbookName As String _
-) As Boolean
-
-    Dim wb As Workbook
-
-    On Error Resume Next
-    Set wb = Application.Workbooks(workbookName)
-    On Error GoTo 0
-
-    IsWorkbookLoaded = Not wb Is Nothing
-
-End Function
-
-Private Function FindMainAddin() As AddIn
-
-    Dim addinItem As AddIn
-
-    For Each addinItem In Application.AddIns
-
-        If StrComp( _
-            addinItem.Name, _
-            MAIN_ADDIN_NAME, _
-            vbTextCompare _
-        ) = 0 Then
-
-            Set FindMainAddin = addinItem
-            Exit Function
-
-        End If
-
-        If StrComp( _
-            addinItem.Title, _
-            MAIN_ADDIN_TITLE, _
-            vbTextCompare _
-        ) = 0 Then
-
-            Set FindMainAddin = addinItem
-            Exit Function
-
-        End If
-
-    Next addinItem
-
-End Function
-```
-
-В `ThisWorkbook` загрузчика:
-
-```vba
-Option Explicit
-
-Private Sub Workbook_Open()
-
-    Application.OnTime _
-        EarliestTime:=Now + TimeSerial(0, 0, 3), _
-        Procedure:="'" & ThisWorkbook.Name & "'!StartMainAddinLoading"
-
-End Sub
-
-Private Sub Workbook_BeforeClose(Cancel As Boolean)
-
-    On Error Resume Next
-
-    If mNextAttempt <> 0 Then
-        Application.OnTime _
-            EarliestTime:=mNextAttempt, _
-            Procedure:="'" & ThisWorkbook.Name & "'!TryLoadMainAddin", _
-            Schedule:=False
-    End If
-
-    On Error GoTo 0
-
-End Sub
-```
-
-Тут есть одна техническая поправка: `mNextAttempt` объявлена `Private` в обычном модуле, поэтому из `ThisWorkbook` она недоступна. Самый простой вариант — либо убрать отмену таймера из `Workbook_BeforeClose`, либо объявить переменную как `Public`:
-
-```vba
-Public mNextAttempt As Date
-```
-
-Я бы пока вообще оставил только:
-
-```vba
-Private Sub Workbook_Open()
-
-    Application.OnTime _
-        EarliestTime:=Now + TimeSerial(0, 0, 3), _
-        Procedure:="'" & ThisWorkbook.Name & "'!StartMainAddinLoading"
-
-End Sub
-```
-
-Загрузчик всё равно закрывается только вместе с Excel.
-
-## Куда положить загрузчик
-
-Путь пользовательской папки `XLSTART` можно получить прямо в Immediate Window:
+Ещё проверь:
 
 ```vba
 ? Application.StartupPath
 ```
 
-Обычно это что-то вроде:
+И положи обычный тестовый файл `Test.xlsm` именно в эту папку, не подключая его как надстройку. В `ThisWorkbook`:
+
+```vba
+Private Sub Workbook_Open()
+    MsgBox "XLSTART работает"
+End Sub
+```
+
+Если даже он иногда не открывается, значит Excel пропускает всю папку `XLSTART`.
+
+## Самая вероятная причина — Excel запускается через DDE из уже висящего процесса
+
+Excel очень любит после закрытия окна оставлять `EXCEL.EXE` в памяти. Особенно если:
+
+* надстройка держит объект Excel;
+* Python/xlwings создал COM-ссылку и не освободил её;
+* есть зависший невидимый экземпляр;
+* проводник или другая программа открывает книгу через DDE;
+* какой-то COM-add-in удерживает процесс.
+
+Тогда при следующем «запуске Excel» **нового запуска на самом деле нет**. Windows просто передаёт команду уже существующему `EXCEL.EXE`.
+
+А раз нового процесса нет, то:
+
+* механизм стартовой загрузки не выполняется;
+* `XLSTART` повторно не обрабатывается;
+* установленные `.xlam` повторно не загружаются;
+* `Workbook_Open` загрузчика не запускается.
+
+Это очень хорошо совпадает с твоей ситуацией.
+
+### Как проверить
+
+Закрой все окна Excel и зайди в диспетчер задач.
+
+Посмотри, остался ли:
 
 ```text
-C:\Users\Имя\AppData\Roaming\Microsoft\Excel\XLSTART
+Microsoft Excel
 ```
 
-В эту папку кладётся только:
+или:
 
 ```text
-PVTResultsLoader.xlam
+EXCEL.EXE
 ```
 
-Основная надстройка остаётся на сетевом диске.
+Если остался — заверши процесс вручную и снова запусти Excel.
 
-## Почему лучше переключать `Installed`, а не делать `Workbooks.Open`
+Если после полного завершения процесса обе надстройки всегда загружаются, причина найдена.
 
-Можно было бы написать:
+Ещё проще выполнить после закрытия Excel:
+
+```cmd
+tasklist | findstr /I EXCEL.EXE
+```
+
+Если там остался процесс — вот твоя «магия».
+
+## Почему процесс Excel может оставаться
+
+С учётом твоего проекта первый подозреваемый — `xlwings` или другой Python COM-код.
+
+Например, такой код может оставить Excel висеть:
+
+```python
+app = xw.App()
+wb = app.books.open(path)
+```
+
+если потом гарантированно не выполнить:
+
+```python
+wb.close()
+app.quit()
+```
+
+И даже после `app.quit()` иногда остаются Python-ссылки:
+
+```python
+del wb
+del app
+```
+
+Лучше использовать:
+
+```python
+import xlwings as xw
+
+app = None
+wb = None
+
+try:
+    app = xw.App(visible=False, add_book=False)
+    wb = app.books.open(path)
+
+    # работа
+
+finally:
+    if wb is not None:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    if app is not None:
+        try:
+            app.quit()
+        except Exception:
+            pass
+```
+
+Но ещё опаснее, когда Python цепляется к уже запущенному Excel через:
+
+```python
+xw.apps.active
+```
+
+или:
+
+```python
+xw.Book.caller()
+```
+
+и где-то остаются COM-объекты листов, диапазонов или книг.
+
+## Проверь прямо сейчас такой сценарий
+
+1. Закрой все окна Excel.
+2. В диспетчере задач заверши все `EXCEL.EXE`.
+3. Запусти Excel из меню «Пуск», не двойным кликом по книге.
+4. Проверь:
 
 ```vba
-Workbooks.Open "L:\...\PVTResults.xlam"
+? Workbooks.Count
 ```
 
-Но для зарегистрированной надстройки правильнее повторить то действие, которое уже гарантированно лечит проблему вручную:
+и:
 
 ```vba
-addinItem.Installed = False
-addinItem.Installed = True
+For Each wb In Workbooks: Debug.Print wb.Name: Next
 ```
 
-Microsoft прямо указывает, что установка `Installed = True` устанавливает надстройку и вызывает её `Auto_Add`, а `False` снимает установку и вызывает `Auto_Remove`. ([Microsoft Learn][3])
+Если обе надстройки загрузились — почти наверняка до этого оставался старый процесс.
 
-То есть загрузчик автоматически делает именно это:
+## Ещё один диагностический тест
 
-> снять галочку → подтвердить → поставить галочку → подтвердить.
+Запусти Excel принудительно отдельным процессом:
 
-## Ещё я бы проверил одну вещь
-
-Когда проблема возникнет снова, сразу выполни:
-
-```vba
-Dim ai As AddIn
-Set ai = AddIns("Название надстройки")
-
-? ai.FullName
-? ai.Installed
-? Dir$(ai.FullName)
+```cmd
+excel.exe /x
 ```
 
-Важно посмотреть именно `ai.FullName`, а не вручную введённый правильный путь.
+Ключ `/x` заставляет Excel создать новый отдельный экземпляр. Microsoft документирует командные переключатели запуска Office, включая запуск отдельного экземпляра. ([Поддержка Microsoft][1])
 
-Возможно, в `AddIns` у пользователя хранится:
+Если через:
+
+```cmd
+excel.exe /x
+```
+
+надстройки грузятся стабильно, а обычным запуском иногда нет — проблема точно связана с повторным использованием существующего процесса Excel, а не с путями или доверием.
+
+## Если процесс точно новый, тогда сбрасывать регистрацию Excel Add-ins
+
+Excel хранит список подключённых `.xlam` в пользовательском реестре, обычно здесь:
 
 ```text
-L:\старый_путь\PVTResults.xlam
+HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Excel\Options
 ```
 
-или прежний UNC-путь, а ты через `Dir` проверял уже актуальное расположение. Галочка при этом тоже будет стоять, потому что запись о надстройке существует.
+Там присутствуют значения:
 
-И ещё сравнить:
-
-```vba
-? AddIns("Название надстройки").FullName
+```text
+OPEN
+OPEN1
+OPEN2
+OPEN3
 ```
 
-на рабочем и проблемном компьютерах.
+примерно такого вида:
 
-Но если `FullName` правильный, наиболее практичное решение — **локальный загрузчик с повторной установкой сетевой надстройки через 3–5 секунд после запуска Excel**. Он не ломает ни одной ссылки в формах и не требует изменять саму основную `.xlam`.
+```text
+/R "L:\...\PVTResults.xlam"
+```
 
-[1]: https://learn.microsoft.com/en-us/office/vba/api/excel.application.addins?utm_source=chatgpt.com "Application.AddIns property (Excel)"
-[2]: https://support.microsoft.com/en-us/excel/customize-how-excel-starts?utm_source=chatgpt.com "Customize how Excel starts"
-[3]: https://learn.microsoft.com/en-us/office/vba/api/excel.addin.installed?utm_source=chatgpt.com "AddIn.Installed property (Excel)"
+или:
+
+```text
+/R "C:\...\Loader.xlam"
+```
+
+Это и есть фактическая очередь файлов, которые Excel открывает при старте. Запись в окне надстроек и фактический стартовый список могут рассинхронизироваться. Для автозагрузки XLA/XLAM используются именно значения `OPEN`; Microsoft также описывает их применение для загрузки надстроек при запуске. ([Microsoft Learn][2])
+
+Открой:
+
+```text
+regedit
+```
+
+и перейди:
+
+```text
+HKEY_CURRENT_USER
+  \Software
+    \Microsoft
+      \Office
+        \16.0
+          \Excel
+            \Options
+```
+
+Посмотри содержимое:
+
+```text
+OPEN
+OPEN1
+OPEN2
+...
+```
+
+Там могут оказаться:
+
+* дубликаты;
+* пустые значения;
+* старые пути;
+* криво записанные параметры;
+* пропущенный номер;
+* один путь без кавычек;
+* остатки удалённых надстроек.
+
+Перед изменением экспортируй раздел `Options`.
+
+Я бы сделал так:
+
+1. Закрыть Excel.
+2. Убедиться, что `EXCEL.EXE` завершён.
+3. Экспортировать раздел `Excel\Options`.
+4. Удалить только значения `OPEN`, `OPEN1`, `OPEN2` и далее.
+5. Запустить Excel.
+6. Заново подключить сначала Loader, потом основную надстройку.
+7. Закрыть Excel штатно.
+8. Снова проверить значения реестра.
+
+## Мой главный подозреваемый сейчас
+
+**Excel на самом деле не запускается заново, а подключается к оставшемуся в памяти экземпляру.**
+
+Потому что это наиболее логично объясняет всё одновременно:
+
+* `Installed=True`;
+* книга отсутствует в `Workbooks`;
+* путь доступен;
+* сетевой и локальный add-in ведут себя одинаково;
+* ручное снятие и установка галочки немедленно загружает файл.
+
+Первым делом проверь `EXCEL.EXE` после закрытия всех окон и запуск через:
+
+```cmd
+excel.exe /x
+```
+
+Это даст почти однозначный ответ.
+
+[1]: https://support.microsoft.com/en-us/office/lifecycle/command-line-switches-for-microsoft-office-products?utm_source=chatgpt.com "Command-line switches for Microsoft Office products"
+[2]: https://learn.microsoft.com/en-us/answers/questions/1490470/installation-of-excel-addin-for-all-users?utm_source=chatgpt.com "Installation of Excel AddIn for all users"
