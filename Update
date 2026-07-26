@@ -1,297 +1,556 @@
-Вот теперь диагноз меняется: **это не проблема сетевого диска вообще**. Excel иногда не загружает ни основную `.xlam`, ни локальный загрузчик. Значит ломается сам стартовый механизм Excel.
+Да. Я просмотрел проект. **Главная реальная ошибка находится в связке `excel_io.py` + `sync.py`.**
 
-И, судя по симптомам, наиболее вероятно одно из двух:
-
-1. Excel запускается в режиме, где стартовые надстройки пропускаются.
-2. В пользовательском профиле Excel повреждены записи автозагрузки надстроек.
-
-### Сначала проверь одну очень важную вещь
-
-Когда надстройки не загрузились, выполни:
-
-```vba
-? Application.AutomationSecurity
-? Application.EnableEvents
-```
-
-Нормально должно быть примерно:
-
-```text
-2
-True
-```
-
-Но главное — `EnableEvents`. Если оно оказалось `False`, то Excel мог открыть `.xlam`, но не выполнить `Workbook_Open`. Хотя у тебя книги вообще нет в `Workbooks`, поэтому это, скорее всего, не основной случай.
-
-Ещё проверь:
-
-```vba
-? Application.StartupPath
-```
-
-И положи обычный тестовый файл `Test.xlsm` именно в эту папку, не подключая его как надстройку. В `ThisWorkbook`:
-
-```vba
-Private Sub Workbook_Open()
-    MsgBox "XLSTART работает"
-End Sub
-```
-
-Если даже он иногда не открывается, значит Excel пропускает всю папку `XLSTART`.
-
-## Самая вероятная причина — Excel запускается через DDE из уже висящего процесса
-
-Excel очень любит после закрытия окна оставлять `EXCEL.EXE` в памяти. Особенно если:
-
-* надстройка держит объект Excel;
-* Python/xlwings создал COM-ссылку и не освободил её;
-* есть зависший невидимый экземпляр;
-* проводник или другая программа открывает книгу через DDE;
-* какой-то COM-add-in удерживает процесс.
-
-Тогда при следующем «запуске Excel» **нового запуска на самом деле нет**. Windows просто передаёт команду уже существующему `EXCEL.EXE`.
-
-А раз нового процесса нет, то:
-
-* механизм стартовой загрузки не выполняется;
-* `XLSTART` повторно не обрабатывается;
-* установленные `.xlam` повторно не загружаются;
-* `Workbook_Open` загрузчика не запускается.
-
-Это очень хорошо совпадает с твоей ситуацией.
-
-### Как проверить
-
-Закрой все окна Excel и зайди в диспетчер задач.
-
-Посмотри, остался ли:
-
-```text
-Microsoft Excel
-```
-
-или:
-
-```text
-EXCEL.EXE
-```
-
-Если остался — заверши процесс вручную и снова запусти Excel.
-
-Если после полного завершения процесса обе надстройки всегда загружаются, причина найдена.
-
-Ещё проще выполнить после закрытия Excel:
-
-```cmd
-tasklist | findstr /I EXCEL.EXE
-```
-
-Если там остался процесс — вот твоя «магия».
-
-## Почему процесс Excel может оставаться
-
-С учётом твоего проекта первый подозреваемый — `xlwings` или другой Python COM-код.
-
-Например, такой код может оставить Excel висеть:
+`ExcelWorkbookGateway` сохраняет открытую книгу в:
 
 ```python
-app = xw.App()
-wb = app.books.open(path)
+self.book
 ```
 
-если потом гарантированно не выполнить:
+а `StudySyncService.close()` закрывает только SQLite:
 
 ```python
-wb.close()
-app.quit()
+def close(self) -> None:
+    self.repo.close()
 ```
 
-И даже после `app.quit()` иногда остаются Python-ссылки:
+То есть явного освобождения ссылки на открытую Excel-книгу вообще нет. Именно этот код используется основной синхронизацией.  
+
+## 1. Обязательное исправление: `excel_io.py`
+
+В начале файла добавь:
 
 ```python
-del wb
-del app
+import gc
 ```
 
-Лучше использовать:
+Сейчас импорты начинаются примерно так:
 
 ```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
 import xlwings as xw
+```
 
-app = None
-wb = None
+Сделай:
+
+```python
+from __future__ import annotations
+
+import gc
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import xlwings as xw
+```
+
+В классе `ExcelWorkbookGateway`, сразу после метода:
+
+```python
+def save(self) -> None:
+    """Сохраняет книгу Excel."""
+    self.book.save()
+```
+
+добавь:
+
+```python
+def close(self) -> None:
+    """
+    Освобождает ссылки xlwings/COM на пользовательский Excel.
+
+    Книгу и приложение не закрывает: ими управляет пользователь.
+    """
+    self.book = None
+    self.workbook_arg = None
+
+    gc.collect()
+```
+
+В итоге участок должен выглядеть так:
+
+```python
+def save(self) -> None:
+    """Сохраняет книгу Excel."""
+    self.book.save()
+
+def close(self) -> None:
+    """
+    Освобождает ссылки xlwings/COM на пользовательский Excel.
+
+    Книгу и приложение не закрывает: ими управляет пользователь.
+    """
+    self.book = None
+    self.workbook_arg = None
+
+    gc.collect()
+
+def _find_open_book(self, workbook: str) -> xw.Book:
+    ...
+```
+
+Это обязательно: сейчас объект gateway постоянно хранит `xw.Book` в `self.book`. 
+
+---
+
+## 2. Обязательное исправление: `sync.py`
+
+В начало `sync.py` добавь:
+
+```python
+import gc
+```
+
+Сейчас в `StudySyncService` метод закрытия выглядит так:
+
+```python
+def close(self) -> None:
+    """Закрывает соединение с БД."""
+    self.repo.close()
+```
+
+Замени его целиком на:
+
+```python
+def close(self) -> None:
+    """
+    Закрывает SQLite и освобождает все ссылки на Excel/COM.
+
+    Пользовательскую книгу и Excel не закрывает.
+    """
+    try:
+        if self.repo is not None:
+            self.repo.close()
+    finally:
+        self.task_status = None
+        self.repo = None
+
+        if self.excel is not None:
+            try:
+                self.excel.close()
+            finally:
+                self.excel = None
+
+        gc.collect()
+```
+
+Почему это важно: `run_save()` и `run_load()` уже вызывают:
+
+```python
+finally:
+    service.close()
+```
+
+Но старый `service.close()` освобождал только соединение SQLite. После замены этот существующий `finally` начнёт корректно освобождать и ссылку на книгу Excel. 
+
+### Ещё небольшая ошибка в `run_json`
+
+У тебя в вызове `run_save()` не передаётся `status_comment`, хотя параметр есть:
+
+Сейчас:
+
+```python
+report = run_save(
+    workbook,
+    db_path,
+    study_codes,
+    task_status=task_status,
+)
+```
+
+Лучше заменить на:
+
+```python
+report = run_save(
+    workbook,
+    db_path,
+    study_codes,
+    task_status=task_status,
+    status_comment=status_comment,
+)
+```
+
+К зависанию Excel это не относится, но это явная потеря параметра.
+
+---
+
+# Остальные xlwings-скрипты
+
+Там нет такого же долгоживущего объекта-контейнера, как `ExcelWorkbookGateway`, но они тоже подключаются к пользовательскому экземпляру Excel. Поэтому лучше добавить принудительный сборщик ссылок в точках выхода.
+
+## 3. `refresh_tasks.py`
+
+Этот файл находит открытую книгу через перебор:
+
+```python
+for app in xw.apps:
+    for book in app.books:
+```
+
+а затем сохраняет ссылку в `target_book` на всё время выполнения функции. 
+
+Добавь в импорты:
+
+```python
+import gc
+```
+
+Самый простой вариант без переписывания огромной функции:
+
+### Переименуй существующую функцию
+
+Было:
+
+```python
+def refresh_tasks(
+        *,
+        workbook: str,
+        ...
+) -> RefreshTasksReport:
+```
+
+Станет:
+
+```python
+def _refresh_tasks_impl(
+        *,
+        workbook: str,
+        ...
+) -> RefreshTasksReport:
+```
+
+### Сразу после неё добавь обёртку с тем же старым именем
+
+```python
+def refresh_tasks(
+        *,
+        workbook: str,
+        db_path: str,
+        source_workbook: str,
+        project_number: str,
+        source_parent_sheet: str,
+        source_parent_table: str,
+        source_child_sheet: str,
+        source_child_table: str,
+        target_parent_sheet: str,
+        target_parent_table: str,
+        target_child_sheet: str,
+        target_child_table: str,
+) -> RefreshTasksReport:
+    try:
+        return _refresh_tasks_impl(
+            workbook=workbook,
+            db_path=db_path,
+            source_workbook=source_workbook,
+            project_number=project_number,
+            source_parent_sheet=source_parent_sheet,
+            source_parent_table=source_parent_table,
+            source_child_sheet=source_child_sheet,
+            source_child_table=source_child_table,
+            target_parent_sheet=target_parent_sheet,
+            target_parent_table=target_parent_table,
+            target_child_sheet=target_child_sheet,
+            target_child_table=target_child_table,
+        )
+    finally:
+        gc.collect()
+```
+
+Так все текущие вызовы `refresh_tasks(...)` останутся рабочими, но после завершения функции Python принудительно соберёт COM-обёртки.
+
+---
+
+## 4. `create_quality_act.py`
+
+Здесь хранятся сразу две ссылки:
+
+```python
+target_book = find_open_book(workbook)
+excel_app = target_book.app
+```
+
+а в `finally` закрывается только созданный акт. Ссылки `target_book` и `excel_app` явно не сбрасываются. 
+
+Добавь:
+
+```python
+import gc
+```
+
+В конец имеющегося `finally`:
+
+```python
+finally:
+    if act_wb is not None:
+        try:
+            act_wb.close()
+        except Exception:
+            pass
+
+    excel_app.display_alerts = previous_display_alerts
+    excel_app.screen_updating = previous_screen_updating
+```
+
+добавь:
+
+```python
+    act_wb = None
+    target_book = None
+    excel_app = None
+
+    gc.collect()
+```
+
+Полностью:
+
+```python
+finally:
+    if act_wb is not None:
+        try:
+            act_wb.close()
+        except Exception:
+            pass
+
+    try:
+        excel_app.display_alerts = previous_display_alerts
+        excel_app.screen_updating = previous_screen_updating
+    finally:
+        act_wb = None
+        target_book = None
+        excel_app = None
+
+        gc.collect()
+```
+
+Именно через `try/finally`, чтобы ссылки освободились даже при ошибке восстановления свойств Excel.
+
+---
+
+## 5. `create_opoh_quality_act.py`
+
+Здесь есть:
+
+```python
+book = find_open_book(workbook_path)
+act_book = book.app.books.open(...)
+```
+
+В конце закрывается `act_book`, но ссылка `book` остаётся до завершения процесса. 
+
+Добавь:
+
+```python
+import gc
+```
+
+Замени:
+
+```python
+finally:
+    act_book.close()
+```
+
+на:
+
+```python
+finally:
+    try:
+        act_book.close()
+    finally:
+        act_book = None
+        book = None
+        gc.collect()
+```
+
+Лучше перед открытием также объявить:
+
+```python
+act_book: xw.Book | None = None
+```
+
+То есть:
+
+```python
+progress("Открываю созданный акт")
+
+act_book: xw.Book | None = None
 
 try:
-    app = xw.App(visible=False, add_book=False)
-    wb = app.books.open(path)
+    act_book = book.app.books.open(
+        str(output_path),
+        update_links=False,
+        read_only=False,
+    )
 
-    # работа
+    # остальная логика
 
 finally:
-    if wb is not None:
+    if act_book is not None:
         try:
-            wb.close()
+            act_book.close()
         except Exception:
             pass
 
-    if app is not None:
-        try:
-            app.quit()
-        except Exception:
-            pass
+    act_book = None
+    book = None
+    gc.collect()
 ```
 
-Но ещё опаснее, когда Python цепляется к уже запущенному Excel через:
+Так обработается и ошибка непосредственно во время открытия акта.
+
+---
+
+# Файлы, которые создают собственный Excel
+
+## 6. `create_project_forms.py`
+
+Этот файл создаёт отдельный процесс:
 
 ```python
-xw.apps.active
+app = xw.App(visible=True, add_book=False)
 ```
 
-или:
+и уже вызывает:
 
 ```python
-xw.Book.caller()
+finally:
+    app.quit()
 ```
 
-и где-то остаются COM-объекты листов, диапазонов или книг.
+Это в целом правильно. 
 
-## Проверь прямо сейчас такой сценарий
+Но после `quit()` лучше принудительно освободить обёртки.
 
-1. Закрой все окна Excel.
-2. В диспетчере задач заверши все `EXCEL.EXE`.
-3. Запусти Excel из меню «Пуск», не двойным кликом по книге.
-4. Проверь:
+Добавь:
 
-```vba
-? Workbooks.Count
+```python
+import gc
 ```
 
-и:
+Замени `finally`:
 
-```vba
-For Each wb In Workbooks: Debug.Print wb.Name: Next
+```python
+finally:
+    try:
+        app.quit()
+    except Exception:
+        pass
 ```
 
-Если обе надстройки загрузились — почти наверняка до этого оставался старый процесс.
+на:
 
-## Ещё один диагностический тест
+```python
+finally:
+    addin_book = None
 
-Запусти Excel принудительно отдельным процессом:
-
-```cmd
-excel.exe /x
+    try:
+        app.quit()
+    except Exception:
+        pass
+    finally:
+        app = None
+        gc.collect()
 ```
 
-Ключ `/x` заставляет Excel создать новый отдельный экземпляр. Microsoft документирует командные переключатели запуска Office, включая запуск отдельного экземпляра. ([Поддержка Microsoft][1])
+Перед `try` нужно объявить:
 
-Если через:
-
-```cmd
-excel.exe /x
+```python
+addin_book: xw.Book | None = None
 ```
 
-надстройки грузятся стабильно, а обычным запуском иногда нет — проблема точно связана с повторным использованием существующего процесса Excel, а не с путями или доверием.
+То есть:
 
-## Если процесс точно новый, тогда сбрасывать регистрацию Excel Add-ins
+```python
+app = xw.App(visible=True, add_book=False)
+addin_book: xw.Book | None = None
+```
 
-Excel хранит список подключённых `.xlam` в пользовательском реестре, обычно здесь:
+Иначе при ошибке до строки открытия надстройки переменная может ещё не существовать.
+
+---
+
+## 7. `migrate_v21_to_v22.py`
+
+Тут тоже создаётся собственный:
+
+```python
+app = xw.App(visible=False, add_book=False)
+```
+
+и вызывается `app.quit()`. Это нормальная схема. 
+
+Добавь:
+
+```python
+import gc
+```
+
+Замени:
+
+```python
+finally:
+    try:
+        app.quit()
+    except Exception:
+        pass
+```
+
+на:
+
+```python
+finally:
+    try:
+        app.quit()
+    except Exception:
+        pass
+    finally:
+        app = None
+        gc.collect()
+```
+
+---
+
+# Файлы, которые менять не нужно
+
+В этих файлах нет подключения к Excel через `xlwings`:
+
+* `repository.py` — только SQLite; 
+* `schema.py` — только описание схем; 
+* `task_status.py` — только SQLite; 
+* `value_converter.py` — только преобразование значений; 
+* `sync_launcher.py` — запускает `sync.py` через `subprocess`, сам к Excel не подключается. 
+
+`sync_launcher.py` может удерживать **Python-процесс**, только если окно launcher остаётся открытым, но COM-ссылка находится в дочернем `sync.py`, а не в launcher.
+
+# Что исправить в первую очередь
+
+Минимальный набор, который непосредственно лечит твою проблему:
+
+1. Добавить `ExcelWorkbookGateway.close()` в `excel_io.py`.
+2. Переписать `StudySyncService.close()` в `sync.py`.
+3. Добавить `gc.collect()` после освобождения ссылок.
+4. Проверить, что VBA действительно дожидается завершения Python-процесса.
+
+После первых двух изменений схема завершения будет такой:
 
 ```text
-HKEY_CURRENT_USER\Software\Microsoft\Office\16.0\Excel\Options
+run_save / run_load
+    ↓
+finally
+    ↓
+StudySyncService.close()
+    ↓
+ExcelWorkbookGateway.close()
+    ↓
+self.book = None
+    ↓
+освобождение COM-ссылки
+    ↓
+Excel может штатно завершить EXCEL.EXE
 ```
 
-Там присутствуют значения:
-
-```text
-OPEN
-OPEN1
-OPEN2
-OPEN3
-```
-
-примерно такого вида:
-
-```text
-/R "L:\...\PVTResults.xlam"
-```
-
-или:
-
-```text
-/R "C:\...\Loader.xlam"
-```
-
-Это и есть фактическая очередь файлов, которые Excel открывает при старте. Запись в окне надстроек и фактический стартовый список могут рассинхронизироваться. Для автозагрузки XLA/XLAM используются именно значения `OPEN`; Microsoft также описывает их применение для загрузки надстроек при запуске. ([Microsoft Learn][2])
-
-Открой:
-
-```text
-regedit
-```
-
-и перейди:
-
-```text
-HKEY_CURRENT_USER
-  \Software
-    \Microsoft
-      \Office
-        \16.0
-          \Excel
-            \Options
-```
-
-Посмотри содержимое:
-
-```text
-OPEN
-OPEN1
-OPEN2
-...
-```
-
-Там могут оказаться:
-
-* дубликаты;
-* пустые значения;
-* старые пути;
-* криво записанные параметры;
-* пропущенный номер;
-* один путь без кавычек;
-* остатки удалённых надстроек.
-
-Перед изменением экспортируй раздел `Options`.
-
-Я бы сделал так:
-
-1. Закрыть Excel.
-2. Убедиться, что `EXCEL.EXE` завершён.
-3. Экспортировать раздел `Excel\Options`.
-4. Удалить только значения `OPEN`, `OPEN1`, `OPEN2` и далее.
-5. Запустить Excel.
-6. Заново подключить сначала Loader, потом основную надстройку.
-7. Закрыть Excel штатно.
-8. Снова проверить значения реестра.
-
-## Мой главный подозреваемый сейчас
-
-**Excel на самом деле не запускается заново, а подключается к оставшемуся в памяти экземпляру.**
-
-Потому что это наиболее логично объясняет всё одновременно:
-
-* `Installed=True`;
-* книга отсутствует в `Workbooks`;
-* путь доступен;
-* сетевой и локальный add-in ведут себя одинаково;
-* ручное снятие и установка галочки немедленно загружает файл.
-
-Первым делом проверь `EXCEL.EXE` после закрытия всех окон и запуск через:
-
-```cmd
-excel.exe /x
-```
-
-Это даст почти однозначный ответ.
-
-[1]: https://support.microsoft.com/en-us/office/lifecycle/command-line-switches-for-microsoft-office-products?utm_source=chatgpt.com "Command-line switches for Microsoft Office products"
-[2]: https://learn.microsoft.com/en-us/answers/questions/1490470/installation-of-excel-addin-for-all-users?utm_source=chatgpt.com "Installation of Excel AddIn for all users"
+Убивать `EXCEL.EXE` из Python или VBA не нужно — это опасный костыль, который может прибить другие несохранённые книги. Здесь нужно именно отпускать COM-ссылку, а не завершать процесс силой.
