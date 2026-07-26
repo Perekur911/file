@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import sys
+import time
 import traceback
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -26,7 +27,12 @@ PROJECT_NUMBER_RE = re.compile(r"^\d{2}-F\d{3}$")
 
 PROJECT_DIR = Path(__file__).resolve().parent
 ERROR_LOG_PATH = PROJECT_DIR / "sync_errors.log"
-TASK_STATUS_EXPORT_PATH = PROJECT_DIR / "Журнал заданий ГТИ.xlsx"
+TASK_STATUS_EXPORT_PATH = Path("L:\LRC\exchange\КСП Лайт\Журнал_заданий_ГТИ.xlsx")
+
+DB_BACKUP_DIR = Path(r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\backups")
+DB_BACKUP_COPIES = 3
+
+PROGRESS_FILE_PATH: Path | None = None
 
 def write_error_log(
     *,
@@ -47,12 +53,115 @@ def write_error_log(
         f.write(traceback_text)
         f.write("\n")
 
+
+def set_progress_file(path: str | None) -> None:
+    global PROGRESS_FILE_PATH
+
+    if not path:
+        PROGRESS_FILE_PATH = None
+        return
+
+    PROGRESS_FILE_PATH = Path(path)
+    PROGRESS_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PROGRESS_FILE_PATH.write_text("", encoding="utf-8")
+
+
 def progress(message: str) -> None:
-    print(
-        f"[{datetime.now().strftime('%H:%M:%S')}] {message}",
-        file=sys.stderr,
-        flush=True,
-    )
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
+
+    if PROGRESS_FILE_PATH is not None:
+        for _ in range(5):
+            try:
+                with PROGRESS_FILE_PATH.open("a", encoding="utf-8") as f:
+                    f.write(line)
+                return
+            except PermissionError:
+                time.sleep(0.05)
+            except OSError:
+                time.sleep(0.05)
+
+        # Прогресс не критичен. Не даём ему ломать основную синхронизацию.
+        return
+
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+def get_db_backup_path(db_path: str | Path, index: int) -> Path:
+    """
+    index:
+        1 — самая старая копия
+        DB_BACKUP_COPIES — самая свежая копия
+    """
+    source = Path(db_path)
+    return DB_BACKUP_DIR / f"{source.stem}_backup_{index}{source.suffix}"
+
+
+def make_sqlite_backup(db_path: str | Path) -> Path:
+    """
+    Делает консистентную копию SQLite-файла через sqlite3 backup API.
+
+    Ротация:
+        backup_1 удаляется
+        backup_2 -> backup_1
+        backup_3 -> backup_2
+        текущая БД -> backup_3
+    """
+    source_path = Path(db_path)
+
+    if not source_path.exists():
+        raise FileNotFoundError(f"Файл SQLite БД не найден: {source_path}")
+
+    DB_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+    progress("Создаю резервную копию SQLite БД...")
+
+    oldest = get_db_backup_path(source_path, 1)
+
+    if oldest.exists():
+        oldest.unlink()
+
+    for index in range(2, DB_BACKUP_COPIES + 1):
+        src = get_db_backup_path(source_path, index)
+        dst = get_db_backup_path(source_path, index - 1)
+
+        if src.exists():
+            if dst.exists():
+                dst.unlink()
+            src.replace(dst)
+
+    latest = get_db_backup_path(source_path, DB_BACKUP_COPIES)
+    tmp_path = latest.with_name(latest.stem + "_tmp" + latest.suffix)
+
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    source_conn = sqlite3.connect(str(source_path), timeout=30)
+    backup_conn = sqlite3.connect(str(tmp_path), timeout=30)
+
+    try:
+        source_conn.backup(backup_conn)
+    finally:
+        backup_conn.close()
+        source_conn.close()
+
+    tmp_path.replace(latest)
+
+    progress(f"Резервная копия БД создана: {latest}")
+
+    return latest
+
+
+def backup_db_before_write(db_path: str, mode: str) -> None:
+    """
+    Бэкап делаем только перед режимами, которые меняют БД.
+    load БД не меняет, поэтому там бэкап не нужен.
+    """
+    if mode not in {"save", "status"}:
+        return
+
+    make_sqlite_backup(db_path)
 
 @dataclass
 class SyncTableReport:
@@ -115,6 +224,7 @@ class StudySyncService:
             studies: list[StudySchema],
             *,
             task_status: str = TaskStatusRepository.COMPLETED_STATUS,
+            status_comment: str | None = None,
     ) -> SyncReport:
         """
         Сохраняет выбранные исследования из Excel в SQLite.
@@ -155,12 +265,14 @@ class StudySyncService:
                         self._save_single_table(
                             study.result_table,
                             task_status=task_status,
+                            status_comment=status_comment,
                         )
                     )
                 else:
                     parent_report, child_report = self._save_parent_and_child(
                         study,
                         task_status=task_status,
+                        status_comment=status_comment,
                     )
                     reports.append(parent_report)
                     reports.append(child_report)
@@ -246,6 +358,7 @@ class StudySyncService:
             status: str,
             result_id: int | None = None,
             date_time: Any = None,
+            status_comment: str | None = None,
     ) -> SyncReport:
 
         progress(f"Устанавливаю статус задания: {taskid} / {task_type} -> {status}")
@@ -261,6 +374,7 @@ class StudySyncService:
                     status=status,
                     explicit_date_time=date_time,
                 ),
+                status_comment=status_comment,
             )
 
             self.repo.commit()
@@ -284,6 +398,7 @@ class StudySyncService:
             schema: TableSchema,
             *,
             task_status: str,
+            status_comment: str | None = None,
     ) -> SyncTableReport:
         """
         Сохраняет одиночную таблицу без дочерних данных.
@@ -317,6 +432,7 @@ class StudySyncService:
             rows=prepared_rows,
             saved_ids=save_result.ids or [],
             status=task_status,
+            status_comment=status_comment,
         )
 
         progress(f"Записываю новые ID обратно в Excel: {schema.excel_table_name}")
@@ -340,6 +456,7 @@ class StudySyncService:
             study: StudySchema,
             *,
             task_status: str,
+            status_comment: str | None = None,
     ) -> tuple[SyncTableReport, SyncTableReport]:
         """
         Сохраняет пару таблиц: родительскую *_results и дочернюю *_sourceData.
@@ -384,6 +501,7 @@ class StudySyncService:
             rows=parent_rows,
             saved_ids=parent_ids,
             status=task_status,
+            status_comment=status_comment,
         )
 
         progress(f"Записываю parent ID обратно в Excel: {parent_schema.excel_table_name}")
@@ -720,6 +838,7 @@ class StudySyncService:
             rows: list[dict[str, Any]],
             saved_ids: list[int],
             status: str,
+            status_comment: str | None = None,
     ) -> int:
         """
         Создаёт записи TaskStatus для сохранённых строк результата.
@@ -756,6 +875,7 @@ class StudySyncService:
                     result_schema=result_schema,
                     row=row,
                 ),
+                status_comment=status_comment,
             )
 
             if was_created:
@@ -1002,6 +1122,7 @@ def export_task_status_to_excel(
         "task_type",
         "resultId",
         "dateTime",
+        "statusComment",
     ]
 
     with sqlite3.connect(db_path) as conn:
@@ -1015,7 +1136,8 @@ def export_task_status_to_excel(
                 taskid,
                 task_type,
                 resultId,
-                dateTime
+                dateTime,
+                statusComment
             FROM TaskStatus
             ORDER BY statusid
             """
@@ -1060,6 +1182,7 @@ def export_task_status_to_excel(
         "D": 14,
         "E": 12,
         "F": 22,
+        "G": 45,
     }
 
     for column_letter, width in column_widths.items():
@@ -1081,6 +1204,7 @@ def run_save(
     db_path: str,
     study_codes: list[str] | None = None,
     task_status: str = TaskStatusRepository.COMPLETED_STATUS,
+    status_comment: str | None = None,
 ) -> SyncReport:
     progress(f"Сохранение исследований: {study_codes or 'ALL'}")
     service = StudySyncService(workbook=workbook, db_path=db_path)
@@ -1088,6 +1212,7 @@ def run_save(
         return service.save_to_db(
             get_studies(study_codes),
             task_status=task_status,
+            status_comment=status_comment,
         )
     finally:
         service.close()
@@ -1100,6 +1225,7 @@ def run_status(
     status: str,
     result_id: int | None = None,
     date_time: Any = None,
+    status_comment: str | None = None,
 ) -> SyncReport:
     service = StudySyncService(workbook=None, db_path=db_path)
     try:
@@ -1109,6 +1235,7 @@ def run_status(
             status=status,
             result_id=result_id,
             date_time=date_time,
+            status_comment=status_comment,
         )
     finally:
         service.close()
@@ -1139,6 +1266,7 @@ def run_json(
     task_type: str | None = None,
     result_id: int | None = None,
     date_time: str | None = None,
+    status_comment: str | None = None,
 ) -> str:
     """
     Возвращает результат JSON-строкой для VBA.
@@ -1149,6 +1277,8 @@ def run_json(
         if mode == "save":
             if not workbook:
                 raise ValueError("Для режима save обязательно нужен --workbook")
+
+            backup_db_before_write(db_path, mode)
 
             report = run_save(
                 workbook,
@@ -1166,20 +1296,31 @@ def run_json(
 
             report = run_load(workbook, db_path, project_number, study_codes)
 
+
         elif mode == "status":
+
             if taskid is None:
                 raise ValueError("Для режима status обязательно нужен --task-id")
 
             if not task_type:
                 raise ValueError("Для режима status обязательно нужен --task-type")
 
+            backup_db_before_write(db_path, mode)
+
             report = run_status(
+
                 db_path,
+
                 taskid=taskid,
+
                 task_type=task_type,
+
                 status=task_status,
+
                 result_id=result_id,
+
                 date_time=date_time,
+
             )
 
         else:
@@ -1261,6 +1402,7 @@ def main(argv: list[str] | None = None) -> int:
         choices=["save", "load", "status"],
         help="save: Excel -> SQLite; load: SQLite -> Excel; status: только запись TaskStatus",
     )
+    parser.add_argument("--progress-file", default=None)
     parser.add_argument(
         "--workbook",
         default=None,
@@ -1296,7 +1438,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Дата/время статуса для mode=status",
     )
+    parser.add_argument(
+        "--status-comment",
+        default=None,
+        help="Комментарий к статусу задания, например причина отмены",
+    )
     args = parser.parse_args(argv)
+    set_progress_file(args.progress_file)
 
     json_result = run_json(
         mode=args.mode,
@@ -1309,6 +1457,7 @@ def main(argv: list[str] | None = None) -> int:
         task_type=args.task_type,
         result_id=args.result_id,
         date_time=args.date_time,
+        status_comment=args.status_comment,
     )
 
     print(json_result)
