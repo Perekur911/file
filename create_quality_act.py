@@ -5,72 +5,84 @@ import json
 import logging
 import re
 import shutil
+import sqlite3
 import sys
-import time
 import traceback
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import openpyxl
 import xlwings as xw
 
 
 # =============================================================================
-# Настройки по умолчанию
+# Настройки проекта
 # =============================================================================
-
-DEFAULT_ACT_TEMPLATE = (
-    r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\Работа\База данных результатов\Акт качества.xlsx"
-)
 
 PROJECT_DIR = Path(__file__).resolve().parent
-ERROR_LOG_PATH = PROJECT_DIR / "create_quality_act_errors.log"
 
+DB_PATH = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db"
 
-GAS_SAMPLE_TYPES = {"GS", "DG", "PNG", "SHFLU", "WHG"}
-LIQ_SAMPLE_TYPES = {"LS", "DEC"}
+# Корневая папка, внутри которой создавать папки проектов.
+#   BASE_PROJECTS_DIR\2026\26-F001-XXX-YYY\...
+BASE_PROJECTS_DIR = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\Работа"
 
+USE_YEAR_SUBFOLDER = True
 
-# =============================================================================
-# Report
-# =============================================================================
+# Чистая форма v22
+CLEAN_V22_TEMPLATE = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\XX-FXXX-XXX-XXX_Форма_v22 чистая мал.xlsx"
+UNPROTECT_PASSWORDS = ("1984", "9184", "")
+PROTECT_PASSWORD = "1984"
 
-@dataclass
-class QualityActReport:
-    ok: bool
-    message: str
-    output_path: str | None = None
-    gas_rows: int = 0
-    liquid_rows: int = 0
-    error_type: str | None = None
-    traceback: str | None = None
+# Внешняя книга с заданиями
+TASKS_WORKBOOK = r"L:\LRC\exchange\КСП Лайт\Журнал_заданий_флюиды.xlsx"
 
+# Если во внешнем файле задания лежат в умной таблице:
+TASKS_PARENT_SHEET = "ГТИ"
+TASKS_PARENT_TABLE = "Журнал_ГТИ"
 
-# =============================================================================
-# Logging
-# =============================================================================
+# Если таблицы нет, скрипт попробует прочитать просто used range листа TASKS_PARENT_SHEET.
+TASK_SAMPLE_CODE_COL = "Код проекта"
+TASK_DATETIME_COL = "Дата и время"
 
-def write_error_log(
-    *,
-    message: str,
-    error_type: str,
-    traceback_text: str,
-) -> None:
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+# refresh_tasks.py должен лежать рядом или быть доступен через PYTHONPATH.
+REFRESH_TASKS_SOURCE_PARENT_SHEET = "ГТИ"
+REFRESH_TASKS_SOURCE_PARENT_TABLE = "Журнал_ГТИ"
+REFRESH_TASKS_SOURCE_CHILD_SHEET = "Смешение"
+REFRESH_TASKS_SOURCE_CHILD_TABLE = "ЖУрнал_объединения"
 
-    with ERROR_LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write("\n" + "=" * 100 + "\n")
-        f.write(f"datetime: {now}\n")
-        f.write(f"error_type: {error_type}\n")
-        f.write(f"message: {message}\n")
-        f.write("-" * 100 + "\n")
-        f.write(traceback_text)
-        f.write("\n")
+REFRESH_TASKS_TARGET_PARENT_SHEET = "Task"
+REFRESH_TASKS_TARGET_PARENT_TABLE = "Task"
+REFRESH_TASKS_TARGET_CHILD_SHEET = "Task_mix"
+REFRESH_TASKS_TARGET_CHILD_TABLE = "Task_mix"
+
+# Надстройка и макрос
+ADDIN_PATH = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam"
+AFTER_REFRESH_MACRO = "PowerQuery.silentRefresh_Project"
+
+# Куда писать номер проекта в новой форме
+PROJECT_CELL_SHEET = "OP"
+PROJECT_CELL_ADDRESS = "B6"
+
+# Сколько последних проектов брать из внешнего журнала, если пользователь оставил ввод пустым
+RECENT_PROJECT_LIMIT = 50
+
+# Как выделять имя папки проекта из sampleCode:
+# 25-F218-SRU-204-GS1 -> при 4 будет 25-F218-SRU-204
+# 25-F218-SRU-204-GS1 -> при 2 будет 25-F218
+FOLDER_PROJECT_PARTS = 4
+
+# Какой проект передавать в refresh_tasks:
+# обычно 25-F218, 26-F001 и т.д.
+REFRESH_PROJECT_PARTS = 2
+
+LOG_PATH = PROJECT_DIR / "create_project_forms.log"
 
 
 logging.basicConfig(
-    filename=PROJECT_DIR / "create_quality_act.log",
+    filename=LOG_PATH,
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     filemode="a",
@@ -79,398 +91,212 @@ logging.basicConfig(
 
 
 # =============================================================================
-# xlwings helpers
+# Reports
 # =============================================================================
 
-def find_open_book(workbook: str) -> xw.Book:
-    target = str(Path(workbook)).lower()
-    target_name = Path(workbook).name.lower()
-
-    for app in xw.apps:
-        for book in app.books:
-            full_name = str(book.fullname).lower() if book.fullname else ""
-            book_name = book.name.lower()
-
-            if full_name == target or book_name == target_name:
-                return book
-
-    raise FileNotFoundError(
-        f"Открытая книга Excel не найдена: {workbook}. "
-        f"Открой книгу с формами перед запуском скрипта."
-    )
+@dataclass
+class ProjectCandidate:
+    folder_project: str
+    refresh_project: str
+    latest_datetime: str | None
+    example_sample_code: str
 
 
-def read_xlwings_table(
-    book: xw.Book,
-    *,
-    sheet_name: str,
-    table_name: str,
-) -> tuple[list[str], list[list[Any]]]:
+@dataclass
+class ProjectCreateReport:
+    project: str
+    ok: bool
+    message: str
+    folder: str | None = None
+    workbook: str | None = None
+    refresh_project: str | None = None
+    error_type: str | None = None
+
+
+@dataclass
+class CreateFormsReport:
+    ok: bool
+    message: str
+    candidates_found: int
+    already_started: int
+    created: int
+    skipped_existing_files: int
+    projects: list[ProjectCreateReport]
+
+
+# =============================================================================
+# Console progress
+# =============================================================================
+
+def progress(message: str) -> None:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+
+def unprotect_all_sheets(book: xw.Book) -> None:
+    for sheet in book.sheets:
+        for password in UNPROTECT_PASSWORDS:
+            try:
+                sheet.api.Unprotect(Password=password)
+                break
+            except Exception:
+                pass
+
+
+def protect_all_sheets(book: xw.Book) -> None:
+    for sheet in book.sheets:
+        try:
+            sheet.api.Protect(
+                Password=PROTECT_PASSWORD,
+                DrawingObjects=True,
+                Contents=True,
+                Scenarios=True,
+                UserInterfaceOnly=True,
+                AllowFiltering=True,
+            )
+        except Exception as exc:
+            logging.warning("Не удалось защитить лист %s: %s", sheet.name, exc)
+
+# =============================================================================
+# Project parsing
+# =============================================================================
+
+def normalize_project_number(value: str) -> str:
+    value = value.strip().upper()
+
+    match = re.fullmatch(r"(\d{2})-F(\d+)", value)
+
+    if not match:
+        raise ValueError(f"Некорректный номер проекта: {value}")
+
+    year, number = match.groups()
+    return f"{year}-F{int(number):03d}"
+
+
+def expand_project_range(start: str, end: str) -> list[str]:
+    start = normalize_project_number(start)
+    end = normalize_project_number(end)
+
+    m1 = re.fullmatch(r"(\d{2}-F)(\d{3})", start)
+    m2 = re.fullmatch(r"(\d{2}-F)(\d{3})", end)
+
+    if not m1 or not m2:
+        raise ValueError(f"Некорректный диапазон: {start}...{end}")
+
+    prefix1, n1 = m1.groups()
+    prefix2, n2 = m2.groups()
+
+    if prefix1 != prefix2:
+        raise ValueError(f"Диапазон должен быть внутри одного года: {start}...{end}")
+
+    n1_i = int(n1)
+    n2_i = int(n2)
+
+    if n2_i < n1_i:
+        raise ValueError(f"Конец диапазона меньше начала: {start}...{end}")
+
+    return [f"{prefix1}{i:03d}" for i in range(n1_i, n2_i + 1)]
+
+
+def parse_projects_input(text: str) -> list[str]:
+    text = text.strip()
+
+    if not text:
+        return []
+
+    text = re.sub(r"\s*\.{2,3}\s*", "...", text)
+
+    parts = re.split(r"[,\s;]+", text)
+
+    result: list[str] = []
+
+    for part in parts:
+        part = part.strip()
+
+        if not part:
+            continue
+
+        if "..." in part:
+            start, end = part.split("...", 1)
+            result.extend(expand_project_range(start, end))
+        else:
+            result.append(normalize_project_number(part))
+
+    seen = set()
+    unique: list[str] = []
+
+    for project in result:
+        if project not in seen:
+            unique.append(project)
+            seen.add(project)
+
+    return unique
+
+
+def ask_projects_text() -> str:
     try:
-        sheet = book.sheets[sheet_name]
-    except Exception as exc:
-        raise ValueError(f"В книге '{book.name}' нет листа '{sheet_name}'") from exc
+        import tkinter as tk
+        from tkinter import simpledialog
 
-    try:
-        table = sheet.tables[table_name]
-    except Exception as exc:
-        raise ValueError(
-            f"На листе '{sheet_name}' нет умной таблицы '{table_name}'"
-        ) from exc
+        root = tk.Tk()
+        root.withdraw()
 
-    values = table.range.value
-
-    if not values:
-        return [], []
-
-    if not isinstance(values[0], list):
-        values = [values]
-
-    headers = [normalize_header(v) for v in values[0]]
-    rows = values[1:]
-
-    return headers, rows
-
-
-def build_header_map(headers: list[str]) -> dict[str, int]:
-    return {
-        str(header).strip().lower(): idx
-        for idx, header in enumerate(headers)
-        if str(header).strip()
-    }
-
-
-def require_columns(
-    header_map: dict[str, int],
-    columns: list[str],
-    source_name: str,
-) -> None:
-    missing = [
-        col for col in columns
-        if col.lower() not in header_map
-    ]
-
-    if missing:
-        raise ValueError(
-            f"В '{source_name}' не найдены обязательные колонки: {missing}. "
-            f"Фактические колонки: {list(header_map.keys())}"
+        value = simpledialog.askstring(
+            title="Создание форм проектов",
+            prompt=(
+                "Введите проект или диапазон, например:\n"
+                "26-F001 или 26-F001...26-F015\n\n"
+                "Оставьте пустым, чтобы взять последние 50 проектов из журнала заданий."
+            ),
         )
 
+        root.destroy()
 
-def normalize_header(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
+        return "" if value is None else value.strip()
 
-
-# =============================================================================
-# Result table wrapper
-# =============================================================================
-
-class ResultTable:
-    def __init__(self, headers: list[str], rows: list[list[Any]], name: str):
-        self.headers = headers
-        self.rows = rows
-        self.name = name
-        self.map = build_header_map(headers)
-
-    def get_column_index(self, column_name: str) -> int | None:
-        return self.map.get(column_name.lower())
-
-    def get_value(self, row_index: int, column_name: str) -> Any:
-        col_index = self.get_column_index(column_name)
-        if col_index is None:
-            return None
-
-        row = self.rows[row_index]
-        if col_index >= len(row):
-            return None
-
-        return row[col_index]
-
-    def find_row_by_sample_code(self, sample_code: str) -> int | None:
-        sample_col = self.get_column_index("sampleCode")
-        if sample_col is None:
-            raise ValueError(f"В таблице '{self.name}' нет колонки sampleCode")
-
-        for i, row in enumerate(self.rows):
-            if sample_col < len(row) and normalize_text(row[sample_col]) == sample_code:
-                return i
-
-        return None
-
-
-# =============================================================================
-# xlwings named ranges / template helpers
-# =============================================================================
-
-def _short_defined_name(name: Any) -> str:
-    """Возвращает имя без префикса листа, например Sheet1!MyName -> MyName."""
-    text = str(name).strip()
-
-    if "!" in text:
-        text = text.rsplit("!", 1)[-1]
-
-    return text.strip("'")
-
-
-def try_get_defined_range(
-    book: xw.Book,
-    defined_name: str,
-) -> xw.Range | None:
-    """Ищет книжный или локальный именованный диапазон."""
-    try:
-        return book.names[defined_name].refers_to_range
     except Exception:
-        pass
-
-    target = defined_name.strip().lower()
-
-    for name in book.names:
-        if _short_defined_name(name.name).lower() != target:
-            continue
-
-        try:
-            return name.refers_to_range
-        except Exception:
-            continue
-
-    for sheet in book.sheets:
-        for name in sheet.names:
-            if _short_defined_name(name.name).lower() != target:
-                continue
-
-            try:
-                return name.refers_to_range
-            except Exception:
-                continue
-
-    return None
-
-
-def get_defined_range(book: xw.Book, defined_name: str) -> xw.Range:
-    target_range = try_get_defined_range(book, defined_name)
-
-    if target_range is None:
-        raise ValueError(f"Не найден именованный диапазон '{defined_name}'")
-
-    return target_range
-
-
-def _range_data_to_2d(
-    value: Any,
-    row_count: int,
-    column_count: int,
-) -> list[list[Any]]:
-    """Нормализует результат xlwings Range.formula до двумерного списка."""
-    if row_count == 1 and column_count == 1:
-        return [[value]]
-
-    if row_count == 1:
-        if isinstance(value, (list, tuple)):
-            if value and isinstance(value[0], (list, tuple)):
-                return [list(value[0])]
-
-            return [list(value)]
-
-        return [[value]]
-
-    if column_count == 1:
-        if not isinstance(value, (list, tuple)):
-            return [[value]]
-
-        if value and isinstance(value[0], (list, tuple)):
-            return [list(row) for row in value]
-
-        return [[item] for item in value]
-
-    if not isinstance(value, (list, tuple)):
-        return [[value]]
-
-    return [
-        list(row) if isinstance(row, (list, tuple)) else [row]
-        for row in value
-    ]
-
-
-def read_defined_range_table(
-    book: xw.Book,
-    defined_name: str,
-) -> list[list[Any]]:
-    target_range = get_defined_range(book, defined_name)
-
-    # Formula используется намеренно: для формульных ячеек получаем саму формулу,
-    # а для обычных ячеек — их значения. Это соответствует cell.value в openpyxl.
-    raw_data = target_range.formula
-
-    return _range_data_to_2d(
-        raw_data,
-        target_range.rows.count,
-        target_range.columns.count,
-    )
-
-
-def write_defined_range_table(
-    book: xw.Book,
-    defined_name: str,
-    data: list[list[Any]],
-    data_row_count: int,
-) -> None:
-    target_range = get_defined_range(book, defined_name)
-    headers = data[0] if data else []
-
-    max_data_rows = min(
-        data_row_count,
-        max(len(data) - 1, 0),
-        max(target_range.rows.count - 1, 0),
-    )
-
-    for row_idx in range(1, max_data_rows + 1):
-        row_data = data[row_idx]
-        max_columns = min(len(row_data), target_range.columns.count)
-
-        for col_idx in range(max_columns):
-            value = row_data[col_idx]
-
-            # Как и раньше, None не записываем, чтобы не затирать содержимое шаблона.
-            if value is None:
-                continue
-
-            header_name = headers[col_idx] if col_idx < len(headers) else ""
-            value = normalize_act_table_value(value, header_name)
-
-            cell = target_range.offset(row_idx, col_idx).resize(1, 1)
-
-            if isinstance(value, str) and value.startswith("="):
-                cell.formula = value
-            else:
-                cell.value = value
-
-
-def write_defined_name_value(
-    book: xw.Book,
-    defined_name: str,
-    value: Any,
-) -> None:
-    if value is None:
-        return
-
-    target_range = try_get_defined_range(book, defined_name)
-
-    # Сохраняем прежнее поведение: отсутствующее необязательное имя просто пропускаем.
-    if target_range is None:
-        return
-
-    target_range.resize(1, 1).value = value
-
-
-def hide_unused_rows_for_defined_table(
-    book: xw.Book,
-    sheet_name: str,
-    defined_name: str,
-    used_data_rows: int,
-) -> None:
-    try:
-        sheet = book.sheets[sheet_name]
-    except Exception as exc:
-        raise ValueError(f"В книге '{book.name}' нет листа '{sheet_name}'") from exc
-
-    target_range = get_defined_range(book, defined_name)
-
-    min_row = target_range.row
-    max_row = target_range.row + target_range.rows.count - 1
-
-    if min_row <= 0:
-        return
-
-    # Полностью повторяет прежнюю логику: скрывается строка заголовка диапазона.
-    sheet.range(f"{min_row}:{min_row}").api.EntireRow.Hidden = True
-
-    first_unused_row = min_row + used_data_rows + 1
-
-    if first_unused_row <= max_row:
-        sheet.range(
-            f"{first_unused_row}:{max_row}"
-        ).api.EntireRow.Hidden = True
+        return input(
+            "Введите проект/диапазон или оставьте пустым для последних 50 проектов: "
+        ).strip()
 
 
 # =============================================================================
-# Mapping helpers
+# Sample/project helpers
 # =============================================================================
 
-def build_act_map(table_data: list[list[Any]]) -> dict[str, dict[str, int]]:
+def canonicalize_f_part(value: str) -> str:
     """
-    По первой строке таблицы акта строит карту вида:
-        {
-            "LIF": {"samplecode": 0, ...},
-            "OP": {"deltapopenpct": 3, ...},
-            "locate": {"calc": 10}
-        }
-
-    Заголовки в шаблоне ожидаются вида:
-        LIF_sampleCode
-        OP_deltaPopenPCT
-        GC_gasvolumePCT
-        calc
+    F218, F218a, F218b -> F218
     """
-    result: dict[str, dict[str, int]] = {
-        "LIF": {},
-        "OP": {},
-        "BP": {},
-        "GC": {},
-        "locate": {},
-    }
+    text = str(value).strip().upper()
 
-    if not table_data:
-        return result
+    match = re.fullmatch(r"F(\d{3})([A-ZА-Я]*)?", text)
 
-    for idx, col_name in enumerate(table_data[0]):
-        if not col_name:
-            continue
+    if not match:
+        return text
 
-        col_text = str(col_name).strip()
-
-        if col_text in ("-",):
-            continue
-
-        if col_text == "calc":
-            result["locate"]["calc"] = idx
-            continue
-
-        if "_" not in col_text:
-            continue
-
-        prefix, field = col_text.split("_", 1)
-        prefix = prefix.strip()
-        field = field.strip().lower()
-
-        if prefix not in result:
-            result[prefix] = {}
-
-        result[prefix][field] = idx
-
-    return result
-
+    return f"F{match.group(1)}"
 
 def normalize_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
 
-INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
-
-def make_safe_filename_part(value: Any, fallback: str = "Проект") -> str:
-    text = normalize_text(value)
+def derive_project_from_sample_code(sample_code: Any, parts_count: int) -> str:
+    text = normalize_text(sample_code)
 
     if not text:
-        text = fallback
+        return ""
 
-    text = INVALID_FILENAME_CHARS_RE.sub("_", text)
-    text = re.sub(r"\s+", " ", text)
-    text = text.strip(" .")
+    parts = text.split("-")
 
-    return text or fallback
+    if len(parts) < 2:
+        return text
+
+    # 25-F218a-SRU-204-GS2 -> 25-F218-SRU-204-GS2
+    parts[1] = canonicalize_f_part(parts[1])
+
+    return "-".join(parts[:min(parts_count, len(parts))])
+
 
 def normalize_excel_date(value: Any) -> datetime | None:
     if value is None:
@@ -479,25 +305,23 @@ def normalize_excel_date(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value
 
-    # Excel serial date: 1 = 1900-01-01, в Python/OLE удобно считать от 1899-12-30
     if isinstance(value, (int, float)):
         if value <= 0:
             return None
-
         return datetime(1899, 12, 30) + timedelta(days=float(value))
 
     text = str(value).strip()
 
-    if text == "":
+    if not text:
         return None
 
     for fmt in (
-        "%d.%m.%Y",
         "%d.%m.%Y %H:%M:%S",
         "%d.%m.%Y %H:%M",
-        "%Y-%m-%d",
+        "%d.%m.%Y",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
     ):
         try:
             return datetime.strptime(text, fmt)
@@ -506,691 +330,502 @@ def normalize_excel_date(value: Any) -> datetime | None:
 
     return None
 
-def to_float_or_none(value: Any) -> float | None:
-    if value is None:
-        return None
 
-    text = str(value).strip()
+def project_year_folder(project_name: str) -> str:
+    match = re.match(r"^(\d{2})-F", project_name)
 
-    if text == "":
-        return None
+    if not match:
+        return ""
 
-    try:
-        return float(text.replace(",", "."))
-    except Exception:
-        return None
-
-def parse_number_for_excel(value: Any) -> Any:
-    """
-    Преобразует строковые числа в int/float для записи в Excel.
-
-    '7,184'  -> 7.184
-    '21.063' -> 21.063
-    '5'      -> 5
-    '-'      -> '-'
-    '25-F123-GS1' -> без изменений
-    """
-    if value is None:
-        return None
-
-    if isinstance(value, bool):
-        return value
-
-    if isinstance(value, (int, float)):
-        return value
-
-    if not isinstance(value, str):
-        return value
-
-    original = value
-    text = value.strip()
-
-    if text == "" or text == "-":
-        return original
-
-    # убираем обычные и неразрывные пробелы внутри числа
-    compact = text.replace("\xa0", "").replace(" ", "")
-
-    # только простое число, без букв/шифров/дат
-    if not re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", compact):
-        return original
-
-    normalized = compact.replace(",", ".")
-
-    try:
-        number = float(normalized)
-    except ValueError:
-        return original
-
-    # если было целое число без десятичного разделителя — пишем int
-    if "," not in compact and "." not in compact and number.is_integer():
-        return int(number)
-
-    return number
+    return f"20{match.group(1)}"
 
 
-def should_convert_act_column_to_number(header_name: Any) -> bool:
-    """
-    Конвертируем в число только результатные блоки OP/BP/GC.
+def project_folder_path(base_dir: Path, folder_project: str) -> Path:
+    if USE_YEAR_SUBFOLDER:
+        return base_dir / project_year_folder(folder_project) / folder_project
 
-    LIF-часть не трогаем, чтобы случайно не превратить шифры/номера/коды в числа.
-    """
-    if header_name is None:
-        return False
-
-    text = str(header_name).strip()
-
-    if "_" not in text:
-        return False
-
-    prefix, field = text.split("_", 1)
-
-    prefix = prefix.strip().upper()
-    field = field.strip().lower()
-
-    if prefix not in {"OP", "BP", "GC"}:
-        return False
-
-    # Явно текстовые поля результатов.
-    if field in {
-        "samplecode",
-        "date",
-        "operator",
-        "comment",
-        "punit",
-        "equipment",
-        "equipmentnumber",
-        "presence",
-        "phase",
-    }:
-        return False
-
-    return True
-
-
-def normalize_act_table_value(value: Any, header_name: Any) -> Any:
-    if should_convert_act_column_to_number(header_name):
-        return parse_number_for_excel(value)
-
-    return value
-
-def get_row_value(row: list[Any], col_map: dict[str, int], column_name: str) -> Any:
-    idx = col_map.get(column_name.lower())
-    if idx is None:
-        return None
-
-    if idx >= len(row):
-        return None
-
-    return row[idx]
-
-
-def first_non_empty(
-    rows: list[list[Any]],
-    col_map: dict[str, int],
-    column_name: str,
-) -> Any:
-    idx = col_map.get(column_name.lower())
-    if idx is None:
-        return None
-
-    for row in rows:
-        if idx < len(row) and row[idx] not in (None, ""):
-            return row[idx]
-
-    return None
-
-
-def min_max_dates(
-    rows: list[list[Any]],
-    col_map: dict[str, int],
-    column_name: str,
-) -> tuple[datetime | None, datetime | None]:
-    idx = col_map.get(column_name.lower())
-
-    if idx is None:
-        return None, None
-
-    min_date: datetime | None = None
-    max_date: datetime | None = None
-
-    for row in rows:
-        if idx >= len(row):
-            continue
-
-        value = normalize_excel_date(row[idx])
-
-        if value is None:
-            continue
-
-        if min_date is None or value < min_date:
-            min_date = value
-
-        if max_date is None or value > max_date:
-            max_date = value
-
-    return min_date, max_date
-
-
-def format_date_range(min_date: Any, max_date: Any) -> Any:
-    if min_date is None and max_date is None:
-        return None
-
-    if min_date is None:
-        return max_date
-
-    if max_date is None:
-        return min_date
-
-    if hasattr(min_date, "strftime") and hasattr(max_date, "strftime"):
-        if min_date.strftime("%d.%m.%Y") == max_date.strftime("%d.%m.%Y"):
-            return min_date.strftime("%d.%m.%Y")
-
-        return f"{min_date.strftime('%d.%m.%Y')} - {max_date.strftime('%d.%m.%Y')}"
-
-    if min_date == max_date:
-        return min_date
-
-    return f"{min_date} - {max_date}"
+    return base_dir / folder_project
 
 
 # =============================================================================
-# Main logic
+# Read external tasks workbook
 # =============================================================================
 
-def create_quality_act(
-    *,
-    workbook: str,
-    template_path: str = DEFAULT_ACT_TEMPLATE,
-    output_dir: str | None = None,
-) -> QualityActReport:
-    start_time = time.time()
-
-    target_book = find_open_book(workbook)
-
-    if output_dir is None:
-        output_dir = str(Path(workbook).parent)
-
-    output_dir_path = Path(output_dir)
-    output_dir_path.mkdir(parents=True, exist_ok=True)
-
-    logging.info("[Act] Читаем текущую книгу")
-
-    op_headers, op_rows = read_xlwings_table(
-        target_book,
-        sheet_name="OP_results",
-        table_name="OP_results",
+def read_external_task_rows(
+    workbook_path: str,
+    sheet_name: str,
+    table_name: str,
+) -> list[dict[str, Any]]:
+    wb = openpyxl.load_workbook(
+        workbook_path,
+        read_only=False,
+        data_only=True,
     )
-    bp_headers, bp_rows = read_xlwings_table(
-        target_book,
-        sheet_name="BP_results",
-        table_name="BP_results",
-    )
-    gc_headers, gc_rows = read_xlwings_table(
-        target_book,
-        sheet_name="GC_results",
-        table_name="GC_results",
-    )
-
-    lif_headers, lif_rows = read_xlwings_table(
-        target_book,
-        sheet_name="All_samples",
-        table_name="Append1",
-    )
-
-    results: dict[str, ResultTable] = {
-        "OP": ResultTable(op_headers, op_rows, "OP_results"),
-        "BP": ResultTable(bp_headers, bp_rows, "BP_results"),
-        "GC": ResultTable(gc_headers, gc_rows, "GC_results"),
-    }
-
-    lif_map = build_header_map(lif_headers)
-
-    require_columns(
-        lif_map,
-        [
-            "typeSampleShort",
-            "sampleCode",
-            "Project",
-            "Field",
-            "Well",
-        ],
-        "All_samples/Append1",
-    )
-
-    project = first_non_empty(lif_rows, lif_map, "Project")
-    field = first_non_empty(lif_rows, lif_map, "Field")
-    well = first_non_empty(lif_rows, lif_map, "Well")
-
-    if isinstance(well, float) and well.is_integer():
-        well_text = str(int(well))
-    else:
-        well_text = normalize_text(well)
-
-    project_str = f"{project}-{field}-{well_text}" if project and field and well_text else None
-    project_file_part = make_safe_filename_part(project_str)
-
-    today_str = datetime.today().strftime("%d-%m-%Y, %H-%M")
-    new_act_path = output_dir_path / f"{project_file_part}_Акт качества {today_str}.xlsx"
-
-    shutil.copy2(template_path, new_act_path)
-
-    excel_app = target_book.app
-    act_wb: xw.Book | None = None
-
-    previous_display_alerts = excel_app.display_alerts
-    previous_screen_updating = excel_app.screen_updating
 
     try:
-        excel_app.display_alerts = False
-        excel_app.screen_updating = False
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"Во внешней книге нет листа '{sheet_name}'")
 
-        # Открываем созданную копию шаблона через Excel/xlwings
-        # в том же экземпляре Excel, где открыта исходная книга.
-        act_wb = excel_app.books.open(
-            str(new_act_path),
-            update_links=False,
-            read_only=False,
-        )
+        ws = wb[sheet_name]
 
-        try:
-            act_wb.sheets["Акт качества"]
-        except Exception as exc:
-            raise ValueError(
-                f"В шаблоне '{new_act_path}' нет листа 'Акт качества'"
-            ) from exc
+        rows_values: list[list[Any]]
 
-        gas_act_tbl = read_defined_range_table(act_wb, "GasActTable")
-        liq_act_tbl = read_defined_range_table(act_wb, "LiquidActTable")
+        if table_name in ws.tables:
+            table = ws.tables[table_name]
+            cell_range = ws[table.ref]
+            rows_values = [[cell.value for cell in row] for row in cell_range]
+        else:
+            # fallback: читаем used range листа
+            rows_values = [
+                list(row)
+                for row in ws.iter_rows(values_only=True)
+                if any(cell is not None for cell in row)
+            ]
 
-        gas_map = build_act_map(gas_act_tbl)
-        liq_map = build_act_map(liq_act_tbl)
+        if not rows_values:
+            return []
 
-        min_result_date = None
-        max_result_date = None
+        headers = [
+            str(value).strip() if value is not None else ""
+            for value in rows_values[0]
+        ]
 
-        gas_cur_row = 0
-        liq_cur_row = 0
+        result: list[dict[str, Any]] = []
 
-        # -------------------------------------------------------------------------
-        # 1. Заполняем LIF-часть из All_samples / Append1
-        # -------------------------------------------------------------------------
+        for raw_row in rows_values[1:]:
+            row = {
+                headers[i]: raw_row[i] if i < len(raw_row) else ""
+                for i in range(len(headers))
+            }
 
-        for lif_row in lif_rows:
-            sample_type = normalize_text(
-                get_row_value(lif_row, lif_map, "typeSampleShort")
-            )
+            if all(normalize_text(v) == "" for v in row.values()):
+                continue
 
-            if sample_type in GAS_SAMPLE_TYPES:
-                gas_cur_row += 1
+            result.append(row)
 
-                if gas_cur_row >= len(gas_act_tbl):
-                    raise ValueError("В GasActTable не хватает строк под газовые пробы")
-
-                for col_name, act_col_idx in gas_map["LIF"].items():
-                    gas_act_tbl[gas_cur_row][act_col_idx] = get_row_value(
-                        lif_row,
-                        lif_map,
-                        col_name,
-                    )
-
-            elif sample_type in LIQ_SAMPLE_TYPES:
-                liq_cur_row += 1
-
-                if liq_cur_row >= len(liq_act_tbl):
-                    raise ValueError("В LiquidActTable не хватает строк под жидкостные пробы")
-
-                for col_name, act_col_idx in liq_map["LIF"].items():
-                    liq_act_tbl[liq_cur_row][act_col_idx] = get_row_value(
-                        lif_row,
-                        lif_map,
-                        col_name,
-                    )
-
-        # -------------------------------------------------------------------------
-        # 2. Подмешиваем результаты OP/BP/GC по sampleCode
-        # -------------------------------------------------------------------------
-
-        min_result_date, max_result_date = fill_result_blocks(
-            act_table=gas_act_tbl,
-            act_map=gas_map,
-            row_count=gas_cur_row,
-            results=results,
-            min_date=min_result_date,
-            max_date=max_result_date,
-        )
-
-        min_result_date, max_result_date = fill_result_blocks(
-            act_table=liq_act_tbl,
-            act_map=liq_map,
-            row_count=liq_cur_row,
-            results=results,
-            min_date=min_result_date,
-            max_date=max_result_date,
-        )
-
-        # -------------------------------------------------------------------------
-        # 3. Расчёт качества
-        # -------------------------------------------------------------------------
-
-        calculate_gas_quality(gas_act_tbl, gas_map, gas_cur_row)
-        calculate_liquid_quality(liq_act_tbl, liq_map, liq_cur_row)
-
-        # -------------------------------------------------------------------------
-        # 4. Записываем таблицы в акт
-        # -------------------------------------------------------------------------
-
-        write_defined_range_table(
-            act_wb,
-            "GasActTable",
-            gas_act_tbl,
-            gas_cur_row,
-        )
-
-        write_defined_range_table(
-            act_wb,
-            "LiquidActTable",
-            liq_act_tbl,
-            liq_cur_row,
-        )
-
-        # -------------------------------------------------------------------------
-        # 5. Заполняем именованные диапазоны шапки
-        # -------------------------------------------------------------------------
-
-        write_defined_name_value(
-            act_wb,
-            "dates",
-            format_date_range(min_result_date, max_result_date),
-        )
-
-        write_defined_name_value(act_wb, "project", project_str)
-
-        delivery_min, delivery_max = min_max_dates(lif_rows, lif_map, "deliveryDate")
-        write_defined_name_value(
-            act_wb,
-            "dateDelivery",
-            format_date_range(delivery_min, delivery_max),
-        )
-
-        transfer_min, transfer_max = min_max_dates(lif_rows, lif_map, "transferDate")
-        write_defined_name_value(
-            act_wb,
-            "dateSampling",
-            format_date_range(transfer_min, transfer_max),
-        )
-
-        write_defined_name_value(
-            act_wb,
-            "reservoir",
-            first_non_empty(lif_rows, lif_map, "reservoir"),
-        )
-
-        write_defined_name_value(
-            act_wb,
-            "FullNameDZO",
-            first_non_empty(lif_rows, lif_map, "FullNameDZO"),
-        )
-
-        write_defined_name_value(
-            act_wb,
-            "LU",
-            first_non_empty(lif_rows, lif_map, "LU"),
-        )
-
-        write_defined_name_value(
-            act_wb,
-            "Well",
-            well,
-        )
-
-        # -------------------------------------------------------------------------
-        # 6. Скрываем лишние строки
-        # -------------------------------------------------------------------------
-
-        hide_unused_rows_for_defined_table(
-            act_wb,
-            "Акт качества",
-            "LiquidActTable",
-            liq_cur_row,
-        )
-
-        hide_unused_rows_for_defined_table(
-            act_wb,
-            "Акт качества",
-            "GasActTable",
-            gas_cur_row,
-        )
-
-        act_wb.save()
+        return result
 
     finally:
-        if act_wb is not None:
+        wb.close()
+
+
+def collect_recent_project_candidates(
+    *,
+    rows: list[dict[str, Any]],
+    wanted_refresh_projects: set[str] | None,
+    limit: int,
+) -> list[ProjectCandidate]:
+    grouped: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        sample_code = normalize_text(row.get(TASK_SAMPLE_CODE_COL))
+
+        if not sample_code:
+            continue
+
+        refresh_project = derive_project_from_sample_code(
+            sample_code,
+            REFRESH_PROJECT_PARTS,
+        )
+
+        folder_project = derive_project_from_sample_code(
+            sample_code,
+            FOLDER_PROJECT_PARTS,
+        )
+
+        if wanted_refresh_projects is not None and refresh_project not in wanted_refresh_projects:
+            continue
+
+        if not refresh_project or not folder_project:
+            continue
+
+        dt = normalize_excel_date(row.get(TASK_DATETIME_COL))
+
+        old = grouped.get(refresh_project)
+
+        if old is None:
+            grouped[refresh_project] = {
+                "folder_project": folder_project,
+                "refresh_project": refresh_project,
+                "latest_datetime": dt,
+                "example_sample_code": sample_code,
+            }
+            continue
+
+        old_dt = old.get("latest_datetime")
+
+        # Берём самый свежий sampleCode внутри проекта,
+        # чтобы из него получить актуальное имя папки.
+        if old_dt is None or (dt is not None and dt > old_dt):
+            old["folder_project"] = folder_project
+            old["latest_datetime"] = dt
+            old["example_sample_code"] = sample_code
+
+    candidates: list[ProjectCandidate] = []
+
+    for item in grouped.values():
+        dt = item["latest_datetime"]
+
+        candidates.append(
+            ProjectCandidate(
+                folder_project=item["folder_project"],
+                refresh_project=item["refresh_project"],
+                latest_datetime=dt.strftime("%Y-%m-%d %H:%M:%S") if dt else None,
+                example_sample_code=item["example_sample_code"],
+            )
+        )
+
+    candidates.sort(
+        key=lambda c: c.latest_datetime or "",
+        reverse=True,
+    )
+
+    if wanted_refresh_projects is None:
+        candidates = candidates[:limit]
+
+    return candidates
+
+# =============================================================================
+# SQLite
+# =============================================================================
+
+def get_started_projects_from_db(db_path: str) -> set[str]:
+    started: set[str] = set()
+
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT sampleCode
+            FROM OP_results
+            WHERE sampleCode IS NOT NULL
+              AND TRIM(sampleCode) <> ''
+            """
+        ).fetchall()
+
+    for (sample_code,) in rows:
+        folder_project = derive_project_from_sample_code(
+            sample_code,
+            FOLDER_PROJECT_PARTS,
+        )
+
+        if folder_project:
+            started.add(folder_project)
+
+    return started
+
+
+# =============================================================================
+# Excel / xlwings
+# =============================================================================
+
+def open_or_get_addin(app: xw.App, addin_path: str) -> xw.Book:
+    addin_name = Path(addin_path).name.lower()
+
+    for book in app.books:
+        if book.name.lower() == addin_name:
+            return book
+
+    return app.books.open(addin_path)
+
+
+def set_project_cell(book: xw.Book, refresh_project: str) -> None:
+    sheet = book.sheets[PROJECT_CELL_SHEET]
+    sheet.range(PROJECT_CELL_ADDRESS).value = refresh_project
+
+
+def run_refresh_tasks_for_book(
+    *,
+    workbook_path: Path,
+    refresh_project: str,
+) -> None:
+    from refresh_tasks import refresh_tasks
+
+    progress(f"Обновляю задания refresh_tasks для {refresh_project}")
+
+    refresh_tasks(
+        workbook=str(workbook_path),
+        db_path=DB_PATH,
+        source_workbook=TASKS_WORKBOOK,
+        project_number=refresh_project,
+        source_parent_sheet=REFRESH_TASKS_SOURCE_PARENT_SHEET,
+        source_parent_table=REFRESH_TASKS_SOURCE_PARENT_TABLE,
+        source_child_sheet=REFRESH_TASKS_SOURCE_CHILD_SHEET,
+        source_child_table=REFRESH_TASKS_SOURCE_CHILD_TABLE,
+        target_parent_sheet=REFRESH_TASKS_TARGET_PARENT_SHEET,
+        target_parent_table=REFRESH_TASKS_TARGET_PARENT_TABLE,
+        target_child_sheet=REFRESH_TASKS_TARGET_CHILD_SHEET,
+        target_child_table=REFRESH_TASKS_TARGET_CHILD_TABLE,
+    )
+
+
+def run_after_refresh_macro(
+    *,
+    app: xw.App,
+    workbook: xw.Book,
+    addin_book: xw.Book,
+) -> None:
+    progress(f"Запускаю макрос надстройки: {AFTER_REFRESH_MACRO}")
+
+    workbook.activate()
+
+    macro = addin_book.macro(AFTER_REFRESH_MACRO)
+    macro()
+
+
+# =============================================================================
+# Main workflow
+# =============================================================================
+
+def create_one_project_form(
+    *,
+    app: xw.App,
+    candidate: ProjectCandidate,
+    base_dir: Path,
+    template_path: Path,
+    overwrite: bool,
+    addin_book: xw.Book,
+) -> ProjectCreateReport:
+    workbook: xw.Book | None = None
+
+    try:
+        folder = project_folder_path(base_dir, candidate.folder_project)
+        folder.mkdir(parents=True, exist_ok=True)
+
+        new_file = folder / f"{candidate.folder_project}_v22.xlsx"
+
+        if new_file.exists():
+            if not overwrite:
+                return ProjectCreateReport(
+                    project=candidate.folder_project,
+                    ok=True,
+                    message="Файл уже существует, пропускаю",
+                    folder=str(folder),
+                    workbook=str(new_file),
+                    refresh_project=candidate.refresh_project,
+                )
+
+            new_file.unlink()
+
+        progress(f"Копирую чистую форму: {candidate.folder_project}")
+        shutil.copy2(template_path, new_file)
+
+        progress(f"Открываю новую форму: {new_file.name}")
+        workbook = app.books.open(
+            str(new_file),
+            update_links=False,
+            ignore_read_only_recommended=True,
+        )
+        unprotect_all_sheets(workbook)
+        progress(f"Записываю номер проекта в {PROJECT_CELL_SHEET}!{PROJECT_CELL_ADDRESS}: {candidate.refresh_project}")
+        set_project_cell(workbook, candidate.refresh_project)
+        workbook.save()
+
+        run_refresh_tasks_for_book(
+            workbook_path=new_file,
+            refresh_project=candidate.refresh_project,
+        )
+
+        run_after_refresh_macro(
+            app=app,
+            workbook=workbook,
+            addin_book=addin_book,
+        )
+
+        protect_all_sheets(workbook)
+        progress("Сохраняю новую форму")
+        workbook.save()
+
+        return ProjectCreateReport(
+            project=candidate.folder_project,
+            ok=True,
+            message="Форма создана",
+            folder=str(folder),
+            workbook=str(new_file),
+            refresh_project=candidate.refresh_project,
+        )
+
+    except Exception as exc:
+        logging.exception("Ошибка создания формы проекта %s", candidate.folder_project)
+
+        return ProjectCreateReport(
+            project=candidate.folder_project,
+            ok=False,
+            message=str(exc),
+            refresh_project=candidate.refresh_project,
+            error_type=type(exc).__name__,
+        )
+
+    finally:
+        if workbook is not None:
             try:
-                act_wb.close()
+                workbook.close()
             except Exception:
                 pass
 
-        excel_app.display_alerts = previous_display_alerts
-        excel_app.screen_updating = previous_screen_updating
 
-    elapsed = time.time() - start_time
-    logging.info("[Act] Готово: %s, %.2f сек", new_act_path, elapsed)
+def create_project_forms(
+    *,
+    projects_text: str,
+    overwrite: bool = False,
+) -> CreateFormsReport:
+    base_dir = Path(BASE_PROJECTS_DIR)
+    template_path = Path(CLEAN_V22_TEMPLATE)
 
-    return QualityActReport(
-        ok=True,
-        message=f"Акт качества создан за {elapsed:.2f} сек",
-        output_path=str(new_act_path),
-        gas_rows=gas_cur_row,
-        liquid_rows=liq_cur_row,
+    if not base_dir.exists():
+        raise FileNotFoundError(f"Корневая папка проектов не найдена: {base_dir}")
+
+    if not template_path.exists():
+        raise FileNotFoundError(f"Чистая форма v22 не найдена: {template_path}")
+
+    progress("Читаю OP_results из SQLite, определяю уже начатые проекты")
+    started_projects = get_started_projects_from_db(DB_PATH)
+
+    wanted_projects = parse_projects_input(projects_text)
+
+    wanted_set: set[str] | None
+    if wanted_projects:
+        wanted_set = set(wanted_projects)
+        progress(f"Пользователь указал проекты: {', '.join(wanted_projects)}")
+    else:
+        wanted_set = None
+        progress(f"Проекты не указаны, беру последние {RECENT_PROJECT_LIMIT} из журнала заданий")
+
+    progress("Читаю внешний журнал заданий")
+    task_rows = read_external_task_rows(
+        TASKS_WORKBOOK,
+        TASKS_PARENT_SHEET,
+        TASKS_PARENT_TABLE,
+    )
+
+    candidates = collect_recent_project_candidates(
+        rows=task_rows,
+        wanted_refresh_projects=wanted_set,
+        limit=RECENT_PROJECT_LIMIT,
+    )
+
+    progress(f"Найдено кандидатов проектов: {len(candidates)}")
+
+    missing_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.folder_project not in started_projects
+    ]
+
+    progress(f"Из них ещё нет в OP_results: {len(missing_candidates)}")
+
+    app = xw.App(visible=True, add_book=False)
+
+    reports: list[ProjectCreateReport] = []
+    skipped_existing_files = 0
+
+    try:
+        app.display_alerts = False
+        app.screen_updating = False
+
+        progress("Открываю надстройку")
+        addin_book = open_or_get_addin(app, ADDIN_PATH)
+
+        for candidate in missing_candidates:
+            progress("-" * 80)
+            progress(f"Создаю форму проекта: {candidate.folder_project}")
+
+            report = create_one_project_form(
+                app=app,
+                candidate=candidate,
+                base_dir=base_dir,
+                template_path=template_path,
+                overwrite=overwrite,
+                addin_book=addin_book,
+            )
+
+            if report.message == "Файл уже существует, пропускаю":
+                skipped_existing_files += 1
+
+            reports.append(report)
+
+    finally:
+        try:
+            app.quit()
+        except Exception:
+            pass
+
+    created_count = sum(1 for report in reports if report.ok and report.message == "Форма создана")
+    ok = all(report.ok for report in reports)
+
+    return CreateFormsReport(
+        ok=ok,
+        message="Создание форм завершено" if ok else "Создание форм завершено с ошибками",
+        candidates_found=len(candidates),
+        already_started=len(candidates) - len(missing_candidates),
+        created=created_count,
+        skipped_existing_files=skipped_existing_files,
+        projects=reports,
     )
 
 
-def fill_result_blocks(
-    *,
-    act_table: list[list[Any]],
-    act_map: dict[str, dict[str, int]],
-    row_count: int,
-    results: dict[str, ResultTable],
-    min_date: Any,
-    max_date: Any,
-) -> tuple[Any, Any]:
-    lif_sample_col = act_map["LIF"].get("samplecode")
-    if lif_sample_col is None:
-        return min_date, max_date
-
-    for row_num_act in range(1, row_count + 1):
-        sample_code = normalize_text(act_table[row_num_act][lif_sample_col])
-
-        for result_code, result_table in results.items():
-            if result_code not in act_map:
-                continue
-
-            if result_code in ("LIF", "locate"):
-                continue
-
-            result_fields = act_map.get(result_code, {})
-            if not result_fields:
-                continue
-
-            result_row_index = result_table.find_row_by_sample_code(sample_code)
-            if result_row_index is None:
-                continue
-
-            result_date = result_table.get_value(result_row_index, "date")
-
-            if result_date:
-                if min_date is None or result_date < min_date:
-                    min_date = result_date
-
-                if max_date is None or result_date > max_date:
-                    max_date = result_date
-
-            for col_name, act_col_idx in result_fields.items():
-                value = result_table.get_value(result_row_index, col_name)
-                act_table[row_num_act][act_col_idx] = value
-
-    return min_date, max_date
-
-
-def calculate_gas_quality(
-    gas_act_tbl: list[list[Any]],
-    gas_map: dict[str, dict[str, int]],
-    gas_cur_row: int,
-) -> None:
-    calc_col = gas_map.get("locate", {}).get("calc")
-    delta_col = gas_map.get("OP", {}).get("deltapopenpct")
-    vliq_col = gas_map.get("OP", {}).get("vliqphase")
-
-    if calc_col is None or delta_col is None or vliq_col is None:
-        return
-
-    for row in range(1, gas_cur_row + 1):
-        delta_popen = to_float_or_none(gas_act_tbl[row][delta_col])
-        v_liq_ph = to_float_or_none(gas_act_tbl[row][vliq_col])
-
-        if v_liq_ph is None:
-            v_liq_ph = 0.0
-
-        if delta_popen is None:
-            continue
-
-        if delta_popen < -10 or v_liq_ph > 1.0:
-            gas_act_tbl[row][calc_col] = "Некачественная"
-        elif 10 > delta_popen > -10 and v_liq_ph == 0:
-            gas_act_tbl[row][calc_col] = "Качественная"
-        else:
-            gas_act_tbl[row][calc_col] = "Качественная с отклонением"
-
-
-def calculate_liquid_quality(
-    liq_act_tbl: list[list[Any]],
-    liq_map: dict[str, dict[str, int]],
-    liq_cur_row: int,
-) -> None:
-    calc_col = liq_map.get("locate", {}).get("calc")
-    delta_col = liq_map.get("OP", {}).get("deltapopenpct")
-    gas_pct_col = liq_map.get("GC", {}).get("gasvolumepct")
-
-    if calc_col is None or delta_col is None or gas_pct_col is None:
-        return
-
-    for row in range(1, liq_cur_row + 1):
-        delta_popen = to_float_or_none(liq_act_tbl[row][delta_col])
-        pct_gas_ph = to_float_or_none(liq_act_tbl[row][gas_pct_col])
-
-        if pct_gas_ph is None:
-            pct_gas_ph = 0.0
-
-        if delta_popen is None:
-            continue
-
-        if delta_popen < -10 or pct_gas_ph >= 5.0:
-            liq_act_tbl[row][calc_col] = "Некачественная"
-        elif 10 > delta_popen > -10 and pct_gas_ph == 0:
-            liq_act_tbl[row][calc_col] = "Качественная"
-        else:
-            liq_act_tbl[row][calc_col] = "Качественная с отклонением"
-
-
 # =============================================================================
-# JSON / CLI
+# CLI
 # =============================================================================
 
 def run_json(
     *,
-    workbook: str,
-    template_path: str = DEFAULT_ACT_TEMPLATE,
-    output_dir: str | None = None,
+    projects_text: str,
+    overwrite: bool,
 ) -> str:
     try:
-        report = create_quality_act(
-            workbook=workbook,
-            template_path=template_path,
-            output_dir=output_dir,
+        report = create_project_forms(
+            projects_text=projects_text,
+            overwrite=overwrite,
         )
 
         return json.dumps(asdict(report), ensure_ascii=False, indent=2)
 
     except Exception as exc:
-        traceback_text = traceback.format_exc()
-        error_type = type(exc).__name__
-        message = str(exc)
+        logging.exception("Критическая ошибка создания форм")
 
-        write_error_log(
-            message=message,
-            error_type=error_type,
-            traceback_text=traceback_text,
-        )
-
-        report = QualityActReport(
+        report = CreateFormsReport(
             ok=False,
-            message=(
-                f"{error_type}: {message}\n\n"
-                f"Полный traceback записан в лог:\n{ERROR_LOG_PATH}"
-            ),
-            error_type=error_type,
-            traceback=None,
+            message=f"{type(exc).__name__}: {exc}. Подробности в логе: {LOG_PATH}",
+            candidates_found=0,
+            already_started=0,
+            created=0,
+            skipped_existing_files=0,
+            projects=[],
         )
 
         return json.dumps(asdict(report), ensure_ascii=False, indent=2)
 
 
-def load_payload(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8-sig") as f:
-        return json.load(f)
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Создание акта качества из текущей книги Excel"
+        description="Автоматическое создание clean_form_v22 для новых проектов"
     )
 
     parser.add_argument(
-        "--payload",
-        type=Path,
+        "--projects",
         default=None,
-        help="Путь к JSON payload. Если указан, остальные параметры можно не передавать.",
+        help=(
+            "Проект или диапазон проектов, например 26-F001 или 26-F001...26-F015. "
+            "Если не указано, будет показано окно ввода. Пустой ввод = последние 50 проектов."
+        ),
     )
 
     parser.add_argument(
-        "--workbook",
-        default=None,
-        help="Путь к уже открытой книге с формами",
-    )
-
-    parser.add_argument(
-        "--template",
-        default=DEFAULT_ACT_TEMPLATE,
-        help="Путь к шаблону акта качества",
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        help="Папка для сохранения созданного акта. По умолчанию папка книги.",
+        "--overwrite",
+        action="store_true",
+        help="Перезаписывать уже существующие *_v22.xlsx",
     )
 
     args = parser.parse_args(argv)
 
-    if args.payload:
-        data = load_payload(args.payload)
+    projects_text = args.projects
 
-        workbook = data["workbook"]
-        template_path = data.get("template", args.template)
-        output_dir = data.get("output_dir", args.output_dir)
-    else:
-        if not args.workbook:
-            parser.error("Нужно указать --workbook или --payload")
-
-        workbook = args.workbook
-        template_path = args.template
-        output_dir = args.output_dir
+    if projects_text is None:
+        projects_text = ask_projects_text()
 
     json_result = run_json(
-        workbook=workbook,
-        template_path=template_path,
-        output_dir=output_dir,
+        projects_text=projects_text,
+        overwrite=args.overwrite,
     )
 
     print(json_result)
