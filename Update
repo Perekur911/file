@@ -1,145 +1,138 @@
-Это почти наверняка **гонка при запуске Excel из-за сетевого диска**.
+Да, тогда **локальную копию основной надстройки делать не надо**. Ты прав: Excel способен записать в форму что-то вроде:
 
-Excel хранит надстройку как установленную, поэтому галочка остаётся. Но при старте он пытается открыть `.xlam` с сетевого пути в момент, когда:
+```text
+'C:\Users\Иван\AppData\Local\...\PVTResults.xlam'!SomeMacro
+```
 
-* сетевой диск ещё не подключён;
-* VPN/удалённая сессия ещё не подняла сеть;
-* файловый сервер временно не ответил;
-* Windows уже показывает букву диска, но обращение к файлу ещё не готово;
-* антивирус или сетевой фильтр задержал открытие.
+или добавить локальный путь в формулу внешней функции. После сохранения формы другим пользователям станет весело.
 
-Excel один раз не смог открыть файл — и **не повторяет попытку позже**. При этом он не обязательно снимает галочку и не помещает надстройку в «Отключённые». Поэтому интерфейс говорит «включена», а книги `.xlam` в памяти нет.
-
-Когда ты снимаешь и снова ставишь галочку, сеть уже доступна, Excel повторно открывает файл — и всё начинает работать.
-
-Надёжные расположения здесь почти ни при чём: они разрешают выполнение макросов, но **не гарантируют доступность сетевого файла в момент запуска**. Для сетевых доверенных расположений также должна быть разрешена отдельная настройка «Разрешить надежные расположения в сети». ([Microsoft Learn][1])
-
-## Как подтвердить
-
-Когда надстройка снова «не запустилась», открой редактор VBA и в Immediate Window выполни:
+Но результат проверки всё равно очень показательный:
 
 ```vba
-? AddIns("Название надстройки").Installed
+AddIns("...").Installed = True
 ```
 
-Скорее всего получишь:
-
-```text
-True
-```
-
-Затем:
+при этом:
 
 ```vba
-? Workbooks("ИмяНадстройки.xlam").Name
+Workbooks("PVTResults.xlam")
 ```
 
-И получишь ошибку `Subscript out of range`, то есть Excel считает надстройку установленной, но книга реально не открыта.
+не существует.
 
-Можно ещё проверить напрямую:
+То есть Excel сохранил надстройку в списке установленных, но на этом конкретном запуске **физически не открыл файл**. `AddIns` — это список элементов в окне «Надстройки», а не список реально загруженных книг. ([Microsoft Learn][1])
 
-```vba
-? Dir("L:\путь\ИмяНадстройки.xlam")
-```
+А нормальный результат `Dir(...)`, выполненный уже после запуска Excel, не опровергает проблему: в момент автоматической загрузки путь мог быть ещё недоступен или Excel мог просто пропустить загрузку по другой внутренней ошибке. Через несколько секунд, когда ты проверил `Dir`, всё уже работало.
 
-Если в момент проблемного запуска вернётся пустая строка, причина доказана: Excel начал загрузку раньше, чем сетевой путь стал доступен.
+## Оптимальное решение для твоего случая
 
-## Лучшее решение
+Локально размещается **не сама рабочая надстройка**, а крошечный `Loader.xlam`, который:
 
-**Не запускать рабочую надстройку непосредственно с сетевого диска.**
+1. автоматически открывается из `XLSTART`;
+2. проверяет, загружена ли сетевая надстройка;
+3. если нет — принудительно перезапускает её через `Installed = False / True`;
+4. при неудаче повторяет попытку через несколько секунд.
 
-Правильная схема:
+Основная надстройка по-прежнему остаётся здесь:
 
 ```text
-Сетевая папка
-    ↓ копирование при входе или запуске
-Локальная папка пользователя
-    ↓
-Excel загружает локальную копию
+L:\...\PVTResults.xlam
 ```
 
-Например:
+Поэтому все формулы, кнопки и ссылки продолжают указывать на один общий сетевой файл. Локальный загрузчик вообще нигде в рабочих формах не упоминается.
+
+Excel автоматически открывает файлы, помещённые в пользовательскую папку `XLSTART`. ([Поддержка Microsoft][2])
+
+## Код локального загрузчика
+
+Создай пустую надстройку, например:
 
 ```text
-Сеть:
-L:\LRC\common_data\PVT Results\PVTResults.xlam
-
-Локально:
-%LOCALAPPDATA%\Company\PVTResults\PVTResults.xlam
+PVTResultsLoader.xlam
 ```
 
-Excel всегда загружает локальный файл, а небольшой скрипт при входе пользователя или перед запуском Excel обновляет его с сервера. Это одновременно решает:
-
-* гонку подключения сетевого диска;
-* кратковременные обрывы сети;
-* медленную загрузку Excel;
-* блокировку файла при замене надстройки;
-* ситуацию, когда несколько пользователей открыли один `.xlam`;
-* проблемы при работе через удалённый рабочий стол.
-
-## Более простой, но менее надёжный вариант
-
-Заменить путь с буквой диска:
-
-```text
-L:\LRC\common_data\...
-```
-
-на UNC:
-
-```text
-\\server\share\LRC\common_data\...
-```
-
-Это устраняет зависимость от того, успела ли Windows назначить букву `L:`, но не устраняет задержку самого сервера или сети.
-
-Особенно вероятна проблема с буквой диска, если она подключается:
-
-* групповыми политиками;
-* логон-скриптом;
-* после подключения VPN;
-* отдельно внутри удалённой сессии.
-
-## Можно сделать автоматическое восстановление
-
-Локальный загрузчик, например в `XLSTART`, может проверять наличие надстройки и загружать её после небольшой задержки:
+В обычный модуль помести:
 
 ```vba
 Option Explicit
 
-Private Const ADDIN_PATH As String = _
-    "L:\LRC\common_data\PVT Results\PVTResults.xlam"
+Private Const MAIN_ADDIN_NAME As String = "PVTResults.xlam"
+Private Const MAIN_ADDIN_TITLE As String = "PVTResults"
 
-Public Sub EnsurePVTAddinLoaded()
+Private mAttempt As Long
+Private mNextAttempt As Date
 
-    Dim addinWb As Workbook
+Public Sub StartMainAddinLoading()
 
-    If IsWorkbookLoaded("PVTResults.xlam") Then Exit Sub
-
-    If Len(Dir$(ADDIN_PATH)) = 0 Then
-        ' Сеть пока недоступна — повторить через 10 секунд
-        Application.OnTime _
-            EarliestTime:=Now + TimeSerial(0, 0, 10), _
-            Procedure:="EnsurePVTAddinLoaded"
-        Exit Sub
-    End If
-
-    On Error Resume Next
-    Set addinWb = Workbooks.Open( _
-        Filename:=ADDIN_PATH, _
-        ReadOnly:=True)
-
-    If addinWb Is Nothing Then
-        Application.OnTime _
-            EarliestTime:=Now + TimeSerial(0, 0, 10), _
-            Procedure:="EnsurePVTAddinLoaded"
-    End If
-
-    On Error GoTo 0
+    mAttempt = 0
+    TryLoadMainAddin
 
 End Sub
 
-Private Function IsWorkbookLoaded(ByVal workbookName As String) As Boolean
+Public Sub TryLoadMainAddin()
+
+    Const MAX_ATTEMPTS As Long = 10
+    Const RETRY_SECONDS As Long = 5
+
+    Dim addinItem As AddIn
+
+    On Error GoTo LoadFailed
+
+    ' Надстройка уже реально открыта.
+    If IsWorkbookLoaded(MAIN_ADDIN_NAME) Then
+        mAttempt = 0
+        Exit Sub
+    End If
+
+    mAttempt = mAttempt + 1
+
+    Set addinItem = FindMainAddin()
+
+    If addinItem Is Nothing Then
+        GoTo LoadFailed
+    End If
+
+    ' Excel может считать надстройку установленной,
+    ' хотя её книга фактически не загружена.
+    If addinItem.Installed Then
+        addinItem.Installed = False
+        DoEvents
+    End If
+
+    addinItem.Installed = True
+    DoEvents
+
+    If IsWorkbookLoaded(MAIN_ADDIN_NAME) Then
+        mAttempt = 0
+        Exit Sub
+    End If
+
+LoadFailed:
+
+    If mAttempt < MAX_ATTEMPTS Then
+
+        mNextAttempt = Now + TimeSerial(0, 0, RETRY_SECONDS)
+
+        Application.OnTime _
+            EarliestTime:=mNextAttempt, _
+            Procedure:="'" & ThisWorkbook.Name & "'!TryLoadMainAddin"
+
+    Else
+
+        MsgBox _
+            "Не удалось загрузить надстройку:" & vbCrLf & _
+            MAIN_ADDIN_NAME & vbCrLf & vbCrLf & _
+            "Проверьте доступность сетевого диска.", _
+            vbExclamation, _
+            "PVT Results"
+
+    End If
+
+End Sub
+
+Private Function IsWorkbookLoaded( _
+    ByVal workbookName As String _
+) As Boolean
 
     Dim wb As Workbook
 
@@ -150,11 +143,165 @@ Private Function IsWorkbookLoaded(ByVal workbookName As String) As Boolean
     IsWorkbookLoaded = Not wb Is Nothing
 
 End Function
+
+Private Function FindMainAddin() As AddIn
+
+    Dim addinItem As AddIn
+
+    For Each addinItem In Application.AddIns
+
+        If StrComp( _
+            addinItem.Name, _
+            MAIN_ADDIN_NAME, _
+            vbTextCompare _
+        ) = 0 Then
+
+            Set FindMainAddin = addinItem
+            Exit Function
+
+        End If
+
+        If StrComp( _
+            addinItem.Title, _
+            MAIN_ADDIN_TITLE, _
+            vbTextCompare _
+        ) = 0 Then
+
+            Set FindMainAddin = addinItem
+            Exit Function
+
+        End If
+
+    Next addinItem
+
+End Function
 ```
 
-Но это скорее страховка. **Нормальное промышленное решение — локальная копия плюс автоматическое обновление с сервера.**
+В `ThisWorkbook` загрузчика:
 
-Ещё возможен механизм Office Resiliency, который отключает медленные или аварийные надстройки, однако у тебя надстройка отсутствует в отключённых элементах, а повторное переключение галочки сразу помогает. Это гораздо больше похоже именно на недоступность сетевого файла во время запуска, а не на автоматическое отключение Office. Office действительно имеет механизм отключения проблемных и медленных надстроек, но обычно это отражается в соответствующем разделе. ([Microsoft Learn][2])
+```vba
+Option Explicit
 
-[1]: https://learn.microsoft.com/en-us/microsoft-365-apps/security/trusted-locations?utm_source=chatgpt.com "Trusted Locations for Office files - Microsoft 365 Apps"
-[2]: https://learn.microsoft.com/en-us/office/vba/outlook/concepts/getting-started/support-for-keeping-add-ins-enabled?utm_source=chatgpt.com "Support for keeping add-ins enabled"
+Private Sub Workbook_Open()
+
+    Application.OnTime _
+        EarliestTime:=Now + TimeSerial(0, 0, 3), _
+        Procedure:="'" & ThisWorkbook.Name & "'!StartMainAddinLoading"
+
+End Sub
+
+Private Sub Workbook_BeforeClose(Cancel As Boolean)
+
+    On Error Resume Next
+
+    If mNextAttempt <> 0 Then
+        Application.OnTime _
+            EarliestTime:=mNextAttempt, _
+            Procedure:="'" & ThisWorkbook.Name & "'!TryLoadMainAddin", _
+            Schedule:=False
+    End If
+
+    On Error GoTo 0
+
+End Sub
+```
+
+Тут есть одна техническая поправка: `mNextAttempt` объявлена `Private` в обычном модуле, поэтому из `ThisWorkbook` она недоступна. Самый простой вариант — либо убрать отмену таймера из `Workbook_BeforeClose`, либо объявить переменную как `Public`:
+
+```vba
+Public mNextAttempt As Date
+```
+
+Я бы пока вообще оставил только:
+
+```vba
+Private Sub Workbook_Open()
+
+    Application.OnTime _
+        EarliestTime:=Now + TimeSerial(0, 0, 3), _
+        Procedure:="'" & ThisWorkbook.Name & "'!StartMainAddinLoading"
+
+End Sub
+```
+
+Загрузчик всё равно закрывается только вместе с Excel.
+
+## Куда положить загрузчик
+
+Путь пользовательской папки `XLSTART` можно получить прямо в Immediate Window:
+
+```vba
+? Application.StartupPath
+```
+
+Обычно это что-то вроде:
+
+```text
+C:\Users\Имя\AppData\Roaming\Microsoft\Excel\XLSTART
+```
+
+В эту папку кладётся только:
+
+```text
+PVTResultsLoader.xlam
+```
+
+Основная надстройка остаётся на сетевом диске.
+
+## Почему лучше переключать `Installed`, а не делать `Workbooks.Open`
+
+Можно было бы написать:
+
+```vba
+Workbooks.Open "L:\...\PVTResults.xlam"
+```
+
+Но для зарегистрированной надстройки правильнее повторить то действие, которое уже гарантированно лечит проблему вручную:
+
+```vba
+addinItem.Installed = False
+addinItem.Installed = True
+```
+
+Microsoft прямо указывает, что установка `Installed = True` устанавливает надстройку и вызывает её `Auto_Add`, а `False` снимает установку и вызывает `Auto_Remove`. ([Microsoft Learn][3])
+
+То есть загрузчик автоматически делает именно это:
+
+> снять галочку → подтвердить → поставить галочку → подтвердить.
+
+## Ещё я бы проверил одну вещь
+
+Когда проблема возникнет снова, сразу выполни:
+
+```vba
+Dim ai As AddIn
+Set ai = AddIns("Название надстройки")
+
+? ai.FullName
+? ai.Installed
+? Dir$(ai.FullName)
+```
+
+Важно посмотреть именно `ai.FullName`, а не вручную введённый правильный путь.
+
+Возможно, в `AddIns` у пользователя хранится:
+
+```text
+L:\старый_путь\PVTResults.xlam
+```
+
+или прежний UNC-путь, а ты через `Dir` проверял уже актуальное расположение. Галочка при этом тоже будет стоять, потому что запись о надстройке существует.
+
+И ещё сравнить:
+
+```vba
+? AddIns("Название надстройки").FullName
+```
+
+на рабочем и проблемном компьютерах.
+
+Но если `FullName` правильный, наиболее практичное решение — **локальный загрузчик с повторной установкой сетевой надстройки через 3–5 секунд после запуска Excel**. Он не ломает ни одной ссылки в формах и не требует изменять саму основную `.xlam`.
+
+[1]: https://learn.microsoft.com/en-us/office/vba/api/excel.application.addins?utm_source=chatgpt.com "Application.AddIns property (Excel)"
+[2]: https://support.microsoft.com/en-us/excel/customize-how-excel-starts?utm_source=chatgpt.com "Customize how Excel starts"
+[3]: https://learn.microsoft.com/en-us/office/vba/api/excel.addin.installed?utm_source=chatgpt.com "AddIn.Installed property (Excel)"
