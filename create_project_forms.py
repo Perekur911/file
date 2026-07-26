@@ -23,34 +23,35 @@ import xlwings as xw
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
-DB_PATH = r"C:\sqlite\results.db"
+DB_PATH = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db"
 
 # Корневая папка, внутри которой создавать папки проектов.
-# Если USE_YEAR_SUBFOLDER=True, итог будет:
 #   BASE_PROJECTS_DIR\2026\26-F001-XXX-YYY\...
 BASE_PROJECTS_DIR = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\Работа"
 
 USE_YEAR_SUBFOLDER = True
 
 # Чистая форма v22
-CLEAN_V22_TEMPLATE = r"L:\LRC\common_data\ФЛЮИДЫ\ПТИ\sqlite-excel\clean_form_v22.xlsx"
+CLEAN_V22_TEMPLATE = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\XX-FXXX-XXX-XXX_Форма_v22 чистая мал.xlsx"
+UNPROTECT_PASSWORDS = ("1984", "9184", "")
+PROTECT_PASSWORD = "1984"
 
-# Внешняя книга с заданиями, та же, которую используешь для refresh_tasks
+# Внешняя книга с заданиями
 TASKS_WORKBOOK = r"L:\LRC\exchange\КСП Лайт\Журнал_заданий_флюиды.xlsx"
 
 # Если во внешнем файле задания лежат в умной таблице:
-TASKS_PARENT_SHEET = "task"
-TASKS_PARENT_TABLE = "task"
+TASKS_PARENT_SHEET = "ГТИ"
+TASKS_PARENT_TABLE = "Журнал_ГТИ"
 
 # Если таблицы нет, скрипт попробует прочитать просто used range листа TASKS_PARENT_SHEET.
 TASK_SAMPLE_CODE_COL = "Код проекта"
 TASK_DATETIME_COL = "Дата и время"
 
 # refresh_tasks.py должен лежать рядом или быть доступен через PYTHONPATH.
-REFRESH_TASKS_SOURCE_PARENT_SHEET = "task"
-REFRESH_TASKS_SOURCE_PARENT_TABLE = "task"
-REFRESH_TASKS_SOURCE_CHILD_SHEET = "task_mix"
-REFRESH_TASKS_SOURCE_CHILD_TABLE = "task_mix"
+REFRESH_TASKS_SOURCE_PARENT_SHEET = "ГТИ"
+REFRESH_TASKS_SOURCE_PARENT_TABLE = "Журнал_ГТИ"
+REFRESH_TASKS_SOURCE_CHILD_SHEET = "Смешение"
+REFRESH_TASKS_SOURCE_CHILD_TABLE = "ЖУрнал_объединения"
 
 REFRESH_TASKS_TARGET_PARENT_SHEET = "Task"
 REFRESH_TASKS_TARGET_PARENT_TABLE = "Task"
@@ -58,8 +59,8 @@ REFRESH_TASKS_TARGET_CHILD_SHEET = "Task_mix"
 REFRESH_TASKS_TARGET_CHILD_TABLE = "Task_mix"
 
 # Надстройка и макрос
-ADDIN_PATH = r"L:\LRC\common_data\ФЛЮИДЫ\ПТИ\sqlite-excel\надстройка.xlam"
-AFTER_REFRESH_MACRO = "wrappers.QueryFilterSilent_wrap"
+ADDIN_PATH = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam"
+AFTER_REFRESH_MACRO = "PowerQuery.silentRefresh_Project"
 
 # Куда писать номер проекта в новой форме
 PROJECT_CELL_SHEET = "OP"
@@ -130,6 +131,29 @@ class CreateFormsReport:
 def progress(message: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
 
+def unprotect_all_sheets(book: xw.Book) -> None:
+    for sheet in book.sheets:
+        for password in UNPROTECT_PASSWORDS:
+            try:
+                sheet.api.Unprotect(Password=password)
+                break
+            except Exception:
+                pass
+
+
+def protect_all_sheets(book: xw.Book) -> None:
+    for sheet in book.sheets:
+        try:
+            sheet.api.Protect(
+                Password=PROTECT_PASSWORD,
+                DrawingObjects=True,
+                Contents=True,
+                Scenarios=True,
+                UserInterfaceOnly=True,
+                AllowFiltering=True,
+            )
+        except Exception as exc:
+            logging.warning("Не удалось защитить лист %s: %s", sheet.name, exc)
 
 # =============================================================================
 # Project parsing
@@ -591,7 +615,7 @@ def create_one_project_form(
             update_links=False,
             ignore_read_only_recommended=True,
         )
-
+        unprotect_all_sheets(workbook)
         progress(f"Записываю номер проекта в {PROJECT_CELL_SHEET}!{PROJECT_CELL_ADDRESS}: {candidate.refresh_project}")
         set_project_cell(workbook, candidate.refresh_project)
         workbook.save()
@@ -607,6 +631,7 @@ def create_one_project_form(
             addin_book=addin_book,
         )
 
+        protect_all_sheets(workbook)
         progress("Сохраняю новую форму")
         workbook.save()
 
