@@ -1,4 +1,178 @@
-resultIdCVD	sampleCode	TaskId	analyseNumber	dateEnd	dateStart	deltaMatBalance	Pabs	Pstart	Ptransfer	Punit	pvtCell	timeEnd	timeStart	Tstart	Ttransfer	Vstart	Vtransfer	dateTimeSync
+Ниже готовый скрипт для SQLite. Я предполагаю, что `sampleCodeGPh` и `sampleCodeLPh` должны быть **уникальны каждый по отдельности**.
 
-																	
-rowIdCVD	resultIdCVD	step	cellFluidMass	d20	date	dGas	evacuatedFluidMass	GF	gorEquipment	initPatm	m0	m0Trap	m1	m1Trap	m2	mgas	mLiq	operator	Patm	picDen	Ppic	sampleCodeGPh	sampleCodeLPh	stepPcell	stepTcell	T	transferPcell	Upic	V1	V2	Vcell	Vcellend	VCellLiq	Vgas	VgasSt	VGCyl	VGTot	VHeCyl	VHeTot	VLiq	VLiqRelative	Vtransfer
+```sql
+-- В SQLite контроль внешних ключей включается отдельно
+-- для каждого нового подключения к базе данных.
+PRAGMA foreign_keys = ON;
+
+
+-- =========================================================
+-- Родительская таблица
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS CVD_results (
+    resultIdCVD       INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    sampleCode        TEXT    NOT NULL,
+    TaskId            INTEGER,
+    analyseNumber     INTEGER NOT NULL,
+
+    dateEnd           TEXT,
+    dateStart         TEXT,
+
+    deltaMatBalance   REAL,
+
+    Pabs              REAL,
+    Pstart            REAL,
+    Ptransfer         REAL,
+    Punit             TEXT,
+
+    pvtCell           TEXT,
+
+    timeEnd           TEXT,
+    timeStart         TEXT,
+
+    Tstart            REAL,
+    Ttransfer         REAL,
+
+    Vstart            REAL,
+    Vtransfer         REAL,
+
+    dateTimeSync      TEXT,
+
+    CONSTRAINT UQ_CVD_results_sampleCode_analyseNumber
+        UNIQUE (sampleCode, analyseNumber)
+);
+
+
+-- =========================================================
+-- Дочерняя таблица
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS CVD_sourceData (
+    rowIdCVD             INTEGER PRIMARY KEY AUTOINCREMENT,
+
+    resultIdCVD          INTEGER NOT NULL,
+
+    step                 INTEGER,
+
+    cellFluidMass        REAL,
+    d20                  REAL,
+    date                 TEXT,
+    dGas                 REAL,
+    evacuatedFluidMass   REAL,
+
+    GF                   REAL,
+    gorEquipment         TEXT,
+
+    initPatm             REAL,
+
+    m0                   REAL,
+    m0Trap               REAL,
+    m1                   REAL,
+    m1Trap               REAL,
+    m2                   REAL,
+
+    mgas                 REAL,
+    mLiq                 REAL,
+
+    operator             TEXT,
+
+    Patm                 REAL,
+    picDen               REAL,
+    Ppic                 REAL,
+
+    sampleCodeGPh        TEXT,
+    sampleCodeLPh        TEXT,
+
+    stepPcell            REAL,
+    stepTcell            REAL,
+
+    T                    REAL,
+    transferPcell        REAL,
+
+    Upic                 REAL,
+
+    V1                   REAL,
+    V2                   REAL,
+    Vcell                REAL,
+    Vcellend             REAL,
+    VCellLiq             REAL,
+
+    Vgas                 REAL,
+    VgasSt               REAL,
+
+    VGCyl                REAL,
+    VGTot                REAL,
+
+    VHeCyl               REAL,
+    VHeTot               REAL,
+
+    VLiq                 REAL,
+    VLiqRelative         REAL,
+
+    Vtransfer            REAL,
+
+    CONSTRAINT FK_CVD_sourceData_resultIdCVD
+        FOREIGN KEY (resultIdCVD)
+        REFERENCES CVD_results (resultIdCVD)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE,
+
+    CONSTRAINT UQ_CVD_sourceData_sampleCodeGPh
+        UNIQUE (sampleCodeGPh),
+
+    CONSTRAINT UQ_CVD_sourceData_sampleCodeLPh
+        UNIQUE (sampleCodeLPh)
+);
+
+
+-- =========================================================
+-- Индексы
+-- =========================================================
+
+-- Для загрузки всех дочерних строк конкретного результата.
+-- На внешние ключи SQLite автоматически индекс не создаёт.
+CREATE INDEX IF NOT EXISTS IX_CVD_sourceData_resultIdCVD
+    ON CVD_sourceData (resultIdCVD);
+
+
+-- Для поиска исследования по номеру задания.
+CREATE INDEX IF NOT EXISTS IX_CVD_results_TaskId
+    ON CVD_results (TaskId);
+
+
+-- Для поиска дочерних строк по номеру этапа внутри результата.
+CREATE INDEX IF NOT EXISTS IX_CVD_sourceData_resultIdCVD_step
+    ON CVD_sourceData (resultIdCVD, step);
+```
+
+Важный момент: команда
+
+```sql
+PRAGMA foreign_keys = ON;
+```
+
+действует только для **текущего подключения**. Её недостаточно один раз выполнить при создании БД — нужно включать при каждом подключении из Python.
+
+Например:
+
+```python
+conn = sqlite3.connect(db_path)
+conn.execute("PRAGMA foreign_keys = ON")
+```
+
+Тогда удаление:
+
+```sql
+DELETE FROM CVD_results
+WHERE resultIdCVD = 15;
+```
+
+автоматически удалит все строки из `CVD_sourceData`, у которых:
+
+```text
+resultIdCVD = 15
+```
+
+Отдельные индексы для `sampleCodeGPh` и `sampleCodeLPh` не нужны: ограничения `UNIQUE` уже создадут для них внутренние уникальные индексы. То же относится к паре `sampleCode + analyseNumber`.
