@@ -1,131 +1,169 @@
-Вот макрос. Он:
-
-* работает с указанным листом;
-* перебирает только имена уровня книги;
-* берёт только имена, относящиеся к этому листу;
-* выбирает левую верхнюю ячейку именованного диапазона;
-* переходит на 10 физических столбцов вправо через `Cells(row, column + 10)`;
-* создаёт имя, заменяя `_1_` на `_2_`;
-* не использует `Offset`, поэтому ширина объединённых ячеек не влияет.
+Вот макрос. Он перебирает **имена уровня книги**, относящиеся к заданному листу, и добавляет недостающие столбцы справа в соответствующие таблицы.
 
 ```vba
-Public Sub CreateShiftedNamedRanges()
+Public Sub CreateCVDTableColumns()
 
     Const SHEET_NAME As String = "CVD"
-    Const COLUMN_SHIFT As Long = 10
+    Const NAME_PREFIX As String = "CVD_1_"
+
+    Const RESULTS_TABLE_NAME As String = "CVD_results"
+    Const SOURCE_TABLE_NAME As String = "CVD_sourceData"
 
     Dim wb As Workbook
     Dim ws As Worksheet
+
+    Dim resultsTable As ListObject
+    Dim sourceTable As ListObject
+
     Dim nm As Name
-    Dim sourceRange As Range
-    Dim targetRange As Range
+    Dim namedRange As Range
 
-    Dim sourceName As String
-    Dim targetName As String
+    Dim rangeName As String
+    Dim nameParts() As String
+    Dim columnName As String
 
-    Dim namesToCreate As Collection
-    Dim item As Variant
+    Dim addedResults As Long
+    Dim addedSource As Long
 
     Set wb = ThisWorkbook
     Set ws = wb.Worksheets(SHEET_NAME)
-    Set namesToCreate = New Collection
 
-    ' Сначала собираем все имена.
-    ' Нельзя безопасно добавлять новые имена прямо во время перебора wb.Names.
+    Set resultsTable = ws.ListObjects(RESULTS_TABLE_NAME)
+    Set sourceTable = ws.ListObjects(SOURCE_TABLE_NAME)
+
     For Each nm In wb.Names
 
-        ' Имена уровня листа содержат "!".
-        ' Нам нужны только имена уровня книги.
+        ' Берём только имена уровня книги.
         If InStr(1, nm.Name, "!", vbTextCompare) = 0 Then
 
-            Set sourceRange = Nothing
+            rangeName = nm.Name
 
-            On Error Resume Next
-            Set sourceRange = nm.RefersToRange
-            On Error GoTo 0
+            ' Имя должно начинаться с CVD_1_.
+            If StrComp( _
+                    Left$(rangeName, Len(NAME_PREFIX)), _
+                    NAME_PREFIX, _
+                    vbTextCompare _
+               ) = 0 Then
 
-            If Not sourceRange Is Nothing Then
+                Set namedRange = Nothing
 
-                ' Проверяем, что имя относится именно к указанному листу.
-                If sourceRange.Worksheet Is ws Then
+                On Error Resume Next
+                Set namedRange = nm.RefersToRange
+                On Error GoTo 0
 
-                    sourceName = nm.Name
+                ' Проверяем, что имя относится к нужному листу.
+                If Not namedRange Is Nothing Then
+                    If namedRange.Worksheet Is ws Then
 
-                    ' Берём только имена, содержащие "_1_".
-                    If InStr(1, sourceName, "_1_", vbTextCompare) > 0 Then
+                        nameParts = Split(rangeName, "_")
 
-                        targetName = Replace( _
-                            Expression:=sourceName, _
-                            Find:="_1_", _
-                            Replace:="_2_", _
-                            Compare:=vbTextCompare _
-                        )
+                        Select Case UBound(nameParts) - LBound(nameParts) + 1
 
-                        ' Смещение именно по номеру столбца,
-                        ' независимо от объединения ячеек.
-                        If sourceRange.Cells(1, 1).Column + COLUMN_SHIFT _
-                                <= ws.Columns.Count Then
+                            ' Например:
+                            ' CVD_1_taskId
+                            Case 3
 
-                            Set targetRange = ws.Cells( _
-                                sourceRange.Cells(1, 1).Row, _
-                                sourceRange.Cells(1, 1).Column + COLUMN_SHIFT _
-                            )
+                                columnName = nameParts(2)
 
-                            namesToCreate.Add Array( _
-                                targetName, _
-                                targetRange.Address( _
-                                    RowAbsolute:=True, _
-                                    ColumnAbsolute:=True, _
-                                    ReferenceStyle:=xlA1, _
-                                    External:=True _
-                                ) _
-                            )
+                                If Not TableColumnExists( _
+                                        resultsTable, _
+                                        columnName _
+                                   ) Then
 
-                        End If
+                                    resultsTable.ListColumns.Add.Name = columnName
+                                    addedResults = addedResults + 1
+
+                                End If
+
+                            ' Например:
+                            ' CVD_1_st1_Ppic
+                            Case 4
+
+                                If StrComp( _
+                                        nameParts(2), _
+                                        "st1", _
+                                        vbTextCompare _
+                                   ) = 0 Then
+
+                                    columnName = nameParts(3)
+
+                                    If Not TableColumnExists( _
+                                            sourceTable, _
+                                            columnName _
+                                       ) Then
+
+                                        sourceTable.ListColumns.Add.Name = columnName
+                                        addedSource = addedSource + 1
+
+                                    End If
+
+                                End If
+
+                        End Select
                     End If
                 End If
             End If
         End If
     Next nm
 
-    ' Создаём новые имена уровня книги.
-    For Each item In namesToCreate
-
-        targetName = CStr(item(0))
-
-        ' Если имя уже существует, удаляем его.
-        On Error Resume Next
-        wb.Names(targetName).Delete
-        On Error GoTo 0
-
-        wb.Names.Add _
-            Name:=targetName, _
-            RefersTo:="=" & CStr(item(1))
-
-    Next item
-
-    MsgBox "Создано именованных диапазонов: " & namesToCreate.Count, _
-           vbInformation
+    MsgBox _
+        "Создано колонок:" & vbCrLf & _
+        RESULTS_TABLE_NAME & ": " & addedResults & vbCrLf & _
+        SOURCE_TABLE_NAME & ": " & addedSource, _
+        vbInformation
 
 End Sub
+
+
+Private Function TableColumnExists( _
+    ByVal table As ListObject, _
+    ByVal columnName As String _
+) As Boolean
+
+    Dim tableColumn As ListColumn
+
+    For Each tableColumn In table.ListColumns
+
+        If StrComp( _
+                tableColumn.Name, _
+                columnName, _
+                vbTextCompare _
+           ) = 0 Then
+
+            TableColumnExists = True
+            Exit Function
+
+        End If
+    Next tableColumn
+
+    TableColumnExists = False
+
+End Function
 ```
 
-Название листа указывается здесь:
+Логика получается такая:
 
-```vba
-Const SHEET_NAME As String = "CVD"
+```text
+CVD_1_taskId
 ```
 
-Например, если исходное имя:
+Три фрагмента: `CVD`, `1`, `taskId` → в `CVD_results` добавится колонка `taskId`.
 
 ```text
 CVD_1_st1_Ppic
 ```
 
-и оно ссылается на `D15`, новое имя будет:
+Четыре фрагмента, третий равен `st1` → в `CVD_sourceData` добавится колонка `Ppic`.
 
 ```text
-CVD_2_st1_Ppic
+CVD_1_st2_Ppic
+CVD_1_last_Ppic
 ```
 
-и будет ссылаться на `N15`, то есть ровно на 10 номеров столбцов правее. Даже если `D15` входит в объединённый диапазон `D15:F15`, отсчёт всё равно пойдёт от столбца `D`, а не от правой границы объединения.
+Четыре фрагмента, но третий не `st1` → ничего не создаётся.
+
+Уже существующие в таблицах колонки повторно не добавляются. Название листа меняется здесь:
+
+```vba
+Const SHEET_NAME As String = "CVD"
+```
