@@ -1,6 +1,3 @@
-Ниже готовый скрипт для SQLite. Я предполагаю, что `sampleCodeGPh` и `sampleCodeLPh` должны быть **уникальны каждый по отдельности**.
-
-```sql
 -- В SQLite контроль внешних ключей включается отдельно
 -- для каждого нового подключения к базе данных.
 PRAGMA foreign_keys = ON;
@@ -19,7 +16,9 @@ CREATE TABLE IF NOT EXISTS CVD_results (
 
     dateEnd           TEXT,
     dateStart         TEXT,
-
+    timeEnd           TEXT,
+    timeStart         TEXT,
+    
     deltaMatBalance   REAL,
 
     Pabs              REAL,
@@ -28,9 +27,6 @@ CREATE TABLE IF NOT EXISTS CVD_results (
     Punit             TEXT,
 
     pvtCell           TEXT,
-
-    timeEnd           TEXT,
-    timeStart         TEXT,
 
     Tstart            REAL,
     Ttransfer         REAL,
@@ -54,7 +50,7 @@ CREATE TABLE IF NOT EXISTS CVD_sourceData (
 
     resultIdCVD          INTEGER NOT NULL,
 
-    step                 INTEGER,
+    step                 TEXT,
 
     cellFluidMass        REAL,
     d20                  REAL,
@@ -80,7 +76,7 @@ CREATE TABLE IF NOT EXISTS CVD_sourceData (
 
     Patm                 REAL,
     picDen               REAL,
-    Ppic                 REAL,
+    Ppic                 TEXT,
 
     sampleCodeGPh        TEXT,
     sampleCodeLPh        TEXT,
@@ -91,7 +87,7 @@ CREATE TABLE IF NOT EXISTS CVD_sourceData (
     T                    REAL,
     transferPcell        REAL,
 
-    Upic                 REAL,
+    Upic                 TEXT,
 
     V1                   REAL,
     V2                   REAL,
@@ -145,34 +141,3 @@ CREATE INDEX IF NOT EXISTS IX_CVD_results_TaskId
 -- Для поиска дочерних строк по номеру этапа внутри результата.
 CREATE INDEX IF NOT EXISTS IX_CVD_sourceData_resultIdCVD_step
     ON CVD_sourceData (resultIdCVD, step);
-```
-
-Важный момент: команда
-
-```sql
-PRAGMA foreign_keys = ON;
-```
-
-действует только для **текущего подключения**. Её недостаточно один раз выполнить при создании БД — нужно включать при каждом подключении из Python.
-
-Например:
-
-```python
-conn = sqlite3.connect(db_path)
-conn.execute("PRAGMA foreign_keys = ON")
-```
-
-Тогда удаление:
-
-```sql
-DELETE FROM CVD_results
-WHERE resultIdCVD = 15;
-```
-
-автоматически удалит все строки из `CVD_sourceData`, у которых:
-
-```text
-resultIdCVD = 15
-```
-
-Отдельные индексы для `sampleCodeGPh` и `sampleCodeLPh` не нужны: ограничения `UNIQUE` уже создадут для них внутренние уникальные индексы. То же относится к паре `sampleCode + analyseNumber`.
