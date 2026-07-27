@@ -1,200 +1,1937 @@
-Да, вставь в `schema.py` **перед блоком `STUDIES`**. По текущей структуре у тебя таблицы описываются через `TableSchema`, колонки через `_col(...)`, а связь родитель/дочка задаётся через `parent` и `fk_column`. 
 
-```python
-CVD_RESULTS = TableSchema(
-    logical_name="CVD_RESULTS",
-    db_table="CVD_results",
-    sheet_name="CVD_results",
-    excel_table_name="CVD_results",
-    status_datetime_fields=("dateEnd", "timeEnd"),
-    columns=[
-        _col("resultIdCVD", "resultIdCVD", typ="INTEGER", value_type="integer", pk=True),
+Private Enum GORFormState
+    GOR_FORM_EMPTY = 0
+    GOR_FORM_RESERVED = 1
+    GOR_FORM_FILLED = 2
+End Enum
 
-        _col("sampleCode", "sampleCode", typ="TEXT", value_type="text", required=True),
-        _col("TaskId", "TaskId", typ="INTEGER", value_type="integer"),
-        _col("analyseNumber", "analyseNumber", typ="INTEGER", value_type="integer", required=True),
+Private Const COL_GOR_ROW_ID_DB As String = "rowIdGOR"
+Private Const COL_GOR_RESULT_ID_DB As String = "resultIdGOR"
+Private Const COL_GOR_SAMPLE_CODE_DB As String = "sampleCode"
+Private Const COL_GOR_TYPE_PH_DB As String = "TypePh"
 
-        _col("dateEnd", "dateEnd", typ="TEXT", value_type="date"),
-        _col("dateStart", "dateStart", typ="TEXT", value_type="date"),
-        _col("timeEnd", "timeEnd", typ="TEXT", value_type="time"),
-        _col("timeStart", "timeStart", typ="TEXT", value_type="time"),
+Private Const GOR_FIRST_FORM_FIRST_COL As Long = 2
+Private Const GOR_PAGE_ROW = 4
+Private Const GOR_PAGE_FIRST_COL = 2
 
-        _col("deltaMatBalance", "deltaMatBalance", typ="REAL", value_type="real"),
+Public Function cancelCurrentTaskGOR() As macroResult
+    
+    cancelCurrentTaskGOR = MACRO_FAILED
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
 
-        _col("Pabs", "Pabs", typ="REAL", value_type="real"),
-        _col("Pstart", "Pstart", typ="REAL", value_type="real"),
-        _col("Ptransfer", "Ptransfer", typ="REAL", value_type="real"),
-        _col("Punit", "Punit", typ="TEXT", value_type="text"),
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = wb.Worksheets("GOR")
+    
+    Dim lenght As Integer
+    lenght = sheetGOR.Range("GOR_2_sampleCode").Column - sheetGOR.Range("GOR_1_sampleCode").Column
+    
+    Dim curFormIndex As Integer
+    curFormIndex = (ActiveCell.Column - GOR_FIRST_FORM_FIRST_COL) \ lenght + 1
+    
+    Dim taskCell As Range
+    Set taskCell = sheetGOR.Range("GOR_" & curFormIndex & "_taskId")
+    
+    Dim answer As Integer
+    
+    answer = MsgBox("Âû äåéñòâèòåëüíî õîòèòå óäàëèòü çàäàíèå ¹" & taskCell.value & "?", vbQuestion + vbYesNo, "Ïîäòâåðæäåíèå")
+    
+    If answer <> vbYes Then
+        cancelCurrentTaskGOR = MACRO_NO_CHANGES
+        Exit Function
+    End If
+    
+    Dim comment As String
+    comment = InputBox("Ââåäèòå ïðè÷èíó îòìåíû:", "Îêíî ââîäà")
+    
+    Dim syncResult As String
+    syncResult = SetTaskStatusOnly(taskCell.value, "GOR", "Îòìåíà", comment)
 
-        _col("pvtCell", "pvtCell", typ="TEXT", value_type="text"),
+    If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
+        With taskCell.MergeArea
+            .Interior.ColorIndex = 3
+            If .Locked = False Then
+                .Locked = True
+            End If
+        End With
+        cancelCurrentTaskGOR = MACRO_CHANGED
+        
+    ElseIf syncResult = "NoComment" Or syncResult = "NoTaskId" Then
+        cancelCurrentTaskGOR = MACRO_NO_CHANGES
+        
+    End If
+End Function
 
-        _col("Tstart", "Tstart", typ="REAL", value_type="real"),
-        _col("Ttransfer", "Ttransfer", typ="REAL", value_type="real"),
+Public Sub editCurrentSamplesFormGOR()
+    
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
 
-        _col("Vstart", "Vstart", typ="REAL", value_type="real"),
-        _col("Vtransfer", "Vtransfer", typ="REAL", value_type="real"),
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = wb.Worksheets("GOR")
+    
+    Dim lenght As Integer
+    lenght = sheetGOR.Range("GOR_2_sampleCode").Column - sheetGOR.Range("GOR_1_sampleCode").Column
+    
+    Dim curFormIndex As Integer
+    curFormIndex = (ActiveCell.Column - GOR_FIRST_FORM_FIRST_COL) \ lenght + 1
+    
+    CreateSampleCodeGOR3 curFormIndex
+    
+End Sub
 
-        _col("dateTimeSync", "dateTimeSync", typ="TEXT", value_type="datetime"),
-    ],
+Public Sub DeleteLastListGOR()
+    
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = ActiveWorkbook.Worksheets("GOR")
+    
+    Dim sheetGORresults As Worksheet
+    Set sheetGORresults = ActiveWorkbook.Worksheets("GOR_results")
+    
+    Dim tableResults As ListObject
+    Set tableResults = sheetGORresults.ListObjects("GOR_results")
+    
+    Dim lastForm As Long
+    lastForm = sheetGOR.ListObjects.count
+    
+    If lastForm <= 2 Then
+        MsgBox "Íåëüçÿ óäàëèòü 2 ïåðâûå ôîðìû"
+        Exit Sub
+    End If
+    
+    Dim countFormCols As Long
+    countFormCols = sheetGOR.Range("GOR_2_sampleCode").Column - sheetGOR.Range("GOR_1_sampleCode").Column
+    
+    Dim firstColLastForm As Long
+    firstColLastForm = GOR_FIRST_FORM_FIRST_COL + (lastForm - 1) * countFormCols
+    
+    Dim lastColLastForm As Long
+    lastColLastForm = firstColLastForm + countFormCols - 1
+    
+    Dim headerCell As Range
+    Dim namedRange As String
+    
+    For Each headerCell In tableResults.HeaderRowRange.Cells
+        namedRange = "GOR_" & lastForm & "_" & CStr(headerCell.value)
+        
+        If NamedRangeExists(ActiveWorkbook, namedRange) Then
+            ActiveWorkbook.Names(namedRange).Delete
+        End If
+    Next headerCell
+    
+    sheetGOR.Range( _
+        sheetGOR.columns(firstColLastForm), _
+        sheetGOR.columns(lastColLastForm) _
+    ).EntireColumn.Delete
+    
+    Call DeleteCheckBoxesFromColumnRight(sheetGOR, firstColLastForm)
+
+End Sub
+
+Public Sub InsertListGOR2()
+
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = ActiveWorkbook.Worksheets("GOR")
+    
+    Dim lastList As Integer
+    Dim lastColumn As Integer
+    Dim firstColumn As Integer
+    Dim lenght As Integer
+    lenght = sheetGOR.Range("GOR_2_sampleCode").Column - sheetGOR.Range("GOR_1_sampleCode").Column
+    lastList = sheetGOR.ListObjects.count + 1
+    lastColumn = (lastList) * lenght + GOR_FIRST_FORM_FIRST_COL - 1
+    firstColumn = lastColumn - lenght + 1
+    
+    sheetGOR.Activate
+    sheetGOR.Range(sheetGOR.columns(firstColumn - lenght), sheetGOR.columns(lastColumn - lenght)).EntireColumn.Select
+    sheetGOR.Application.Selection.Copy
+    sheetGOR.columns(firstColumn).Select
+    sheetGOR.Paste
+    
+    sheetGOR.Cells(GOR_PAGE_ROW, GOR_PAGE_FIRST_COL + firstColumn - GOR_FIRST_FORM_FIRST_COL).value = lastList
+    
+    sheetGOR.Cells.FormatConditions.Delete
+    Dim rowDeltaAP As Integer
+    rowDeltaAP = sheetGOR.Range("GOR_1_deltaAP").row
+    
+    Dim rowDeltaMatBalance As Integer
+    rowDeltaMatBalance = sheetGOR.Range("GOR_1_deltaMatBalance").row
+    
+    Dim rowCorrect As Integer
+    rowCorrect = sheetGOR.Range("GOR_1_Correct").row
+    
+    Dim strRangeFormat As String
+    strRangeFormat = "$" & rowCorrect & ":$" & rowCorrect
+    With sheetGOR.Range(strRangeFormat).FormatConditions.Add(Type:=xlCellValue, Operator:=xlEqual, Formula1:="=ÈÑÒÈÍÀ")
+        .Interior.Color = RGB(0, 218, 99) ' Çåë¸íûé öâåò
+    End With
+    With sheetGOR.Range(strRangeFormat).FormatConditions.Add(Type:=xlCellValue, Operator:=xlEqual, Formula1:="=ËÎÆÜ")
+        .Interior.Color = RGB(255, 71, 87) ' Êðàñíûé öâåò
+    End With
+    
+    strRangeFormat = "$" & rowDeltaAP & ":$" & rowDeltaAP
+    ' 1. Çåë¸íûé: çíà÷åíèå <= 0.01
+    With sheetGOR.Range(strRangeFormat).FormatConditions.Add(Type:=xlExpression, Formula1:="=È(Å×ÈÑËÎ(A$" & rowDeltaAP & "); A$" & rowDeltaAP & " <= 0,01)")
+        .Interior.Color = RGB(0, 218, 99) ' Çåë¸íûé öâåò
+    End With
+    ' 2. Æ¸ëòûé: > 0.01 è <= 0.02
+    With sheetGOR.Range(strRangeFormat).FormatConditions.Add(Type:=xlExpression, Formula1:="=È(Å×ÈÑËÎ(A$" & rowDeltaAP & "); A$" & rowDeltaAP & " > 0,01; A$" & rowDeltaAP & " <= 0,03)")
+        .Interior.Color = RGB(255, 235, 4) ' ßðêî-æ¸ëòûé
+    End With
+    ' 3. Êðàñíûé: > 0.02
+    With sheetGOR.Range(strRangeFormat).FormatConditions.Add(Type:=xlExpression, Formula1:="=È(Å×ÈÑËÎ(A$" & rowDeltaAP & "); A$" & rowDeltaAP & " > 0,03)")
+        .Interior.Color = RGB(255, 71, 87) ' Êðàñíûé
+    End With
+    
+    strRangeFormat = "$" & rowDeltaMatBalance & ":$" & rowDeltaMatBalance
+    ' 1. Çåë¸íûé: çíà÷åíèå <= 0.01
+    With sheetGOR.Range(strRangeFormat).FormatConditions.Add(Type:=xlExpression, Formula1:="=È(Å×ÈÑËÎ(A$" & rowDeltaMatBalance & "); A$" & rowDeltaMatBalance & " <= 0,01)")
+        .Interior.Color = RGB(0, 218, 99) ' Çåë¸íûé öâåò
+    End With
+    ' 2. Æ¸ëòûé: > 0.01 è <= 0.02
+    With sheetGOR.Range(strRangeFormat).FormatConditions.Add(Type:=xlExpression, Formula1:="=È(Å×ÈÑËÎ(A$" & rowDeltaMatBalance & "); A$" & rowDeltaMatBalance & " > 0,01; A$" & rowDeltaMatBalance & " <= 0,03)")
+        .Interior.Color = RGB(255, 235, 4) ' ßðêî-æ¸ëòûé
+    End With
+    ' 3. Êðàñíûé: > 0.02
+    With sheetGOR.Range(strRangeFormat).FormatConditions.Add(Type:=xlExpression, Formula1:="=È(Å×ÈÑËÎ(A$" & rowDeltaMatBalance & "); A$" & rowDeltaMatBalance & " > 0,03)")
+        .Interior.Color = RGB(255, 71, 87) ' Êðàñíûé
+    End With
+    
+    
+    Dim prev_name As String
+    Dim new_name As String
+    prev_name = "GOR_source_" & (lastList - 1)
+    new_name = "GOR_source_" & (lastList)
+    
+    For i = lastList To 1 Step -1
+        If sheetGOR.ListObjects(i).name Like prev_name & "##*" Then
+            sheetGOR.ListObjects(i).name = new_name
+            sheetGOR.ListObjects(i).DataBodyRange.ClearContents
+            Exit For
+        End If
+    Next i
+    
+    Dim TableGORResult As ListObject
+    Set TableGORResult = ActiveWorkbook.Worksheets("GOR_results").ListObjects("GOR_results")
+    Dim name_rng As Range
+    
+    prev_name = "GOR_" & (lastList - 1)
+    new_name = "GOR_" & (lastList)
+    
+    For Each name_rng In TableGORResult.HeaderRowRange
+            If name_rng.value = "dateTimeSync" Or name_rng.value = "gorEquipment" Then
+                GoTo cont
+            End If
+            Dim current As Range
+            oldName = prev_name & "_" & name_rng.value
+            Set current = sheetGOR.Cells(sheetGOR.Range(oldName).row, sheetGOR.Range(oldName).Column + lenght)
+            current.name = Replace(oldName, prev_name, new_name)
+            If Not current.HasFormula Then
+                current.value = ""
+            Else
+                If current.HasArray Then
+                    current.FormulaArray = Replace(current.FormulaArray, "_" & (lastList - 1), "_" & lastList)
+                Else
+                    current.Formula = Replace(current.Formula, "_" & (lastList - 1), "_" & lastList)
+                End If
+            End If
+cont:
+    Next name_rng
+    
+    Dim sh As CheckBox
+    For x = sheetGOR.CheckBoxes.count To 1 Step -1
+        Set sh = sheetGOR.CheckBoxes(x)
+
+        If sh.TopLeftCell.Column = sheetGOR.Range(new_name & "_Correct").Column Then
+            sh.name = "CheckBox_GOR_" & lastList
+            sh.linkedCell = sh.TopLeftCell.Address
+            sh.value = xlOn
+            Exit For
+        End If
+    Next x
+    
+    Dim editButton As Button
+    For x = sheetGOR.Buttons.count To 1 Step -1
+        Set editButton = sheetGOR.Buttons(x)
+        
+        If editButton.TopLeftCell.Column = (lastList - 1) * lenght + 5 Then
+            If editButton.name Like "buttonEditSamples_GOR_*" Then
+                editButton.name = "buttonEditSamples_GOR_" & lastList
+                editButton.OnAction = ""
+                Exit For
+            End If
+        End If
+    Next x
+    
+    Dim printArea() As String
+    printArea = Split(sheetGOR.PageSetup.printArea, ":")
+    sheetGOR.PageSetup.printArea = printArea(0) & ":" & Range(printArea(1)).Offset(0, lenght).Address
+    
+    sheetGOR.Range(new_name & "_sampleCode").Resize(1, 3).Locked = False
+    sheetGOR.Range(new_name & "_sampleCode").Interior.Color = xlNone
+
+End Sub
+
+
+Public Sub createSampleCodeGOR2(Optional numPage As Integer)
+    
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = ActiveWorkbook.Worksheets("GOR")
+    pageRow = sheetGOR.Range("GOR_1_page").row
+    Dim page As Integer
+    Dim pageRange As Range
+    
+    If Not sheetGOR.Shapes(Application.Caller) Is Nothing Then
+        Set pageRange = sheetGOR.Cells(pageRow, (sheetGOR.Shapes(Application.Caller).TopLeftCell.Column))
+        If NameExist2(pageRange) Then
+            If pageRange.name.name Like "GOR_#*_page" Then
+                page = pageRange.value
+            Else
+                Exit Sub
+            End If
+        End If
+    End If
+    If numPage <> 0 Then
+        page = numPage
+    ElseIf page = 0 Then
+        Exit Sub
+    End If
+    If sheetGOR.Range("GOR_" & page & "_sampleCode").value = "" Then
+        MsgBox "Íå çàïîëíåí øèôð èññëåäóåìîé ïðîáû."
+        Exit Sub
+    End If
+    Dim GOR_samples_table As ListObject
+    Set GOR_samples_table = sheetGOR.ListObjects("GOR_" & page)
+    
+    If sheetGOR.Range("GOR_" & page & "_sampleCode").value = "" Then
+        Exit Sub
+    End If
+    Dim countVial As Variant
+    Dim countBottle As Variant
+    Dim countTedlarBag As Variant
+    Dim countPics As Variant
+    
+    countVial = sheetGOR.Range("GOR_" & page & "_vial").value
+    countBottle = sheetGOR.Range("GOR_" & page & "_bottle").value
+    countTedlarBag = sheetGOR.Range("GOR_" & page & "_TedlarBag").value
+    countPics = sheetGOR.Range("GOR_" & page & "_pics").value
+    analyseNumber = sheetGOR.Range("GOR_" & page & "_analyseNumber").value
+    
+    Dim sampleCodeLPh As New Collection
+    Dim sampleCodeGPh As New Collection
+    Dim sampleCodePrefix As String
+    Dim sampleCodePostfix As String
+    
+    If analyseNumber = "1" Then
+        sampleCodePrefix = sheetGOR.Range("GOR_" & page & "_sampleCode").value & "-GOR-"
+    Else
+        sampleCodePrefix = sheetGOR.Range("GOR_" & page & "_sampleCode").value & "-GOR" & analyseNumber & "-"
+    End If
+    
+    If IsNumeric(countVial) And countVial <> 0 Then
+        
+        If sheetGOR.Range("GOR_" & page & "_m2").value - sheetGOR.Range("GOR_" & page & "_m0").value > 0.4 Then
+            sampleCodePostfix = "L"
+        Else
+            sampleCodePostfix = "Rinse"
+        End If
+        If countVial > 1 Then
+            For i = 1 To countVial
+                sampleCodeLPh.Add (sampleCodePrefix & sampleCodePostfix & i)
+            Next i
+        ElseIf countVial = 1 Then
+            sampleCodeLPh.Add (sampleCodePrefix & sampleCodePostfix)
+        End If
+    End If
+    
+    If IsNumeric(countPics) And countPics <> 0 Then
+        sampleCodePostfix = ""
+        If IsNumeric(sheetGOR.Range("GOR_" & page & "_VHeTot").value) Then
+            If sheetGOR.Range("GOR_" & page & "_VHeTot") > 0 Then
+                sampleCodePostfix = "-He"
+            End If
+        End If
+        If countPics > 1 Then
+            For i = 1 To countPics
+                sampleCodeGPh.Add (sampleCodePrefix & "G" & i & sampleCodePostfix)
+            Next i
+        ElseIf countPics = 1 Then
+            sampleCodeGPh.Add (sampleCodePrefix & "G" & sampleCodePostfix)
+        End If
+    End If
+    
+    If IsNumeric(countTedlarBag) And countTedlarBag <> 0 Then
+        sampleCodePostfix = ""
+        If IsNumeric(sheetGOR.Range("GOR_" & page & "_VHeTot").value) Then
+            If sheetGOR.Range("GOR_" & page & "_VHeTot") > 0 Then
+                sampleCodePostfix = "-He"
+            End If
+        End If
+        If countTedlarBag > 1 Then
+            For i = 1 To countTedlarBag
+                sampleCodeGPh.Add (sampleCodePrefix & "TB" & i & sampleCodePostfix)
+            Next i
+        ElseIf countTedlarBag = 1 Then
+            sampleCodeGPh.Add (sampleCodePrefix & "TB" & sampleCodePostfix)
+        End If
+    End If
+    
+    If IsNumeric(countBottle) And countBottle <> 0 Then
+        
+        sampleCodePostfix = "LB"
+            
+        If countBottle > 1 Then
+            For i = 1 To countBottle
+                sampleCodeLPh.Add (sampleCodePrefix & sampleCodePostfix & i)
+            Next i
+        ElseIf countBottle = 1 Then
+            sampleCodeLPh.Add (sampleCodePrefix & sampleCodePostfix)
+        End If
+    End If
+    
+    ' ïîêàç ôîðìû
+    Dim frm As New frmCheckCodes
+    frm.InitWithCollections sampleCodeLPh, sampleCodeGPh, "GOR", sheetGOR.Range("GOR_" & page & "_sampleCode"), page
+    frm.show
+
+    Dim arrSamples() As String
+    Dim countSamples As Integer
+    countSamples = sampleCodeLPh.count + sampleCodeGPh.count
+    ReDim arrSamples(1 To countSamples, 1 To GOR_samples_table.ListColumns.count)
+    
+    rowDiff = GOR_samples_table.ListRows.count - sampleCodeLPh.count - sampleCodeGPh.count
+    If rowDiff > 0 Then
+        For i = rowDiff To 1 Step -1
+            GOR_samples_table.ListRows(GOR_samples_table.ListRows.count).Delete
+        Next i
+    ElseIf rowDiff < 0 Then
+        For i = -1 * rowDiff To 1 Step -1
+            GOR_samples_table.ListRows.Add
+        Next i
+    End If
+    
+    If frm.result Then
+        For i = 1 To sampleCodeLPh.count
+            arrSamples(i, GOR_samples_table.ListColumns("sampleCode").index) = sampleCodeLPh(i)
+            arrSamples(i, GOR_samples_table.ListColumns("TypePh").index) = "LPh"
+            If sheetGOR.Range("GOR_" & page & "_resultIdGOR").value > 0 Then
+                arrSamples(i, GOR_samples_table.ListColumns("resultIdGOR").index) = sheetGOR.Range("GOR_" & page & "_resultIdGOR").value
+            End If
+            arrSamples(i, GOR_samples_table.ListColumns("rowIdGOR").index) = GOR_samples_table.ListColumns("rowIdGOR").DataBodyRange(i, 1)
+            'Debug.Print sampleCodeLPh(i)
+        Next i
+        
+        For i = 1 To sampleCodeGPh.count
+            arrSamples(i + sampleCodeLPh.count, GOR_samples_table.ListColumns("sampleCode").index) = sampleCodeGPh(i)
+            arrSamples(i + sampleCodeLPh.count, GOR_samples_table.ListColumns("TypePh").index) = "GPh"
+            If sheetGOR.Range("GOR_" & page & "_resultIdGOR").value > 0 Then
+                arrSamples(i + sampleCodeLPh.count, GOR_samples_table.ListColumns("resultIdGOR").index) = sheetGOR.Range("GOR_" & page & "_resultIdGOR").value
+            End If
+            arrSamples(i + sampleCodeLPh.count, GOR_samples_table.ListColumns("rowIdGOR").index) = GOR_samples_table.ListColumns("rowIdGOR").DataBodyRange(i + sampleCodeLPh.count, 1)
+            'Debug.Print sampleCodeGPh(i)
+        Next i
+        
+        GOR_samples_table.DataBodyRange = arrSamples
+        
+        Dim printArea() As String
+        printArea = Split(sheetGOR.PageSetup.printArea, ":")
+        Dim lastRow As Long
+        lastRow = Cells.Find("*", SearchOrder:=xlByRows, SearchDirection:=xlPrevious).row
+        sheetGOR.PageSetup.printArea = printArea(0) & ":" & sheetGOR.Cells(lastRow, sheetGOR.Range(printArea(1)).Column).Address
+    Else
+        MsgBox "????", vbInformation
+    End If
+    
+End Sub
+
+
+Public Function CreateSampleCodeGOR3(Optional ByVal formIndex As Long = 0) As Boolean
+
+    CreateSampleCodeGOR3 = False
+
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = ActiveWorkbook.Worksheets("GOR")
+
+    If formIndex <= 0 Then Exit Function
+
+    If Not NamedRangeExists(ActiveWorkbook, "GOR_" & formIndex & "_sampleCode") Then
+        MsgBox "Ôîðìà GOR_" & formIndex & " íå íàéäåíà."
+        Exit Function
+    End If
+
+    If sheetGOR.Range("GOR_" & formIndex & "_sampleCode").value = "" Then
+        MsgBox "Íå çàïîëíåí øèôð èññëåäóåìîé ïðîáû."
+        Exit Function
+    End If
+
+    If sheetGOR.Range("GOR_" & formIndex & "_sampleCode").value = "" Then
+        MsgBox "Íå çàïîëíåí øèôð èññëåäóåìîé ïðîáû."
+        Exit Function
+    End If
+
+    Dim GORSamplesTable As ListObject
+    Set GORSamplesTable = sheetGOR.ListObjects("GOR_source_" & formIndex)
+
+    Dim countVial As Variant
+    Dim countBottle As Variant
+    Dim countTedlarBag As Variant
+    Dim countPics As Variant
+    Dim analyseNumber As Variant
+
+    countVial = sheetGOR.Range("GOR_" & formIndex & "_vial").value
+    countBottle = sheetGOR.Range("GOR_" & formIndex & "_bottle").value
+    countTedlarBag = sheetGOR.Range("GOR_" & formIndex & "_TedlarBag").value
+    countPics = sheetGOR.Range("GOR_" & formIndex & "_pics").value
+    analyseNumber = sheetGOR.Range("GOR_" & formIndex & "_analyseNumber").value
+    
+    If Not countVial & countBottle & countTedlarBag & countPics Like "*#*" Then
+        MsgBox "Íå óêàçàíî íè îäíîé ïîëó÷åííîé ïðîáû."
+        Exit Function
+    End If
+    
+    Dim sampleCodeLPh As New Collection
+    Dim sampleCodeGPh As New Collection
+
+    Dim sampleCodePrefix As String
+    Dim sampleCodePostfix As String
+
+    If analyseNumber = "1" Then
+        sampleCodePrefix = sheetGOR.Range("GOR_" & formIndex & "_sampleCode").value & "-GOR-"
+    Else
+        sampleCodePrefix = sheetGOR.Range("GOR_" & formIndex & "_sampleCode").value & "-GOR" & analyseNumber & "-"
+    End If
+
+    Dim i As Long
+
+    If IsNumeric(countVial) And countVial <> 0 Then
+
+        If sheetGOR.Range("GOR_" & formIndex & "_m2").value - sheetGOR.Range("GOR_" & formIndex & "_m0").value > 0.4 Then
+            sampleCodePostfix = "L"
+        Else
+            sampleCodePostfix = "Rinse"
+        End If
+
+        If countVial > 1 Then
+            For i = 1 To countVial
+                sampleCodeLPh.Add sampleCodePrefix & sampleCodePostfix & i
+            Next i
+        ElseIf countVial = 1 Then
+            sampleCodeLPh.Add sampleCodePrefix & sampleCodePostfix
+        End If
+
+    End If
+
+    If IsNumeric(countPics) And countPics <> 0 Then
+
+        sampleCodePostfix = ""
+
+        If IsNumeric(sheetGOR.Range("GOR_" & formIndex & "_VHeTot").value) Then
+            If sheetGOR.Range("GOR_" & formIndex & "_VHeTot").value > 0 Then
+                sampleCodePostfix = "-He"
+            End If
+        End If
+
+        If countPics > 1 Then
+            For i = 1 To countPics
+                sampleCodeGPh.Add sampleCodePrefix & "G" & i & sampleCodePostfix
+            Next i
+        ElseIf countPics = 1 Then
+            sampleCodeGPh.Add sampleCodePrefix & "G" & sampleCodePostfix
+        End If
+
+    End If
+
+    If IsNumeric(countTedlarBag) And countTedlarBag <> 0 Then
+
+        sampleCodePostfix = ""
+
+        If IsNumeric(sheetGOR.Range("GOR_" & formIndex & "_VHeTot").value) Then
+            If sheetGOR.Range("GOR_" & formIndex & "_VHeTot").value > 0 Then
+                sampleCodePostfix = "-He"
+            End If
+        End If
+
+        If countTedlarBag > 1 Then
+            For i = 1 To countTedlarBag
+                sampleCodeGPh.Add sampleCodePrefix & "TB" & i & sampleCodePostfix
+            Next i
+        ElseIf countTedlarBag = 1 Then
+            sampleCodeGPh.Add sampleCodePrefix & "TB" & sampleCodePostfix
+        End If
+
+    End If
+
+    If IsNumeric(countBottle) And countBottle <> 0 Then
+
+        sampleCodePostfix = "LB"
+
+        If countBottle > 1 Then
+            For i = 1 To countBottle
+                sampleCodeLPh.Add sampleCodePrefix & sampleCodePostfix & i
+            Next i
+        ElseIf countBottle = 1 Then
+            sampleCodeLPh.Add sampleCodePrefix & sampleCodePostfix
+        End If
+
+    End If
+
+    Dim countSamples As Long
+    countSamples = sampleCodeLPh.count + sampleCodeGPh.count
+
+    If countSamples = 0 Then
+        MsgBox "Ñòðàíèöà " & formIndex & ": íå ñôîðìèðîâàíî íè îäíîãî øèôðà ïîëó÷åííîé ïðîáû.", vbExclamation
+        Exit Function
+    End If
+
+    ' Ïîêàç ôîðìû ïðîâåðêè/ðåäàêòèðîâàíèÿ øèôðîâ.
+    Dim frm As New frmCheckCodes
+    frm.InitWithCollections sampleCodeLPh, sampleCodeGPh, "GOR", sheetGOR.Range("GOR_" & formIndex & "_sampleCode"), formIndex
+    frm.show
+
+    If Not frm.result Then
+        MsgBox "Ââîä øèôðîâ äëÿ ñòðàíèöû " & formIndex & " îòìåíåí.", vbInformation
+        Exit Function
+    End If
+
+    If GORSamplesTable.DataBodyRange Is Nothing Then
+        GORSamplesTable.ListRows.Add
+    End If
+
+    ' Ñîõðàíÿåì ñòàðûå rowIdGOR ïî íîìåðàì ñòðîê.
+    ' Ýòî âàæíî, åñëè ÷àñòü ïðîá óäàëèëè: ñòàðàÿ ñòðîêà ñ rowIdGOR äîëæíà óéòè â Python ïóñòîé,
+    ' ÷òîáû òàì ìîæíî áûëî óäàëèòü child-çàïèñü èç ÁÄ.
+    Dim oldRowIds As Object
+    Set oldRowIds = CreateObject("Scripting.Dictionary")
+    oldRowIds.CompareMode = vbTextCompare
+
+    Dim oldRowsCount As Long
+    oldRowsCount = GORSamplesTable.ListRows.count
+
+    If ListColumnExists(GORSamplesTable, COL_GOR_ROW_ID_DB) Then
+        For i = 1 To oldRowsCount
+            oldRowIds(CStr(i)) = NormalizeKeyValue( _
+                GORSamplesTable.DataBodyRange.Cells( _
+                    i, _
+                    GORSamplesTable.ListColumns(COL_GOR_ROW_ID_DB).index _
+                ).value _
+            )
+        Next i
+    End If
+
+    Dim targetRowsCount As Long
+    targetRowsCount = countSamples
+
+    If oldRowsCount > targetRowsCount Then
+        targetRowsCount = oldRowsCount
+    End If
+
+    Dim rowDiff As Long
+    rowDiff = GORSamplesTable.ListRows.count - targetRowsCount
+
+    If rowDiff > 0 Then
+        For i = rowDiff To 1 Step -1
+            GORSamplesTable.ListRows(GORSamplesTable.ListRows.count).Delete
+        Next i
+    ElseIf rowDiff < 0 Then
+        For i = -1 * rowDiff To 1 Step -1
+            GORSamplesTable.ListRows.Add
+        Next i
+    End If
+
+    Dim arrSamples() As Variant
+    ReDim arrSamples(1 To targetRowsCount, 1 To GORSamplesTable.ListColumns.count)
+
+    Dim parentResultId As String
+    parentResultId = NormalizeKeyValue(sheetGOR.Range("GOR_" & formIndex & "_resultIdGOR").value)
+
+    Dim rowIndex As Long
+    rowIndex = 1
+
+    For i = 1 To sampleCodeLPh.count
+
+        arrSamples(rowIndex, GORSamplesTable.ListColumns(COL_GOR_SAMPLE_CODE_DB).index) = sampleCodeLPh(i)
+        arrSamples(rowIndex, GORSamplesTable.ListColumns(COL_GOR_TYPE_PH_DB).index) = "LPh"
+
+        If ListColumnExists(GORSamplesTable, COL_GOR_RESULT_ID_DB) Then
+            If Len(parentResultId) > 0 And parentResultId <> "0" Then
+                arrSamples(rowIndex, GORSamplesTable.ListColumns(COL_GOR_RESULT_ID_DB).index) = parentResultId
+            End If
+        End If
+
+        If ListColumnExists(GORSamplesTable, COL_GOR_ROW_ID_DB) Then
+            If oldRowIds.Exists(CStr(rowIndex)) Then
+                arrSamples(rowIndex, GORSamplesTable.ListColumns(COL_GOR_ROW_ID_DB).index) = oldRowIds(CStr(rowIndex))
+            End If
+        End If
+
+        rowIndex = rowIndex + 1
+
+    Next i
+
+    For i = 1 To sampleCodeGPh.count
+
+        arrSamples(rowIndex, GORSamplesTable.ListColumns(COL_GOR_SAMPLE_CODE_DB).index) = sampleCodeGPh(i)
+        arrSamples(rowIndex, GORSamplesTable.ListColumns(COL_GOR_TYPE_PH_DB).index) = "GPh"
+
+        If ListColumnExists(GORSamplesTable, COL_GOR_RESULT_ID_DB) Then
+            If Len(parentResultId) > 0 And parentResultId <> "0" Then
+                arrSamples(rowIndex, GORSamplesTable.ListColumns(COL_GOR_RESULT_ID_DB).index) = parentResultId
+            End If
+        End If
+
+        If ListColumnExists(GORSamplesTable, COL_GOR_ROW_ID_DB) Then
+            If oldRowIds.Exists(CStr(rowIndex)) Then
+                arrSamples(rowIndex, GORSamplesTable.ListColumns(COL_GOR_ROW_ID_DB).index) = oldRowIds(CStr(rowIndex))
+            End If
+        End If
+
+        rowIndex = rowIndex + 1
+
+    Next i
+
+    ' Îñòàëüíûå ñòàðûå ñòðîêè îñòàâëÿåì ïóñòûìè, íî ñ rowIdGOR/resultIdGOR.
+    ' Òàê Python ïîéìåò, ÷òî ýòè child-ñòðîêè íàäî óäàëèòü.
+    For i = rowIndex To targetRowsCount
+
+        If ListColumnExists(GORSamplesTable, COL_GOR_ROW_ID_DB) Then
+            If oldRowIds.Exists(CStr(i)) Then
+                arrSamples(i, GORSamplesTable.ListColumns(COL_GOR_ROW_ID_DB).index) = oldRowIds(CStr(i))
+            End If
+        End If
+
+        If ListColumnExists(GORSamplesTable, COL_GOR_RESULT_ID_DB) Then
+            If Len(parentResultId) > 0 And parentResultId <> "0" Then
+                arrSamples(i, GORSamplesTable.ListColumns(COL_GOR_RESULT_ID_DB).index) = parentResultId
+            End If
+        End If
+
+    Next i
+
+    GORSamplesTable.DataBodyRange.NumberFormat = "@"
+    GORSamplesTable.DataBodyRange.value = arrSamples
+
+    Dim printArea() As String
+    printArea = Split(sheetGOR.PageSetup.printArea, ":")
+
+    Dim lastRow As Long
+    lastRow = sheetGOR.Cells.Find("*", SearchOrder:=xlByRows, SearchDirection:=xlPrevious).row
+
+    sheetGOR.PageSetup.printArea = printArea(0) & ":" & _
+                                   sheetGOR.Cells(lastRow, sheetGOR.Range(printArea(1)).Column).Address
+
+    CreateSampleCodeGOR3 = True
+
+End Function
+
+Public Sub Load_GOR_results_to_forms( _
+    Optional ByVal mode As String = "by_key", _
+    Optional ByVal fields As Variant _
 )
-```
 
-И дочерняя таблица:
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
 
-```python
-CVD_SOURCE_DATA = TableSchema(
-    logical_name="CVD_SOURCE_DATA",
-    db_table="CVD_sourceData",
-    sheet_name="CVD_sourceData",
-    excel_table_name="CVD_sourceData",
-    parent="CVD_RESULTS",
-    fk_column="resultIdCVD",
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = wb.Worksheets("GOR")
 
-    # Важно: step не включаю сюда специально.
-    # Если step будет заранее заполнен во всех строках, иначе пустые строки будут считаться "данными".
-    delete_if_empty_columns=(
-        "cellFluidMass",
-        "d20",
-        "date",
-        "dGas",
-        "evacuatedFluidMass",
-        "GF",
-        "gorEquipment",
-        "initPatm",
-        "m0",
-        "m0Trap",
-        "m1",
-        "m1Trap",
-        "m2",
-        "mgas",
-        "mLiq",
-        "operator",
-        "Patm",
-        "picDen",
-        "Ppic",
-        "sampleCodeGPh",
-        "sampleCodeLPh",
-        "stepPcell",
-        "stepTcell",
-        "T",
-        "transferPcell",
-        "Upic",
-        "V1",
-        "V2",
-        "Vcell",
-        "Vcellend",
-        "VCellLiq",
-        "Vgas",
-        "VgasSt",
-        "VGCyl",
-        "VGTot",
-        "VHeCyl",
-        "VHeTot",
-        "VLiq",
-        "VLiqRelative",
-        "Vtransfer",
-    ),
-    columns=[
-        _col("rowIdCVD", "rowIdCVD", typ="INTEGER", value_type="integer", pk=True),
+    Dim resultTable As ListObject
+    Set resultTable = wb.Worksheets("GOR_results").ListObjects("GOR_results")
 
-        _col("resultIdCVD", "resultIdCVD", typ="INTEGER", value_type="integer", required=True),
+    Dim sourceTable As ListObject
+    Set sourceTable = wb.Worksheets("GOR_sourceData").ListObjects("GOR_sourceData")
 
-        _col("step", "step", typ="TEXT", value_type="text"),
+    Dim fieldFilter As Object
+    Set fieldFilter = BuildFieldFilter(fields)
 
-        _col("cellFluidMass", "cellFluidMass", typ="REAL", value_type="real"),
-        _col("d20", "d20", typ="REAL", value_type="real"),
-        _col("date", "date", typ="TEXT", value_type="date"),
-        _col("dGas", "dGas", typ="REAL", value_type="real"),
-        _col("evacuatedFluidMass", "evacuatedFluidMass", typ="REAL", value_type="real"),
+    mode = LCase$(Trim$(mode))
 
-        _col("GF", "GF", typ="REAL", value_type="real"),
-        _col("gorEquipment", "gorEquipment", typ="TEXT", value_type="text"),
+    If mode <> "by_key" And mode <> "sequential" Then
+        Err.Raise vbObjectError + 5101, , "mode äîëæåí áûòü 'by_key' èëè 'sequential'"
+    End If
 
-        _col("initPatm", "initPatm", typ="REAL", value_type="real"),
+    If resultTable.DataBodyRange Is Nothing Then Exit Sub
 
-        _col("m0", "m0", typ="REAL", value_type="real"),
-        _col("m0Trap", "m0Trap", typ="REAL", value_type="real"),
-        _col("m1", "m1", typ="REAL", value_type="real"),
-        _col("m1Trap", "m1Trap", typ="REAL", value_type="real"),
-        _col("m2", "m2", typ="REAL", value_type="real"),
+    Dim resultRowIndex As Long
+    Dim formIndex As Long
+    Dim notFoundCount As Long
 
-        _col("mgas", "mgas", typ="REAL", value_type="real"),
-        _col("mLiq", "mLiq", typ="REAL", value_type="real"),
+    For resultRowIndex = 1 To resultTable.ListRows.count
 
-        _col("operator", "operator", typ="TEXT", value_type="text"),
+        If mode = "sequential" Then
+            formIndex = resultRowIndex
+            EnsureGORFormExists wb, formIndex
+        Else
+            formIndex = FindFormIndexForResultRow( _
+                wb, _
+                sheetGOR, _
+                resultTable, _
+                resultRowIndex, _
+                "GOR", _
+                Array("sampleCode", "analyseNumber") _
+            )
+        End If
 
-        _col("Patm", "Patm", typ="REAL", value_type="real"),
-        _col("picDen", "picDen", typ="REAL", value_type="real"),
-        _col("Ppic", "Ppic", typ="TEXT", value_type="text"),
+        If formIndex = 0 Or Not NamedRangeExists(wb, "GOR_" & formIndex & "_sampleCode") Then
+            notFoundCount = notFoundCount + 1
+            GoTo NextResultRow
+        End If
 
-        _col("sampleCodeGPh", "sampleCodeGPh", typ="TEXT", value_type="text"),
-        _col("sampleCodeLPh", "sampleCodeLPh", typ="TEXT", value_type="text"),
+        FillOneGORFormFromResultRow _
+            wb, _
+            sheetGOR, _
+            resultTable, _
+            sourceTable, _
+            resultRowIndex, _
+            formIndex, _
+            fieldFilter
 
-        _col("stepPcell", "stepPcell", typ="REAL", value_type="real"),
-        _col("stepTcell", "stepTcell", typ="REAL", value_type="real"),
+NextResultRow:
+    Next resultRowIndex
 
-        _col("T", "T", typ="REAL", value_type="real"),
-        _col("transferPcell", "transferPcell", typ="REAL", value_type="real"),
+    If notFoundCount > 0 Then
+        MsgBox "Äàííûå GOR ïåðåíåñåíû ÷àñòè÷íî. Íå íàéäåíî ôîðì: " & notFoundCount, vbExclamation
+    End If
 
-        _col("Upic", "Upic", typ="TEXT", value_type="text"),
+End Sub
 
-        _col("V1", "V1", typ="REAL", value_type="real"),
-        _col("V2", "V2", typ="REAL", value_type="real"),
-        _col("Vcell", "Vcell", typ="REAL", value_type="real"),
-        _col("Vcellend", "Vcellend", typ="REAL", value_type="real"),
-        _col("VCellLiq", "VCellLiq", typ="REAL", value_type="real"),
 
-        _col("Vgas", "Vgas", typ="REAL", value_type="real"),
-        _col("VgasSt", "VgasSt", typ="REAL", value_type="real"),
-
-        _col("VGCyl", "VGCyl", typ="REAL", value_type="real"),
-        _col("VGTot", "VGTot", typ="REAL", value_type="real"),
-
-        _col("VHeCyl", "VHeCyl", typ="REAL", value_type="real"),
-        _col("VHeTot", "VHeTot", typ="REAL", value_type="real"),
-
-        _col("VLiq", "VLiq", typ="REAL", value_type="real"),
-        _col("VLiqRelative", "VLiqRelative", typ="REAL", value_type="real"),
-
-        _col("Vtransfer", "Vtransfer", typ="REAL", value_type="real"),
-    ],
+Private Sub EnsureGORFormExists( _
+    ByVal wb As Workbook, _
+    ByVal formIndex As Long _
 )
-```
+    Do While Not NamedRangeExists(wb, "GOR_" & formIndex & "_sampleCode")
+        Call InsertListGOR2
+    Loop
+End Sub
 
-Потом в словарь `STUDIES` добавь строку:
 
-```python
-"CVD": StudySchema("CVD", CVD_RESULTS, CVD_SOURCE_DATA),
-```
+Private Sub FillOneGORFormFromResultRow( _
+    ByVal wb As Workbook, _
+    ByVal sheetGOR As Worksheet, _
+    ByVal resultTable As ListObject, _
+    ByVal sourceTable As ListObject, _
+    ByVal resultRowIndex As Long, _
+    ByVal formIndex As Long, _
+    ByVal fieldFilter As Object _
+)
 
-Например так:
+    Dim resultId As Variant
+    resultId = GetTableValue(resultTable, resultRowIndex, COL_GOR_RESULT_ID_DB)
 
-```python
-STUDIES: dict[str, StudySchema] = {
-    "OP": StudySchema("OP", OP_RESULTS, None),
-    "AP": StudySchema("AP", AP_RESULTS, AP_SOURCE_DATA),
-    "GC": StudySchema("GC", GC_RESULTS, GC_SOURCE_DATA),
-    "SSF": StudySchema("SSF", SSF_RESULTS, SSF_SOURCE_DATA),
-    "GOR": StudySchema("GOR", GOR_RESULTS, GOR_SOURCE_DATA),
-    "BP": StudySchema("BP", BP_RESULTS, BP_SOURCE_DATA),
-    "REC": StudySchema("REC", REC_RESULTS, REC_SOURCE_DATA),
-    "EMV": StudySchema("EMV", EMV_RESULTS, EMV_SOURCE_DATA),
-    "JOIN": StudySchema("JOIN", JOIN_RESULTS, JOIN_SOURCE_DATA),
-    "CCE": StudySchema("CCE", CCE_RESULTS, CCE_SOURCE_DATA),
-    "CVD": StudySchema("CVD", CVD_RESULTS, CVD_SOURCE_DATA),
-}
-```
+    Call CopyTableRowToNamedRanges( _
+        wb, _
+        sheetGOR, _
+        resultTable, _
+        resultRowIndex, _
+        "GOR", _
+        formIndex, _
+        fieldFilter _
+    )
 
-`delete_if_empty_columns` здесь важен: текущий `sync.py` использует его, чтобы понять, сохранять дочернюю строку или считать её пустой/удалённой. Если его не указать, `step` тоже будет считаться данными, и пустые строки с заполненным `step` могут улетать в БД. 
+    If Len(NormalizeKeyValue(resultId)) > 0 Then
+        FillGORSourceTableFromSourceData sheetGOR, sourceTable, formIndex, resultId, fieldFilter
+    End If
 
-Ещё момент: я поставил для `TaskStatus` дату завершения из `dateEnd + timeEnd`. Если у тебя в CVD чаще заполнены стартовые поля, замени:
+End Sub
 
-```python
-status_datetime_fields=("dateEnd", "timeEnd"),
-```
 
-на:
+Private Sub FillGORSourceTableFromSourceData( _
+    ByVal sheetGOR As Worksheet, _
+    ByVal sourceTable As ListObject, _
+    ByVal formIndex As Long, _
+    ByVal resultId As Variant, _
+    ByVal fieldFilter As Object _
+)
 
-```python
-status_datetime_fields=("dateStart", "timeStart"),
-```
+    Dim formSourceTable As ListObject
+    Set formSourceTable = sheetGOR.ListObjects("GOR_source_" & formIndex)
+
+    If formSourceTable.DataBodyRange Is Nothing Then
+        Exit Sub
+    End If
+
+    Call ClearMappedColumnsInTable( _
+        formSourceTable, _
+        GORSourceMappings(), _
+        fieldFilter _
+    )
+
+    Call CopyMatchingTableRowsToTableRows( _
+        sourceTable, _
+        formSourceTable, _
+        COL_GOR_RESULT_ID_DB, _
+        resultId, _
+        GORSourceMappings(), _
+        fieldFilter _
+    )
+
+End Sub
+
+
+Private Function GORSourceMappings() As Variant
+
+    GORSourceMappings = Array( _
+        Array(COL_GOR_ROW_ID_DB, COL_GOR_ROW_ID_DB), _
+        Array(COL_GOR_RESULT_ID_DB, COL_GOR_RESULT_ID_DB), _
+        Array(COL_GOR_SAMPLE_CODE_DB, COL_GOR_SAMPLE_CODE_DB), _
+        Array(COL_GOR_TYPE_PH_DB, COL_GOR_TYPE_PH_DB) _
+    )
+
+End Function
+
+Private Function CheckGORTask( _
+    ByVal tasks As ListObject, _
+    ByVal taskId As Long, _
+    ByVal sampleCode As String, _
+    ByVal pageNumber As Long _
+) As Boolean
+
+    CheckGORTask = False
+
+    Dim taskCheck As Range
+    Set taskCheck = tasks.ListColumns("Íîìåð çàäàíèÿ").DataBodyRange.Find( _
+        what:=taskId, _
+        lookat:=xlWhole, _
+        SearchOrder:=xlByColumns _
+    )
+
+    If taskCheck Is Nothing Then
+        MsgBox "Óêàçàí íåèçâåñòíûé íîìåð àíàëèçà " & taskId & _
+               " íà ñòðàíèöå " & pageNumber & _
+               ". Äàííîå èññëåäîâàíèå èãíîðèðóåòñÿ, ïîïðîáóéòå îáíîâèòü äàííûå ïðîåêòà èëè èñïðàâüòå çíà÷åíèå."
+        Exit Function
+    End If
+
+    Dim taskRowIndex As Long
+    taskRowIndex = taskCheck.row - tasks.DataBodyRange.row + 1
+
+    If CStr(tasks.ListColumns("Êîä ïðîåêòà").DataBodyRange.Cells(taskRowIndex, 1).value) <> sampleCode Then
+        MsgBox "Óêàçàí íåâåðíûé íîìåð àíàëèçà " & taskId & _
+               " íà ñòðàíèöå " & pageNumber & _
+               ". Øèôð ïðîáû â çàäàíèè îòëè÷àåòñÿ îò øèôðà ïðîáû â èññëåäîâàíèè. " & _
+               "Äàííîå èññëåäîâàíèå èãíîðèðóåòñÿ, èñïðàâüòå íîìåð çàäàíèÿ èëè âûáåðèòå âåðíóþ ôîðìó äëÿ âíåñåíèÿ."
+        Exit Function
+    End If
+
+    CheckGORTask = True
+
+End Function
+
+Public Function Save_GOR(Optional ByVal taskStatus As String = "") As macroResult
+    
+    Save_GOR = MACRO_FAILED
+    Dim t0 As Double
+    Dim t As Double
+    
+    t0 = Timer
+    t = t0
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = wb.Worksheets("GOR")
+
+    Dim sheetGORResult As Worksheet
+    Set sheetGORResult = wb.Worksheets("GOR_results")
+
+    Dim sheetGORSourceData As Worksheet
+    Set sheetGORSourceData = wb.Worksheets("GOR_sourceData")
+
+    Dim tasks As ListObject
+    Set tasks = wb.Worksheets("Task").ListObjects(1)
+
+    Dim GORTable As ListObject
+    Set GORTable = sheetGORResult.ListObjects("GOR_results")
+
+    Dim GORSourceDataTable As ListObject
+    Set GORSourceDataTable = sheetGORSourceData.ListObjects("GOR_sourceData")
+
+    Dim parentRows As Collection
+    Set parentRows = New Collection
+
+    Dim childRows As Collection
+    Set childRows = New Collection
+
+    Dim validForms As Collection
+    Set validForms = New Collection
+
+    Dim oldSourceRowIds As Object
+    Set oldSourceRowIds = BuildOldChildRowIdMap( _
+        GORSourceDataTable, _
+        COL_GOR_ROW_ID_DB, _
+        COL_GOR_RESULT_ID_DB _
+    )
+    
+    Dim formState As GORFormState
+    Dim i As Long
+    Dim x As Long
+
+    i = 1
+
+    Do While NamedRangeExists(wb, "GOR_" & i & "_sampleCode")
+        
+        formState = Get_GOR_FormState(i)
+
+        Select Case formState
+    
+            Case GOR_FORM_EMPTY
+                GoTo NextFormFirstPass
+    
+            Case GOR_FORM_RESERVED
+                GoTo NextFormFirstPass
+    
+            Case GOR_FORM_FILLED
+                ' èä¸ì äàëüøå
+                
+        End Select
+        
+        If sheetGOR.Range("GOR_" & i & "_TaskId").Interior.ColorIndex = 3 Then
+            GoTo NextFormFirstPass
+        End If
+        
+        If sheetGOR.Range("GOR_" & i & "_analyseNumber").value = "" Then
+            Call checkNumberAnalys2(sheetGOR.Range("GOR_" & i & "_sampleCode").value, "GOR")
+        End If
+        
+        If Not Validate_GOR_Form(i) Then
+            Exit Function
+        End If
+        
+        Dim curTask As Variant
+        curTask = sheetGOR.Range("GOR_" & i & "_TaskId").value
+
+        If Len(Trim$(CStr(curTask))) > 0 And CLng(val(curTask)) <> 0 Then
+            If Not CheckGORTask(tasks, CLng(val(curTask)), CStr(sheetGOR.Range("GOR_" & i & "_sampleCode").value), i) Then
+                GoTo NextFormFirstPass
+            End If
+        End If
+
+        If Not GOR_SourceTableHasValidSampleCodes(i) Then
+
+            Application.ScreenUpdating = True
+            DoEvents
+            Application.ScreenUpdating = False
+
+            If Not CreateSampleCodeGOR3(i) Then
+                GoTo NextFormFirstPass
+            End If
+        End If
+        
+        If Not GOR_SourceTableHasValidSampleCodes(i) Then
+            MsgBox "Ñòðàíèöà " & i & ": â òàáëèöå GOR_source_" & i & _
+                   " íåò íè îäíîãî øèôðà ïîëó÷åííîé ïðîáû ñ óêàçàííûì TypePh.", vbExclamation
+            Exit Function
+        End If
+        
+        validForms.Add i
+
+NextFormFirstPass:
+        i = i + 1
+    Loop
+
+    Debug.Print "GOR v3 after sample forms", _
+                "step:", Format$(Timer - t, "0.000"), _
+                "total:", Format$(Timer - t0, "0.000")
+    t = Timer
+
+    ' 2. Òåïåðü ñîáèðàåì äàííûå èç ôîðì â GOR_results è GOR_sourceData.
+    Dim pageValue As Variant
+
+    For Each pageValue In validForms
+
+        i = CLng(pageValue)
+
+        Dim resultIdValue As Variant
+        Dim parentKey As String
+
+        resultIdValue = sheetGOR.Range("GOR_" & i & "_resultIdGOR").value
+
+        If Len(NormalizeKeyValue(resultIdValue)) = 0 Or NormalizeKeyValue(resultIdValue) = "0" Then
+            parentKey = "temp_" & i
+        Else
+            parentKey = NormalizeKeyValue(resultIdValue)
+        End If
+
+        Dim parentRow() As Variant
+        ReDim parentRow(1 To GORTable.ListColumns.count)
+
+        Dim headerCell As Range
+        Dim headerName As String
+        Dim parentColIndex As Long
+        Dim formRangeName As String
+
+        For Each headerCell In GORTable.HeaderRowRange.Cells
+
+            headerName = CStr(headerCell.value)
+            parentColIndex = GORTable.ListColumns(headerName).index
+            formRangeName = "GOR_" & i & "_" & headerName
+
+            If headerName = "dateTimeSync" Then
+                parentRow(parentColIndex) = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+
+            ElseIf headerName = COL_GOR_RESULT_ID_DB Then
+                parentRow(parentColIndex) = parentKey
+
+            ElseIf NamedRangeExists(wb, formRangeName) Then
+                parentRow(parentColIndex) = FormatValueForSyncText( _
+                    headerName, _
+                    sheetGOR.Range(formRangeName).value _
+                )
+
+            Else
+                parentRow(parentColIndex) = vbNullString
+
+            End If
+
+        Next headerCell
+
+        parentRows.Add parentRow
+
+        Dim srcTable As ListObject
+        Set srcTable = sheetGOR.ListObjects("GOR_source_" & i)
+
+        If Not srcTable.DataBodyRange Is Nothing Then
+
+            For x = 1 To srcTable.ListRows.count
+
+                Dim hasSourceData As Boolean
+                Dim oldRowIdGOR As String
+
+                hasSourceData = SourceRowHasData( _
+                    srcTable, _
+                    x, _
+                    Array(COL_GOR_SAMPLE_CODE_DB, COL_GOR_TYPE_PH_DB), _
+                    Array("AND") _
+                )
+
+                oldRowIdGOR = GetOldChildRowId(oldSourceRowIds, parentKey, x)
+
+                If Len(oldRowIdGOR) = 0 Then
+                    If ListColumnExists(srcTable, COL_GOR_ROW_ID_DB) Then
+                        oldRowIdGOR = NormalizeKeyValue( _
+                            srcTable.DataBodyRange.Cells( _
+                                x, _
+                                srcTable.ListColumns(COL_GOR_ROW_ID_DB).index _
+                            ).value _
+                        )
+                    End If
+                End If
+
+                ' Äîáàâëÿåì ñòðîêó â GOR_sourceData, åñëè:
+                ' 1) åñòü sampleCode + TypePh — insert/update;
+                ' 2) äàííûõ óæå íåò, íî åñòü ñòàðûé rowIdGOR — delete.
+                If hasSourceData Or Len(oldRowIdGOR) > 0 Then
+
+                    Dim childRow() As Variant
+                    ReDim childRow(1 To GORSourceDataTable.ListColumns.count)
+
+                    childRow(GORSourceDataTable.ListColumns(COL_GOR_ROW_ID_DB).index) = oldRowIdGOR
+                    childRow(GORSourceDataTable.ListColumns(COL_GOR_RESULT_ID_DB).index) = parentKey
+
+                    If hasSourceData Then
+
+                        childRow(GORSourceDataTable.ListColumns(COL_GOR_SAMPLE_CODE_DB).index) = _
+                            FormatValueForSyncText( _
+                                COL_GOR_SAMPLE_CODE_DB, _
+                                srcTable.DataBodyRange.Cells( _
+                                    x, _
+                                    srcTable.ListColumns(COL_GOR_SAMPLE_CODE_DB).index _
+                                ).value _
+                            )
+
+                        childRow(GORSourceDataTable.ListColumns(COL_GOR_TYPE_PH_DB).index) = _
+                            FormatValueForSyncText( _
+                                COL_GOR_TYPE_PH_DB, _
+                                srcTable.DataBodyRange.Cells( _
+                                    x, _
+                                    srcTable.ListColumns(COL_GOR_TYPE_PH_DB).index _
+                                ).value _
+                            )
+
+                    End If
+
+                    childRows.Add childRow
+
+                End If
+
+            Next x
+
+        End If
+
+    Next pageValue
+
+    WriteCollectionToListObject GORTable, parentRows
+    WriteCollectionToListObject GORSourceDataTable, childRows
+
+    ' 3. Python sync.
+    If parentRows.count > 0 Then
+
+        Dim syncResult As String
+        syncResult = RunStudySync("save", studies:="GOR", taskStatus:=taskStatus)
+
+        If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
+
+            Call DeleteEmptyRowsByColumns( _
+                GORSourceDataTable, _
+                COL_GOR_ROW_ID_DB, _
+                Array(COL_GOR_SAMPLE_CODE_DB, COL_GOR_TYPE_PH_DB) _
+            )
+
+            ' Âîçâðàùàåì â ôîðìû òîëüêî id:
+            ' - resultIdGOR â ðîäèòåëüñêóþ ôîðìó;
+            ' - resultIdGOR è rowIdGOR â GOR_source_N.
+            Call Load_GOR_results_to_forms( _
+                "by_key", _
+                Array(COL_GOR_RESULT_ID_DB, COL_GOR_ROW_ID_DB) _
+            )
+            Save_GOR = MACRO_CHANGED
+        Else
+            MsgBox "Ñèíõðîíèçàöèÿ GOR íå ïîäòâåðæäåíà êàê óñïåøíàÿ." & vbCrLf & vbCrLf & syncResult, vbExclamation
+        End If
+    Else
+        Save_GOR = MACRO_NO_CHANGES
+    End If
+
+End Function
+
+
+
+Public Sub CheckButtonsGOR()
+
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = ActiveWorkbook.Worksheets("GOR")
+    Dim editButton As Button
+    Dim cancelTaskButton As Button
+    For i = 1 To sheetGOR.ListObjects.count
+        Set editButton = sheetGOR.Buttons("buttonEditSamples_GOR_" & i)
+        Set cancelTaskButton = sheetGOR.Buttons("buttonCancelTask_GOR_" & i)
+        If sheetGOR.Range("GOR_" & i & "_resultIdGOR") <> "" Then
+            If Not editButton.OnAction = "createSampleCodeGOR_wrap" Then
+                editButton.OnAction = "createSampleCodeGOR_wrap"
+            End If
+        Else
+            If Not editButton.OnAction = "" Then
+                editButton.OnAction = ""
+            End If
+        End If
+        
+        If sheetGOR.Range("GOR_" & i & "_TaskId") <> "" Then
+            If Not cancelTaskButton.OnAction = "cancelTask_wrap" Then
+                cancelTaskButton.OnAction = "cancelTask_wrap"
+            End If
+        Else
+            If Not cancelTaskButton.OnAction = "" Then
+                cancelTaskButton.OnAction = ""
+            End If
+        End If
+            
+    Next i
+
+End Sub
+
+
+Sub equipmentModelsRefreshGOR()
+
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = ActiveWorkbook.Sheets("GOR")
+    
+    Dim eq() As String
+    
+    eq = getEquipmentModels("", "TransferVolume")
+    Dim strEqTrans As String
+    strEqTrans = eq(1)
+    For i = 2 To UBound(eq)
+        strEqTrans = strEqTrans & "," & eq(i)
+    Next i
+    
+    eq = getEquipmentModels("Gasometer", "SeparationGasVolume")
+    Dim strEqGM As String
+    strEqGM = eq(1)
+    For i = 2 To UBound(eq)
+        strEqGM = strEqGM & "," & eq(i)
+    Next i
+    
+    Dim CellTrans As Range
+    Dim CellGM As Range
+    i = 1
+    
+    On Error Resume Next
+    Do While True
+        Set CellTrans = Nothing
+        Set CellTrans = sheetGOR.Range("GOR_" & i & "_smplTransfEq")
+        If CellTrans Is Nothing Then Exit Do
+        
+        Set CellGM = sheetGOR.Range("GOR_" & i & "_gorEquipment")
+        
+        With CellTrans.Validation
+            .Delete
+            .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:= _
+            xlBetween, Formula1:=strEqTrans
+            .IgnoreBlank = True
+            .InCellDropdown = True
+            .ShowInput = True
+            .ShowError = True
+        End With
+        With CellGM.Validation
+            .Delete
+            .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:= _
+            xlBetween, Formula1:=strEqGM
+            .IgnoreBlank = True
+            .InCellDropdown = True
+            .ShowInput = True
+            .ShowError = True
+        End With
+        i = i + 1
+    Loop
+    On Error GoTo 0
+    
+End Sub
+
+Private Function Get_GOR_FormState(ByVal formIndex As Long) As GORFormState
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = wb.Worksheets("GOR")
+
+    Dim sampleCode As String
+    sampleCode = Trim$(CStr(sheetGOR.Range("GOR_" & formIndex & "_sampleCode").value))
+
+    Dim hasSampleCode As Boolean
+    hasSampleCode = (sampleCode <> "")
+
+    Dim hasVGTot As Boolean
+    hasVGTot = GOR_HasNonZeroOrError(sheetGOR.Range("GOR_" & formIndex & "_VGTot").value)
+    
+    Dim hasInitMass As Boolean
+    hasInitMass = GOR_HasNonZeroOrError(sheetGOR.Range("GOR_" & formIndex & "_m0").value)
+    
+    Dim hasVial As Boolean
+    Dim hasBottle As Boolean
+    Dim hasTedlarBag As Boolean
+    Dim hasPics As Boolean
+
+    hasVial = GOR_HasNonZeroOrError(sheetGOR.Range("GOR_" & formIndex & "_vial").value)
+    hasBottle = GOR_HasNonZeroOrError(sheetGOR.Range("GOR_" & formIndex & "_bottle").value)
+    hasTedlarBag = GOR_HasNonZeroOrError(sheetGOR.Range("GOR_" & formIndex & "_TedlarBag").value)
+    hasPics = GOR_HasNonZeroOrError(sheetGOR.Range("GOR_" & formIndex & "_pics").value)
+
+    Dim hasAnySampleCount As Boolean
+    hasAnySampleCount = hasVial Or hasBottle Or hasTedlarBag Or hasPics
+
+    Dim hasSourceRows As Boolean
+    hasSourceRows = GOR_SourceTableHasData(formIndex)
+
+    ' Ñîâñåì ïóñòàÿ ôîðìà.
+    If Not hasSampleCode _
+       And Not hasVGTot _
+       And Not hasInitMass _
+       And Not hasAnySampleCount _
+       And Not hasSourceRows Then
+
+        Get_GOR_FormState = GOR_FORM_EMPTY
+        Exit Function
+    End If
+
+    If hasSampleCode And hasVGTot Then
+        Get_GOR_FormState = GOR_FORM_FILLED
+        Exit Function
+    End If
+
+    ' Âñ¸ îñòàëüíîå çàðåçåðâèðîâàííî
+    Get_GOR_FormState = GOR_FORM_RESERVED
+
+End Function
+
+Private Sub GOR_AddError( _
+    ByRef errors As String, _
+    ByRef errorCount As Long, _
+    ByVal message As String _
+)
+
+    errorCount = errorCount + 1
+    errors = errors & errorCount & ". " & message & vbCrLf
+
+End Sub
+
+
+Private Function GOR_HasNonZeroOrError(ByVal value As Variant) As Boolean
+
+    If IsError(value) Then
+        GOR_HasNonZeroOrError = True
+        Exit Function
+    End If
+
+    If Trim$(CStr(value)) = "" Then
+        GOR_HasNonZeroOrError = False
+        Exit Function
+    End If
+
+    If Not IsNumeric(value) Then
+        GOR_HasNonZeroOrError = True
+        Exit Function
+    End If
+
+    GOR_HasNonZeroOrError = (Abs(CDbl(value)) > 0)
+
+End Function
+
+
+Private Function GOR_NamedPositiveNumber( _
+    ByVal wb As Workbook, _
+    ByVal ws As Worksheet, _
+    ByVal rangeName As String _
+) As Boolean
+
+    GOR_NamedPositiveNumber = False
+
+    If Not NamedRangeExists(wb, rangeName) Then
+        Exit Function
+    End If
+
+    Dim v As Variant
+    v = ws.Range(rangeName).value
+
+    If IsError(v) Then
+        Exit Function
+    End If
+
+    If Trim$(CStr(v)) = "" Then
+        Exit Function
+    End If
+
+    If Not IsNumeric(v) Then
+        Exit Function
+    End If
+
+    GOR_NamedPositiveNumber = (CDbl(v) > 0)
+
+End Function
+
+
+Private Function GOR_IsBooleanLike(ByVal value As Variant) As Boolean
+
+    If VarType(value) = vbBoolean Then
+        GOR_IsBooleanLike = True
+        Exit Function
+    End If
+
+    Select Case LCase$(Trim$(CStr(value)))
+
+        Case "true"
+            GOR_IsBooleanLike = True
+
+        Case "false"
+            GOR_IsBooleanLike = True
+
+        Case "èñòèíà"
+            GOR_IsBooleanLike = True
+
+        Case "ëîæü"
+            GOR_IsBooleanLike = True
+
+        Case "1"
+            GOR_IsBooleanLike = True
+
+        Case "0"
+            GOR_IsBooleanLike = True
+
+        Case "äà"
+            GOR_IsBooleanLike = True
+
+        Case "íåò"
+            GOR_IsBooleanLike = True
+
+        Case "+"
+            GOR_IsBooleanLike = True
+
+        Case "-"
+            GOR_IsBooleanLike = True
+
+        Case Else
+            GOR_IsBooleanLike = False
+
+    End Select
+
+End Function
+
+
+Private Function GOR_SourceTableHasData(ByVal formIndex As Long) As Boolean
+
+    GOR_SourceTableHasData = False
+
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = ActiveWorkbook.Worksheets("GOR")
+
+    If Not ListObjectExists(sheetGOR, "GOR_source_" & formIndex) Then
+        Exit Function
+    End If
+
+    Dim sourceTable As ListObject
+    Set sourceTable = sheetGOR.ListObjects("GOR_source_" & formIndex)
+
+    If sourceTable.DataBodyRange Is Nothing Then
+        Exit Function
+    End If
+
+    If Not ListColumnExists(sourceTable, COL_GOR_SAMPLE_CODE_DB) Then
+        Exit Function
+    End If
+
+    If Not ListColumnExists(sourceTable, COL_GOR_TYPE_PH_DB) Then
+        Exit Function
+    End If
+
+    Dim rowIndex As Long
+    Dim sampleCodeValue As Variant
+    Dim typePhValue As Variant
+
+    For rowIndex = 1 To sourceTable.ListRows.count
+
+        sampleCodeValue = sourceTable.DataBodyRange.Cells( _
+            rowIndex, _
+            sourceTable.ListColumns(COL_GOR_SAMPLE_CODE_DB).index _
+        ).value
+
+        typePhValue = sourceTable.DataBodyRange.Cells( _
+            rowIndex, _
+            sourceTable.ListColumns(COL_GOR_TYPE_PH_DB).index _
+        ).value
+
+        If IsError(sampleCodeValue) Or IsError(typePhValue) Then
+            GOR_SourceTableHasData = True
+            Exit Function
+        End If
+
+        If Trim$(CStr(sampleCodeValue)) <> "" Then
+            GOR_SourceTableHasData = True
+            Exit Function
+        End If
+
+        If Trim$(CStr(typePhValue)) <> "" Then
+            GOR_SourceTableHasData = True
+            Exit Function
+        End If
+
+    Next rowIndex
+
+End Function
+
+Private Function Validate_GOR_Form( _
+    ByVal formIndex As Long _
+) As Boolean
+
+    Validate_GOR_Form = False
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = wb.Worksheets("GOR")
+
+    Dim GORTable As ListObject
+    Set GORTable = wb.Worksheets("GOR_results").ListObjects("GOR_results")
+
+    Dim errors As String
+    Dim errorCount As Long
+
+    If formIndex <= 0 Then
+        MsgBox "Íåêîððåêòíûé íîìåð ôîðìû GOR: " & formIndex, vbExclamation
+        Exit Function
+    End If
+
+    If Not NamedRangeExists(wb, "GOR_" & formIndex & "_sampleCode") Then
+        MsgBox "Ôîðìà GOR_" & formIndex & " íå íàéäåíà.", vbExclamation
+        Exit Function
+    End If
+
+    If Not ListObjectExists(sheetGOR, "GOR_source_" & formIndex) Then
+        MsgBox "Òàáëèöà GOR_source_" & formIndex & " íå íàéäåíà.", vbExclamation
+        Exit Function
+    End If
+
+    Dim headerCell As Range
+    Dim fieldName As String
+    Dim rangeName As String
+    Dim rng As Range
+    Dim valueText As String
+
+    ' 1. Ïðîâåðÿåì named ranges ôîðìû ïî êîëîíêàì GOR_results.
+    For Each headerCell In GORTable.HeaderRowRange.Cells
+
+        fieldName = CStr(headerCell.value)
+
+        If fieldName = "dateTimeSync" Then
+            GoTo next_header
+        End If
+
+        rangeName = "GOR_" & formIndex & "_" & fieldName
+
+        If Not NamedRangeExists(wb, rangeName) Then
+            GOR_AddError errors, errorCount, "Íå íàéäåí èìåíîâàííûé äèàïàçîí: " & rangeName
+            GoTo next_header
+        End If
+
+        Set rng = sheetGOR.Range(rangeName)
+
+        If IsError(rng.value) Then
+            GOR_AddError errors, errorCount, rangeName & _
+                         " ñîäåðæèò îøèáêó Excel: " & rng.text & _
+                         " (" & rng.Worksheet.name & "!" & rng.Address(False, False) & ")"
+            GoTo next_header
+        End If
+
+        valueText = Trim$(CStr(rng.value))
+
+        Select Case fieldName
+
+            Case "resultIdGOR"
+                ' Ìîæåò áûòü ïóñòûì äî ïåðâîãî ñîõðàíåíèÿ.
+
+            Case "TaskId"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        GOR_AddError errors, errorCount, "Íîìåð çàäàíèÿ äîëæåí áûòü ÷èñëîì: " & rangeName
+                    ElseIf CDbl(rng.value) < 0 Then
+                        GOR_AddError errors, errorCount, "Íîìåð çàäàíèÿ íå ìîæåò áûòü îòðèöàòåëüíûì: " & rangeName
+                    End If
+                End If
+
+            Case "sampleCode"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå çàïîëíåí øèôð èñõîäíîé ïðîáû: " & rangeName
+                End If
+
+            Case "Correct"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå çàïîëíåíî ïîëå êîððåêòíîñòè ðàñ÷åòà: " & rangeName
+                ElseIf Not GOR_IsBooleanLike(rng.value) Then
+                    GOR_AddError errors, errorCount, "Ïîëå êîððåêòíîñòè äîëæíî áûòü True/False: " & rangeName
+                End If
+
+            Case "date"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå çàïîëíåíà äàòà: " & rangeName
+                ElseIf Not IsDate(rng.value) Then
+                    GOR_AddError errors, errorCount, "Çíà÷åíèå íåâîçìîæíî ïðåîáðàçîâàòü â äàòó: " & rangeName
+                End If
+
+            Case "dateStart"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå çàïîëíåíà äàòà íà÷àëà: " & rangeName
+                ElseIf Not IsDate(rng.value) Then
+                    GOR_AddError errors, errorCount, "Äàòà íà÷àëà äîëæíà áûòü äàòîé: " & rangeName
+                End If
+
+            Case "dateEnd"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå çàïîëíåíà äàòà îêîí÷àíèÿ: " & rangeName
+                ElseIf Not IsDate(rng.value) Then
+                    GOR_AddError errors, errorCount, "Äàòà îêîí÷àíèÿ äîëæíà áûòü äàòîé: " & rangeName
+                End If
+
+            Case "timeStart"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå çàïîëíåíî âðåìÿ íà÷àëà: " & rangeName
+                ElseIf Not rng.text Like "##:##" And Not rng.text Like "#:##" Then
+                    GOR_AddError errors, errorCount, "Âðåìÿ íà÷àëà äîëæíî áûòü âðåìåíåì: " & rangeName
+                End If
+
+            Case "timeEnd"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå çàïîëíåíî âðåìÿ îêîí÷àíèÿ: " & rangeName
+                ElseIf Not rng.text Like "##:##" And Not rng.text Like "#:##" Then
+                    GOR_AddError errors, errorCount, "Âðåìÿ îêîí÷àíèÿ äîëæíî áûòü âðåìåíåì: " & rangeName
+                End If
+
+            Case "operator"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå óêàçàí èñïîëíèòåëü: " & rangeName
+                ElseIf Not IsValidExecutor(rng.value) Then
+                    GOR_AddError errors, errorCount, "Íåâåðíî óêàçàí èñïîëíèòåëü: " & rangeName
+                End If
+
+            Case "analyseNumber"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå óêàçàí íîìåð àíàëèçà: " & rangeName
+                End If
+
+            Case "smplTransfEq"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå óêàçàíî îáîðóäîâàíèå ïåðåíîñà ïðîáû: " & rangeName
+                End If
+
+            Case "smplTransfEqNumber"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå óêàçàí íîìåð îáîðóäîâàíèÿ ïåðåíîñà ïðîáû: " & rangeName
+                End If
+
+            Case "equipmentForTransfer"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå óêàçàíî îáîðóäîâàíèå ïåðåíîñà ïðîáû: " & rangeName
+                End If
+
+            Case "equipForTransferNumber"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå óêàçàí íîìåð îáîðóäîâàíèÿ ïåðåíîñà ïðîáû: " & rangeName
+                End If
+
+            Case "gorEquipment"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå óêàçàíî îáîðóäîâàíèå GOR: " & rangeName
+                End If
+
+            Case "gorEquipmentNumber"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå óêàçàí íîìåð îáîðóäîâàíèÿ GOR: " & rangeName
+                End If
+
+            Case "Tfact"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå óêàçàíà ôàêòè÷åñêàÿ òåìïåðàòóðà: " & rangeName
+                ElseIf Not IsNumeric(rng.value) Then
+                    GOR_AddError errors, errorCount, "Ôàêòè÷åñêàÿ òåìïåðàòóðà äîëæíà áûòü ÷èñëîì: " & rangeName
+                ElseIf CDbl(rng.value) < -20 Or CDbl(rng.value) > 140 Then
+                    GOR_AddError errors, errorCount, "Ôàêòè÷åñêàÿ òåìïåðàòóðà äîëæíà áûòü îò -20 äî 140 °C: " & rangeName
+                End If
+
+            Case "Ppic"
+                If valueText <> "" Then
+                    If Not valueText Like "20##-P##" Then
+                        GOR_AddError errors, errorCount, "Ôîðìàò íîìåðà Ppic äîëæåí áûòü : 20##-P##" & rangeName
+                    End If
+                End If
+
+            Case "PtransferMPa"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        GOR_AddError errors, errorCount, "Äàâëåíèå ïåðåíîñà, ÌÏà, äîëæíî áûòü ÷èñëîì: " & rangeName
+                    ElseIf CDbl(rng.value) < 0 Then
+                        GOR_AddError errors, errorCount, "Äàâëåíèå ïåðåíîñà, ÌÏà, íå ìîæåò áûòü îòðèöàòåëüíûì: " & rangeName
+                    End If
+                End If
+
+            Case "Ptransfer"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        GOR_AddError errors, errorCount, "Äàâëåíèå ïåðåíîñà äîëæíî áûòü ÷èñëîì: " & rangeName
+                    ElseIf CDbl(rng.value) < 0 Then
+                        GOR_AddError errors, errorCount, "Äàâëåíèå ïåðåíîñà íå ìîæåò áûòü îòðèöàòåëüíûì: " & rangeName
+                    End If
+                End If
+
+            Case "VGTot"
+                If valueText = "" Then
+                    GOR_AddError errors, errorCount, "Íå óêàçàí îáùèé îáúåì ãàçà VGTot: " & rangeName
+                ElseIf Not IsNumeric(rng.value) Then
+                    GOR_AddError errors, errorCount, "VGTot äîëæåí áûòü ÷èñëîì: " & rangeName
+                ElseIf CDbl(rng.value) <= 0 Then
+                    GOR_AddError errors, errorCount, "VGTot äîëæåí áûòü áîëüøå 0: " & rangeName
+                End If
+
+            Case "VHeTot"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        GOR_AddError errors, errorCount, "VHeTot äîëæåí áûòü ÷èñëîì: " & rangeName
+                    ElseIf CDbl(rng.value) < 0 Then
+                        GOR_AddError errors, errorCount, "VHeTot íå ìîæåò áûòü îòðèöàòåëüíûì: " & rangeName
+                    End If
+                End If
+
+            Case "m0"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        GOR_AddError errors, errorCount, "m0 äîëæíî áûòü ÷èñëîì: " & rangeName
+                    ElseIf CDbl(rng.value) < 0 Then
+                        GOR_AddError errors, errorCount, "m0 íå ìîæåò áûòü îòðèöàòåëüíûì: " & rangeName
+                    End If
+                End If
+
+            Case "m1"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        GOR_AddError errors, errorCount, "m1 äîëæíî áûòü ÷èñëîì: " & rangeName
+                    ElseIf CDbl(rng.value) < 0 Then
+                        GOR_AddError errors, errorCount, "m1 íå ìîæåò áûòü îòðèöàòåëüíûì: " & rangeName
+                    End If
+                End If
+
+            Case "m2"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        GOR_AddError errors, errorCount, "m2 äîëæíî áûòü ÷èñëîì: " & rangeName
+                    ElseIf CDbl(rng.value) < 0 Then
+                        GOR_AddError errors, errorCount, "m2 íå ìîæåò áûòü îòðèöàòåëüíûì: " & rangeName
+                    End If
+                End If
+
+            Case "vial"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        If rng.value <> "-" Then
+                            GOR_AddError errors, errorCount, "Êîëè÷åñòâî âèàë äîëæíî áûòü ÷èñëîì èëè -: " & rangeName
+                        End If
+                    ElseIf CDbl(rng.value) < 0 Then
+                        GOR_AddError errors, errorCount, "Êîëè÷åñòâî âèàë íå ìîæåò áûòü îòðèöàòåëüíûì: " & rangeName
+                    ElseIf CDbl(rng.value) <> Fix(CDbl(rng.value)) Then
+                        GOR_AddError errors, errorCount, "Êîëè÷åñòâî âèàë äîëæíî áûòü öåëûì ÷èñëîì: " & rangeName
+                    End If
+                End If
+
+            Case "bottle"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        If rng.value <> "-" Then
+                            GOR_AddError errors, errorCount, "Êîëè÷åñòâî áàíîê äîëæíî áûòü ÷èñëîì èëè -: " & rangeName
+                        End If
+                    ElseIf CDbl(rng.value) < 0 Then
+                        GOR_AddError errors, errorCount, "Êîëè÷åñòâî áàíîê íå ìîæåò áûòü îòðèöàòåëüíûì: " & rangeName
+                    ElseIf CDbl(rng.value) <> Fix(CDbl(rng.value)) Then
+                        GOR_AddError errors, errorCount, "Êîëè÷åñòâî áàíîê äîëæíî áûòü öåëûì ÷èñëîì: " & rangeName
+                    End If
+                End If
+
+            Case "TedlarBag"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        If rng.value <> "-" Then
+                            GOR_AddError errors, errorCount, "Êîëè÷åñòâî òåäëàðîâûõ ïàêåòîâ äîëæíî áûòü ÷èñëîì èëè -: " & rangeName
+                        End If
+                    ElseIf CDbl(rng.value) < 0 Then
+                        GOR_AddError errors, errorCount, "Êîëè÷åñòâî òåäëàðîâûõ ïàêåòîâ íå ìîæåò áûòü îòðèöàòåëüíûì: " & rangeName
+                    ElseIf CDbl(rng.value) <> Fix(CDbl(rng.value)) Then
+                        GOR_AddError errors, errorCount, "Êîëè÷åñòâî òåäëàðîâûõ ïàêåòîâ äîëæíî áûòü öåëûì ÷èñëîì: " & rangeName
+                    End If
+                End If
+
+            Case "pics"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        If rng.value <> "-" Then
+                            GOR_AddError errors, errorCount, "Êîëè÷åñòâî ïèêíîìåòðîâ ïàêåòîâ äîëæíî áûòü ÷èñëîì èëè -: " & rangeName
+                        End If
+                    ElseIf CDbl(rng.value) < 0 Then
+                        GOR_AddError errors, errorCount, "Êîëè÷åñòâî ïèêíîìåòðîâ íå ìîæåò áûòü îòðèöàòåëüíûì: " & rangeName
+                    ElseIf CDbl(rng.value) <> Fix(CDbl(rng.value)) Then
+                        GOR_AddError errors, errorCount, "Êîëè÷åñòâî ïèêíîìåòðîâ äîëæíî áûòü öåëûì ÷èñëîì: " & rangeName
+                    End If
+                End If
+
+            Case "deltaAP"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        GOR_AddError errors, errorCount, "deltaAP äîëæåí áûòü ÷èñëîì: " & rangeName
+                    End If
+                End If
+
+            Case "deltaMatBalance"
+                If valueText <> "" Then
+                    If Not IsNumeric(rng.value) Then
+                        GOR_AddError errors, errorCount, "deltaMatBalance äîëæåí áûòü ÷èñëîì: " & rangeName
+                    End If
+                End If
+
+        End Select
+
+next_header:
+    Next headerCell
+
+    Dim hasVialCount As Boolean
+    Dim hasBottleCount As Boolean
+    Dim hasTedlarBagCount As Boolean
+    Dim hasPicsCount As Boolean
+
+    hasVialCount = GOR_NamedPositiveNumber(wb, sheetGOR, "GOR_" & formIndex & "_vial")
+    hasBottleCount = GOR_NamedPositiveNumber(wb, sheetGOR, "GOR_" & formIndex & "_bottle")
+    hasTedlarBagCount = GOR_NamedPositiveNumber(wb, sheetGOR, "GOR_" & formIndex & "_TedlarBag")
+    hasPicsCount = GOR_NamedPositiveNumber(wb, sheetGOR, "GOR_" & formIndex & "_pics")
+
+    If Not hasVialCount _
+       And Not hasBottleCount _
+       And Not hasTedlarBagCount _
+       And Not hasPicsCount Then
+
+        GOR_AddError errors, errorCount, "Íå óêàçàíà íè îäíà ïîëó÷åííàÿ ïðîáà: vial / bottle / TedlarBag / pics."
+    End If
+
+after_source_validation:
+
+    If errorCount > 0 Then
+        MsgBox "GOR_" & formIndex & " íå ñîõðàíåíà. Èñïðàâüòå îøèáêè:" & vbCrLf & vbCrLf & errors, vbExclamation
+        Exit Function
+    End If
+
+    Validate_GOR_Form = True
+
+End Function
+
+Private Function GOR_SourceTableHasValidSampleCodes(ByVal formIndex As Long) As Boolean
+
+    GOR_SourceTableHasValidSampleCodes = False
+
+    Dim sheetGOR As Worksheet
+    Set sheetGOR = ActiveWorkbook.Worksheets("GOR")
+
+    If Not ListObjectExists(sheetGOR, "GOR_source_" & formIndex) Then
+        Exit Function
+    End If
+
+    Dim sourceTable As ListObject
+    Set sourceTable = sheetGOR.ListObjects("GOR_source_" & formIndex)
+
+    If sourceTable.DataBodyRange Is Nothing Then
+        Exit Function
+    End If
+
+    If Not ListColumnExists(sourceTable, COL_GOR_SAMPLE_CODE_DB) Then
+        Exit Function
+    End If
+
+    If Not ListColumnExists(sourceTable, COL_GOR_TYPE_PH_DB) Then
+        Exit Function
+    End If
+
+    Dim sampleCodeCol As Long
+    Dim typePhCol As Long
+
+    sampleCodeCol = sourceTable.ListColumns(COL_GOR_SAMPLE_CODE_DB).index
+    typePhCol = sourceTable.ListColumns(COL_GOR_TYPE_PH_DB).index
+
+    Dim rowIndex As Long
+    Dim sampleCodeValue As Variant
+    Dim typePhValue As Variant
+
+    Dim sampleCodeText As String
+    Dim typePhText As String
+
+    For rowIndex = 1 To sourceTable.ListRows.count
+
+        sampleCodeValue = sourceTable.DataBodyRange.Cells(rowIndex, sampleCodeCol).value
+        typePhValue = sourceTable.DataBodyRange.Cells(rowIndex, typePhCol).value
+
+        If IsError(sampleCodeValue) Or IsError(typePhValue) Then
+            GoTo NextRow
+        End If
+
+        sampleCodeText = Trim$(CStr(sampleCodeValue))
+        typePhText = Trim$(CStr(typePhValue))
+
+        If sampleCodeText <> "" And typePhText <> "" Then
+            GOR_SourceTableHasValidSampleCodes = True
+            Exit Function
+        End If
+
+NextRow:
+    Next rowIndex
+
+End Function
+
+Public Function Validate_GOR() As macroResult
+    Validate_GOR = Save_GOR("Âàëèäèðîâàíî")
+End Function
+
+Public Sub Load_GOR()
+    LoadResearchesFromDB "GOR"
+End Sub
