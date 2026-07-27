@@ -1,143 +1,200 @@
--- В SQLite контроль внешних ключей включается отдельно
--- для каждого нового подключения к базе данных.
-PRAGMA foreign_keys = ON;
+Да, вставь в `schema.py` **перед блоком `STUDIES`**. По текущей структуре у тебя таблицы описываются через `TableSchema`, колонки через `_col(...)`, а связь родитель/дочка задаётся через `parent` и `fk_column`. 
 
+```python
+CVD_RESULTS = TableSchema(
+    logical_name="CVD_RESULTS",
+    db_table="CVD_results",
+    sheet_name="CVD_results",
+    excel_table_name="CVD_results",
+    status_datetime_fields=("dateEnd", "timeEnd"),
+    columns=[
+        _col("resultIdCVD", "resultIdCVD", typ="INTEGER", value_type="integer", pk=True),
 
--- =========================================================
--- Родительская таблица
--- =========================================================
+        _col("sampleCode", "sampleCode", typ="TEXT", value_type="text", required=True),
+        _col("TaskId", "TaskId", typ="INTEGER", value_type="integer"),
+        _col("analyseNumber", "analyseNumber", typ="INTEGER", value_type="integer", required=True),
 
-CREATE TABLE IF NOT EXISTS CVD_results (
-    resultIdCVD       INTEGER PRIMARY KEY AUTOINCREMENT,
+        _col("dateEnd", "dateEnd", typ="TEXT", value_type="date"),
+        _col("dateStart", "dateStart", typ="TEXT", value_type="date"),
+        _col("timeEnd", "timeEnd", typ="TEXT", value_type="time"),
+        _col("timeStart", "timeStart", typ="TEXT", value_type="time"),
 
-    sampleCode        TEXT    NOT NULL,
-    TaskId            INTEGER,
-    analyseNumber     INTEGER NOT NULL,
+        _col("deltaMatBalance", "deltaMatBalance", typ="REAL", value_type="real"),
 
-    dateEnd           TEXT,
-    dateStart         TEXT,
-    timeEnd           TEXT,
-    timeStart         TEXT,
-    
-    deltaMatBalance   REAL,
+        _col("Pabs", "Pabs", typ="REAL", value_type="real"),
+        _col("Pstart", "Pstart", typ="REAL", value_type="real"),
+        _col("Ptransfer", "Ptransfer", typ="REAL", value_type="real"),
+        _col("Punit", "Punit", typ="TEXT", value_type="text"),
 
-    Pabs              REAL,
-    Pstart            REAL,
-    Ptransfer         REAL,
-    Punit             TEXT,
+        _col("pvtCell", "pvtCell", typ="TEXT", value_type="text"),
 
-    pvtCell           TEXT,
+        _col("Tstart", "Tstart", typ="REAL", value_type="real"),
+        _col("Ttransfer", "Ttransfer", typ="REAL", value_type="real"),
 
-    Tstart            REAL,
-    Ttransfer         REAL,
+        _col("Vstart", "Vstart", typ="REAL", value_type="real"),
+        _col("Vtransfer", "Vtransfer", typ="REAL", value_type="real"),
 
-    Vstart            REAL,
-    Vtransfer         REAL,
+        _col("dateTimeSync", "dateTimeSync", typ="TEXT", value_type="datetime"),
+    ],
+)
+```
 
-    dateTimeSync      TEXT,
+И дочерняя таблица:
 
-    CONSTRAINT UQ_CVD_results_sampleCode_analyseNumber
-        UNIQUE (sampleCode, analyseNumber)
-);
+```python
+CVD_SOURCE_DATA = TableSchema(
+    logical_name="CVD_SOURCE_DATA",
+    db_table="CVD_sourceData",
+    sheet_name="CVD_sourceData",
+    excel_table_name="CVD_sourceData",
+    parent="CVD_RESULTS",
+    fk_column="resultIdCVD",
 
+    # Важно: step не включаю сюда специально.
+    # Если step будет заранее заполнен во всех строках, иначе пустые строки будут считаться "данными".
+    delete_if_empty_columns=(
+        "cellFluidMass",
+        "d20",
+        "date",
+        "dGas",
+        "evacuatedFluidMass",
+        "GF",
+        "gorEquipment",
+        "initPatm",
+        "m0",
+        "m0Trap",
+        "m1",
+        "m1Trap",
+        "m2",
+        "mgas",
+        "mLiq",
+        "operator",
+        "Patm",
+        "picDen",
+        "Ppic",
+        "sampleCodeGPh",
+        "sampleCodeLPh",
+        "stepPcell",
+        "stepTcell",
+        "T",
+        "transferPcell",
+        "Upic",
+        "V1",
+        "V2",
+        "Vcell",
+        "Vcellend",
+        "VCellLiq",
+        "Vgas",
+        "VgasSt",
+        "VGCyl",
+        "VGTot",
+        "VHeCyl",
+        "VHeTot",
+        "VLiq",
+        "VLiqRelative",
+        "Vtransfer",
+    ),
+    columns=[
+        _col("rowIdCVD", "rowIdCVD", typ="INTEGER", value_type="integer", pk=True),
 
--- =========================================================
--- Дочерняя таблица
--- =========================================================
+        _col("resultIdCVD", "resultIdCVD", typ="INTEGER", value_type="integer", required=True),
 
-CREATE TABLE IF NOT EXISTS CVD_sourceData (
-    rowIdCVD             INTEGER PRIMARY KEY AUTOINCREMENT,
+        _col("step", "step", typ="TEXT", value_type="text"),
 
-    resultIdCVD          INTEGER NOT NULL,
+        _col("cellFluidMass", "cellFluidMass", typ="REAL", value_type="real"),
+        _col("d20", "d20", typ="REAL", value_type="real"),
+        _col("date", "date", typ="TEXT", value_type="date"),
+        _col("dGas", "dGas", typ="REAL", value_type="real"),
+        _col("evacuatedFluidMass", "evacuatedFluidMass", typ="REAL", value_type="real"),
 
-    step                 TEXT,
+        _col("GF", "GF", typ="REAL", value_type="real"),
+        _col("gorEquipment", "gorEquipment", typ="TEXT", value_type="text"),
 
-    cellFluidMass        REAL,
-    d20                  REAL,
-    date                 TEXT,
-    dGas                 REAL,
-    evacuatedFluidMass   REAL,
+        _col("initPatm", "initPatm", typ="REAL", value_type="real"),
 
-    GF                   REAL,
-    gorEquipment         TEXT,
+        _col("m0", "m0", typ="REAL", value_type="real"),
+        _col("m0Trap", "m0Trap", typ="REAL", value_type="real"),
+        _col("m1", "m1", typ="REAL", value_type="real"),
+        _col("m1Trap", "m1Trap", typ="REAL", value_type="real"),
+        _col("m2", "m2", typ="REAL", value_type="real"),
 
-    initPatm             REAL,
+        _col("mgas", "mgas", typ="REAL", value_type="real"),
+        _col("mLiq", "mLiq", typ="REAL", value_type="real"),
 
-    m0                   REAL,
-    m0Trap               REAL,
-    m1                   REAL,
-    m1Trap               REAL,
-    m2                   REAL,
+        _col("operator", "operator", typ="TEXT", value_type="text"),
 
-    mgas                 REAL,
-    mLiq                 REAL,
+        _col("Patm", "Patm", typ="REAL", value_type="real"),
+        _col("picDen", "picDen", typ="REAL", value_type="real"),
+        _col("Ppic", "Ppic", typ="TEXT", value_type="text"),
 
-    operator             TEXT,
+        _col("sampleCodeGPh", "sampleCodeGPh", typ="TEXT", value_type="text"),
+        _col("sampleCodeLPh", "sampleCodeLPh", typ="TEXT", value_type="text"),
 
-    Patm                 REAL,
-    picDen               REAL,
-    Ppic                 TEXT,
+        _col("stepPcell", "stepPcell", typ="REAL", value_type="real"),
+        _col("stepTcell", "stepTcell", typ="REAL", value_type="real"),
 
-    sampleCodeGPh        TEXT,
-    sampleCodeLPh        TEXT,
+        _col("T", "T", typ="REAL", value_type="real"),
+        _col("transferPcell", "transferPcell", typ="REAL", value_type="real"),
 
-    stepPcell            REAL,
-    stepTcell            REAL,
+        _col("Upic", "Upic", typ="TEXT", value_type="text"),
 
-    T                    REAL,
-    transferPcell        REAL,
+        _col("V1", "V1", typ="REAL", value_type="real"),
+        _col("V2", "V2", typ="REAL", value_type="real"),
+        _col("Vcell", "Vcell", typ="REAL", value_type="real"),
+        _col("Vcellend", "Vcellend", typ="REAL", value_type="real"),
+        _col("VCellLiq", "VCellLiq", typ="REAL", value_type="real"),
 
-    Upic                 TEXT,
+        _col("Vgas", "Vgas", typ="REAL", value_type="real"),
+        _col("VgasSt", "VgasSt", typ="REAL", value_type="real"),
 
-    V1                   REAL,
-    V2                   REAL,
-    Vcell                REAL,
-    Vcellend             REAL,
-    VCellLiq             REAL,
+        _col("VGCyl", "VGCyl", typ="REAL", value_type="real"),
+        _col("VGTot", "VGTot", typ="REAL", value_type="real"),
 
-    Vgas                 REAL,
-    VgasSt               REAL,
+        _col("VHeCyl", "VHeCyl", typ="REAL", value_type="real"),
+        _col("VHeTot", "VHeTot", typ="REAL", value_type="real"),
 
-    VGCyl                REAL,
-    VGTot                REAL,
+        _col("VLiq", "VLiq", typ="REAL", value_type="real"),
+        _col("VLiqRelative", "VLiqRelative", typ="REAL", value_type="real"),
 
-    VHeCyl               REAL,
-    VHeTot               REAL,
+        _col("Vtransfer", "Vtransfer", typ="REAL", value_type="real"),
+    ],
+)
+```
 
-    VLiq                 REAL,
-    VLiqRelative         REAL,
+Потом в словарь `STUDIES` добавь строку:
 
-    Vtransfer            REAL,
+```python
+"CVD": StudySchema("CVD", CVD_RESULTS, CVD_SOURCE_DATA),
+```
 
-    CONSTRAINT FK_CVD_sourceData_resultIdCVD
-        FOREIGN KEY (resultIdCVD)
-        REFERENCES CVD_results (resultIdCVD)
-        ON UPDATE CASCADE
-        ON DELETE CASCADE,
+Например так:
 
-    CONSTRAINT UQ_CVD_sourceData_sampleCodeGPh
-        UNIQUE (sampleCodeGPh),
+```python
+STUDIES: dict[str, StudySchema] = {
+    "OP": StudySchema("OP", OP_RESULTS, None),
+    "AP": StudySchema("AP", AP_RESULTS, AP_SOURCE_DATA),
+    "GC": StudySchema("GC", GC_RESULTS, GC_SOURCE_DATA),
+    "SSF": StudySchema("SSF", SSF_RESULTS, SSF_SOURCE_DATA),
+    "GOR": StudySchema("GOR", GOR_RESULTS, GOR_SOURCE_DATA),
+    "BP": StudySchema("BP", BP_RESULTS, BP_SOURCE_DATA),
+    "REC": StudySchema("REC", REC_RESULTS, REC_SOURCE_DATA),
+    "EMV": StudySchema("EMV", EMV_RESULTS, EMV_SOURCE_DATA),
+    "JOIN": StudySchema("JOIN", JOIN_RESULTS, JOIN_SOURCE_DATA),
+    "CCE": StudySchema("CCE", CCE_RESULTS, CCE_SOURCE_DATA),
+    "CVD": StudySchema("CVD", CVD_RESULTS, CVD_SOURCE_DATA),
+}
+```
 
-    CONSTRAINT UQ_CVD_sourceData_sampleCodeLPh
-        UNIQUE (sampleCodeLPh)
-);
+`delete_if_empty_columns` здесь важен: текущий `sync.py` использует его, чтобы понять, сохранять дочернюю строку или считать её пустой/удалённой. Если его не указать, `step` тоже будет считаться данными, и пустые строки с заполненным `step` могут улетать в БД. 
 
+Ещё момент: я поставил для `TaskStatus` дату завершения из `dateEnd + timeEnd`. Если у тебя в CVD чаще заполнены стартовые поля, замени:
 
--- =========================================================
--- Индексы
--- =========================================================
+```python
+status_datetime_fields=("dateEnd", "timeEnd"),
+```
 
--- Для загрузки всех дочерних строк конкретного результата.
--- На внешние ключи SQLite автоматически индекс не создаёт.
-CREATE INDEX IF NOT EXISTS IX_CVD_sourceData_resultIdCVD
-    ON CVD_sourceData (resultIdCVD);
+на:
 
-
--- Для поиска исследования по номеру задания.
-CREATE INDEX IF NOT EXISTS IX_CVD_results_TaskId
-    ON CVD_results (TaskId);
-
-
--- Для поиска дочерних строк по номеру этапа внутри результата.
-CREATE INDEX IF NOT EXISTS IX_CVD_sourceData_resultIdCVD_step
-    ON CVD_sourceData (resultIdCVD, step);
+```python
+status_datetime_fields=("dateStart", "timeStart"),
+```
