@@ -8,21 +8,21 @@ Option Explicit
 'Private Const SYNC_SCRIPT As String = "C:\PycharmProjects\ExcelSqLite\sync.py"
 'Private Const DB_PATH As String = "C:\sqlite\results.db"
 
-Private Const PYTHON_EXE As String = "L:\LRC\common_data\ÔËÞÈÄÛ\ÃÒÈ\sqlite-excel\.venv\Scripts\python.exe"
-Private Const SYNC_SCRIPT As String = "L:\LRC\common_data\ÔËÞÈÄÛ\ÃÒÈ\sqlite-excel\sync.py"
-Private Const DB_PATH As String = "L:\LRC\common_data\ÔËÞÈÄÛ\ÃÒÈ\sqlite-excel\sqlite\results.db"
+Private Const PYTHON_EXE As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\.venv\Scripts\python.exe"
+Private Const SYNC_SCRIPT As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sync.py"
+Private Const DB_PATH As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db"
 
-Public Const REFRESH_TASKS_SCRIPT As String = "L:\LRC\common_data\ÔËÞÈÄÛ\ÃÒÈ\sqlite-excel\refresh_tasks.py"
-Public Const EXTERNAL_BOOK_TASKS_PATH As String = "L:\LRC\exchange\ÊÑÏ Ëàéò\Æóðíàë_çàäàíèé_ôëþèäû.xlsx" ' "L:\LRC\exchange\ÊÑÏ Ëàéò\Æóðíàë_çàäàíèé_ôëþèäû — êîïèÿ.xlsx"
+Public Const REFRESH_TASKS_SCRIPT As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\refresh_tasks.py"
+Public Const EXTERNAL_BOOK_TASKS_PATH As String = "L:\LRC\exchange\КСП Лайт\Журнал_заданий_флюиды.xlsx" ' "L:\LRC\exchange\КСП Лайт\Журнал_заданий_флюиды — копия.xlsx"
 
-Public Const CREATE_QUALITY_ACT_SCRIPT As String = "L:\LRC\common_data\ÔËÞÈÄÛ\ÃÒÈ\sqlite-excel\create_quality_act.py"
-Public Const QUALITY_ACT_TEMPLATE As String = "L:\LRC\common_data\ÔËÞÈÄÛ\ÃÒÈ\Ðàáîòà\Áàçà äàííûõ ðåçóëüòàòîâ\Àêò êà÷åñòâà.xlsx"
+Public Const CREATE_QUALITY_ACT_SCRIPT As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\create_quality_act.py"
+Public Const QUALITY_ACT_TEMPLATE As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\Работа\База данных результатов\Акт качества.xlsx"
 
 Private Const OPOH_QUALITY_ACT_SCRIPT As String = _
-    "L:\LRC\common_data\ÔËÞÈÄÛ\ÃÒÈ\sqlite-excel\create_opoh_quality_act.py"
+    "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\create_opoh_quality_act.py"
 
 Private Const OPOH_QUALITY_ACT_TEMPLATE As String = _
-    "L:\LRC\common_data\ÔËÞÈÄÛ\ÃÒÈ\sqlite-excel\Àêò êà÷åñòâà ãëóáèíîê.xlsx"
+    "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\Акт качества глубинок.xlsx"
     
 
 Public Function RunStudySync( _
@@ -42,15 +42,15 @@ Public Function RunStudySync( _
     Dim stderrText As String
     
     If ActiveWorkbook Is Nothing Then
-        Err.Raise vbObjectError + 1002, , "Íåò àêòèâíîé êíèãè ñ äàííûìè"
+        Err.Raise vbObjectError + 1002, , "Нет активной книги с данными"
     End If
     
     If ActiveWorkbook.name = ThisWorkbook.name Then
-        Err.Raise vbObjectError + 1003, , "Àêòèâíà êíèãà-íàäñòðîéêà, à íå êíèãà ñ äàííûìè"
+        Err.Raise vbObjectError + 1003, , "Активна книга-надстройка, а не книга с данными"
     End If
     
     If Len(ActiveWorkbook.path) = 0 Then
-        Err.Raise vbObjectError + 1004, , "Êíèãà ñ äàííûìè äîëæíà áûòü ñîõðàíåíà ïåðåä çàïóñêîì ñèíõðîíèçàöèè"
+        Err.Raise vbObjectError + 1004, , "Книга с данными должна быть сохранена перед запуском синхронизации"
     End If
     
     Set targetBook = ActiveWorkbook
@@ -59,18 +59,18 @@ Public Function RunStudySync( _
     mode = LCase$(Trim$(mode))
     
     If mode <> "save" And mode <> "load" Then
-        Err.Raise vbObjectError + 1000, , "mode äîëæåí áûòü save èëè load"
+        Err.Raise vbObjectError + 1000, , "mode должен быть save или load"
     End If
     
     If mode = "load" And Len(Trim$(projectNumber)) = 0 Then
-        Err.Raise vbObjectError + 1001, , "Äëÿ ðåæèìà load íóæíî óêàçàòü projectNumber"
+        Err.Raise vbObjectError + 1001, , "Для режима load нужно указать projectNumber"
     End If
     
     If Len(Trim$(studies)) = 0 Then
         studies = "OP AP GC SSF GOR BP REC EMV"
     End If
     
-    ' Ïåðåñ÷¸ò òîëüêî êíèãè ñ äàííûìè.
+    ' Пересчёт только книги с данными.
     Dim ws As Worksheet
 
     For Each ws In targetBook.Worksheets
@@ -109,7 +109,7 @@ Public Function RunStudySync( _
     Dim progressText As String
     Dim newChunk As String
     
-    frmProgress.lblStatus.Caption = "Çàïóñê Python-ñêðèïòà..."
+    frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
     frmProgress.show vbModeless
     DoEvents
     
@@ -146,10 +146,10 @@ Public Function RunStudySync( _
     Unload frmProgress
     
     If exec.exitCode <> 0 Then
-        MsgBox "Îøèáêà âûïîëíåíèÿ Python-ñêðèïòà:" & vbCrLf & vbCrLf & _
+        MsgBox "Ошибка выполнения Python-скрипта:" & vbCrLf & vbCrLf & _
                stdoutText & vbCrLf & stderrText, vbCritical
     Else
-        MsgBox "Ãîòîâî:" & vbCrLf & vbCrLf & stdoutText, vbInformation
+        MsgBox "Готово:" & vbCrLf & vbCrLf & stdoutText, vbInformation
     End If
     
     RunStudySync = stdoutText
@@ -179,15 +179,15 @@ Public Function SetTaskStatusOnly( _
     taskStatus = Trim$(taskStatus)
     
     If Len(taskType) = 0 Then
-        Err.Raise vbObjectError + 1102, , "Íóæíî óêàçàòü taskType"
+        Err.Raise vbObjectError + 1102, , "Нужно указать taskType"
     End If
     
     If Len(taskStatus) = 0 Then
-        Err.Raise vbObjectError + 1103, , "Íóæíî óêàçàòü taskStatus"
+        Err.Raise vbObjectError + 1103, , "Нужно указать taskStatus"
     End If
     
-    If statusComment = "" And taskStatus = "Îòìåíà" Then
-        MsgBox "Íóæíî óêàçàòü statusComment"
+    If statusComment = "" And taskStatus = "Отмена" Then
+        MsgBox "Нужно указать statusComment"
         SetTaskStatusOnly = "NoComment"
         Exit Function
     End If
@@ -224,10 +224,10 @@ Public Function SetTaskStatusOnly( _
     stderrText = exec.StdErr.ReadAll
     
     If exec.exitCode <> 0 Then
-        MsgBox "Îøèáêà èçìåíåíèÿ ñòàòóñà çàäàíèÿ:" & vbCrLf & vbCrLf & _
+        MsgBox "Ошибка изменения статуса задания:" & vbCrLf & vbCrLf & _
                stdoutText & vbCrLf & stderrText, vbCritical
     Else
-        MsgBox "Ãîòîâî:" & vbCrLf & vbCrLf & stdoutText, vbInformation
+        MsgBox "Готово:" & vbCrLf & vbCrLf & stdoutText, vbInformation
     End If
     
     SetTaskStatusOnly = stdoutText
@@ -250,15 +250,15 @@ Public Sub LoadResearchesFromDB( _
     Set wb = ActiveWorkbook
 
     If wb Is Nothing Then
-        Err.Raise vbObjectError + 1101, , "Íåò àêòèâíîé êíèãè ñ äàííûìè"
+        Err.Raise vbObjectError + 1101, , "Нет активной книги с данными"
     End If
     
     If wb.name = ThisWorkbook.name Then
-        Err.Raise vbObjectError + 1102, , "Àêòèâíà êíèãà-íàäñòðîéêà, à íå êíèãà ñ äàííûìè"
+        Err.Raise vbObjectError + 1102, , "Активна книга-надстройка, а не книга с данными"
     End If
     
     If Len(wb.path) = 0 Then
-        Err.Raise vbObjectError + 1103, , "Êíèãà ñ äàííûìè äîëæíà áûòü ñîõðàíåíà ïåðåä çàãðóçêîé"
+        Err.Raise vbObjectError + 1103, , "Книга с данными должна быть сохранена перед загрузкой"
     End If
 
     Dim project As String
@@ -283,7 +283,7 @@ Public Sub LoadResearchesFromDB( _
     formFillMode = LCase$(Trim$(formFillMode))
     
     If formFillMode <> "sequential" And formFillMode <> "by_key" Then
-        Err.Raise vbObjectError + 1104, , "formFillMode äîëæåí áûòü 'sequential' èëè 'by_key'"
+        Err.Raise vbObjectError + 1104, , "formFillMode должен быть 'sequential' или 'by_key'"
     End If
 
     Dim macroStarted As Boolean
@@ -301,7 +301,7 @@ Public Sub LoadResearchesFromDB( _
     )
 
     If InStr(1, syncResult, """ok"": true", vbTextCompare) = 0 Then
-        MsgBox "Çàãðóçêà èç ÁÄ íå ïîäòâåðæäåíà êàê óñïåøíàÿ." & vbCrLf & vbCrLf & _
+        MsgBox "Загрузка из БД не подтверждена как успешная." & vbCrLf & vbCrLf & _
                syncResult, vbExclamation
         GoTo CleanExit
     End If
@@ -347,7 +347,7 @@ Private Function GetCurrentProject(ByVal wb As Workbook) As String
     GetCurrentProject = CStr(wsOP.ListObjects("ChoosenProject").DataBodyRange(1, 1).value)
 
     If Len(Trim$(GetCurrentProject)) = 0 Then
-        Err.Raise vbObjectError + 1000, , "Íå âûáðàí ïðîåêò â òàáëèöå ChoosenProject."
+        Err.Raise vbObjectError + 1000, , "Не выбран проект в таблице ChoosenProject."
     End If
 
 End Function
@@ -419,7 +419,7 @@ Private Sub LoadStudyForms( _
             Call Load_CCE_results_to_forms(formFillMode)
     
         Case Else
-            Err.Raise vbObjectError + 1001, , "Íåèçâåñòíûé òèï èññëåäîâàíèÿ: " & studyCode
+            Err.Raise vbObjectError + 1001, , "Неизвестный тип исследования: " & studyCode
     End Select
 
 End Sub
@@ -464,7 +464,7 @@ Private Function NormalizeStudiesOrDefault(Optional ByVal studies As Variant) As
     
     For Each key In dict.Keys
         If Not IsKnownStudyCode(CStr(key)) Then
-            Err.Raise vbObjectError + 1201, , "Íåèçâåñòíûé òèï èññëåäîâàíèÿ: " & CStr(key)
+            Err.Raise vbObjectError + 1201, , "Неизвестный тип исследования: " & CStr(key)
         End If
     Next key
 
@@ -554,27 +554,27 @@ Public Function RefreshTasksFromExternalWorkbook( _
     Dim stderrText As String
     
     If ActiveWorkbook Is Nothing Then
-        Err.Raise vbObjectError + 1202, , "Íåò àêòèâíîé êíèãè ñ äàííûìè"
+        Err.Raise vbObjectError + 1202, , "Нет активной книги с данными"
     End If
     
     If ActiveWorkbook.name = ThisWorkbook.name Then
-        Err.Raise vbObjectError + 1203, , "Àêòèâíà êíèãà-íàäñòðîéêà, à íå êíèãà ñ äàííûìè"
+        Err.Raise vbObjectError + 1203, , "Активна книга-надстройка, а не книга с данными"
     End If
     
     If Len(ActiveWorkbook.path) = 0 Then
-        Err.Raise vbObjectError + 1204, , "Êíèãà ñ äàííûìè äîëæíà áûòü ñîõðàíåíà ïåðåä îáíîâëåíèåì çàäàíèé"
+        Err.Raise vbObjectError + 1204, , "Книга с данными должна быть сохранена перед обновлением заданий"
     End If
     
     If Len(Trim$(sourceWorkbookPath)) = 0 Then
-        Err.Raise vbObjectError + 1205, , "Íå óêàçàí ïóòü ê âíåøíåé êíèãå ñ çàäàíèÿìè"
+        Err.Raise vbObjectError + 1205, , "Не указан путь к внешней книге с заданиями"
     End If
     
     If Dir(sourceWorkbookPath) = "" Then
-        Err.Raise vbObjectError + 1206, , "Âíåøíÿÿ êíèãà ñ çàäàíèÿìè íå íàéäåíà: " & sourceWorkbookPath
+        Err.Raise vbObjectError + 1206, , "Внешняя книга с заданиями не найдена: " & sourceWorkbookPath
     End If
     
     If Len(Trim$(projectNumber)) = 0 Then
-        Err.Raise vbObjectError + 1207, , "Íå óêàçàí íîìåð ïðîåêòà"
+        Err.Raise vbObjectError + 1207, , "Не указан номер проекта"
     End If
     
     Set targetBook = ActiveWorkbook
@@ -612,7 +612,7 @@ Public Function RefreshTasksFromExternalWorkbook( _
     Dim progressText As String
     Dim newChunk As String
     
-    frmProgress.lblStatus.Caption = "Çàïóñê Python-ñêðèïòà..."
+    frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
     frmProgress.show vbModeless
     DoEvents
     
@@ -649,10 +649,10 @@ Public Function RefreshTasksFromExternalWorkbook( _
     Unload frmProgress
     
     If exec.exitCode <> 0 Then
-        MsgBox "Îøèáêà îáíîâëåíèÿ çàäàíèé:" & vbCrLf & vbCrLf & _
+        MsgBox "Ошибка обновления заданий:" & vbCrLf & vbCrLf & _
                stdoutText & vbCrLf & stderrText, vbCritical
     Else
-        MsgBox "Çàäàíèÿ îáíîâëåíû:" & vbCrLf & vbCrLf & stdoutText, vbInformation
+        MsgBox "Задания обновлены:" & vbCrLf & vbCrLf & stdoutText, vbInformation
     End If
     
     RefreshTasksFromExternalWorkbook = stdoutText
@@ -665,7 +665,7 @@ Public Sub RefreshTasks_SelectFile()
     Set OP_list = ActiveWorkbook.Worksheets("OP")
     
     If Not OP_list.Range("ChoosenProject[Project]").value Like "2#-F###" Then
-        MsgBox "Íå âåðíî óêàçàí íîìåð ïðîåêòà. Óêàæèòå íîìåð ïðîåêòà â ôîðìàòå 2#-F###, ãäå # - ÿâëÿåòñÿ ÷èñëîì, è ïîâòîðèòå."
+        MsgBox "Не верно указан номер проекта. Укажите номер проекта в формате 2#-F###, где # - является числом, и повторите."
         Exit Sub
     ElseIf OP_list.Range("ChoosenProject[Project]").value Like "2#-F000" Then
         Exit Sub
@@ -680,10 +680,10 @@ Public Sub RefreshTasks_SelectFile()
     Call RefreshTasksFromExternalWorkbook( _
         EXTERNAL_BOOK_TASKS_PATH, _
         projectNumber, _
-        "ÃÒÈ", _
-        "Æóðíàë_ÃÒÈ", _
-        "Ñìåøåíèå", _
-        "ÆÓðíàë_îáúåäèíåíèÿ", _
+        "ГТИ", _
+        "Журнал_ГТИ", _
+        "Смешение", _
+        "ЖУрнал_объединения", _
         "Task", _
         "Task", _
         "Task_mix", _
@@ -708,15 +708,15 @@ Public Function CreateQualityAct( _
     Dim stderrText As String
     
     If ActiveWorkbook Is Nothing Then
-        Err.Raise vbObjectError + 1202, , "Íåò àêòèâíîé êíèãè ñ äàííûìè"
+        Err.Raise vbObjectError + 1202, , "Нет активной книги с данными"
     End If
     
     If ActiveWorkbook.name = ThisWorkbook.name Then
-        Err.Raise vbObjectError + 1203, , "Àêòèâíà êíèãà-íàäñòðîéêà, à íå êíèãà ñ äàííûìè"
+        Err.Raise vbObjectError + 1203, , "Активна книга-надстройка, а не книга с данными"
     End If
     
     If Len(ActiveWorkbook.path) = 0 Then
-        Err.Raise vbObjectError + 1204, , "Êíèãà ñ äàííûìè äîëæíà áûòü ñîõðàíåíà ïåðåä îáíîâëåíèåì çàäàíèé"
+        Err.Raise vbObjectError + 1204, , "Книга с данными должна быть сохранена перед обновлением заданий"
     End If
     
     Set targetBook = ActiveWorkbook
@@ -748,10 +748,10 @@ Public Function CreateQualityAct( _
     stderrText = exec.StdErr.ReadAll
     
     If exec.exitCode <> 0 Then
-        MsgBox "Îøèáêà ñîçäàíèÿ àêòà êà÷åòñâà: " & vbCrLf & vbCrLf & _
+        MsgBox "Ошибка создания акта качетсва: " & vbCrLf & vbCrLf & _
                 stdoutText & vbCrLf & stderrText, vbCritical
     Else
-        MsgBox "Àêò êà÷åñòâà ñîçäàí: " & vbCrLf & vbCrLf & _
+        MsgBox "Акт качества создан: " & vbCrLf & vbCrLf & _
                 stdoutText, vbInformation
     End If
     
@@ -771,17 +771,17 @@ Public Sub CreateOPOHQualityAct()
     Dim stderrText As String
 
     If ActiveWorkbook Is Nothing Then
-        MsgBox "Íåò àêòèâíîé êíèãè ñ äàííûìè.", vbExclamation
+        MsgBox "Нет активной книги с данными.", vbExclamation
         Exit Sub
     End If
 
     If ActiveWorkbook.name = ThisWorkbook.name Then
-        MsgBox "Àêòèâíà êíèãà-íàäñòðîéêà, à íå êíèãà ñ äàííûìè.", vbExclamation
+        MsgBox "Активна книга-надстройка, а не книга с данными.", vbExclamation
         Exit Sub
     End If
 
     If Len(ActiveWorkbook.path) = 0 Then
-        MsgBox "Êíèãà ñ äàííûìè äîëæíà áûòü ñîõðàíåíà ïåðåä ñîçäàíèåì àêòà.", vbExclamation
+        MsgBox "Книга с данными должна быть сохранена перед созданием акта.", vbExclamation
         Exit Sub
     End If
 
@@ -806,10 +806,10 @@ Public Sub CreateOPOHQualityAct()
     stderrText = exec.StdErr.ReadAll
 
     If exec.exitCode <> 0 Then
-        MsgBox "Îøèáêà ñîçäàíèÿ àêòà êà÷åñòâà ãëóáèííûõ ïðîá:" & vbCrLf & vbCrLf & _
+        MsgBox "Ошибка создания акта качества глубинных проб:" & vbCrLf & vbCrLf & _
                stdoutText & vbCrLf & stderrText, vbCritical
     Else
-        MsgBox "Àêò êà÷åñòâà ãëóáèííûõ ïðîá ñîçäàí:" & vbCrLf & vbCrLf & _
+        MsgBox "Акт качества глубинных проб создан:" & vbCrLf & vbCrLf & _
                stdoutText, vbInformation
     End If
 
@@ -956,7 +956,7 @@ Private Function GetWorkingPythonExe() As String
     Err.Raise _
         vbObjectError + 1001, _
         "GetWorkingPythonExe", _
-        "Íå íàéäåí ðàáî÷èé èíòåðïðåòàòîð Python."
+        "Не найден рабочий интерпретатор Python."
 
 End Function
 
