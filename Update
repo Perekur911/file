@@ -1,79 +1,679 @@
-Да, понял. Тогда логика должна быть такая:
+Да. Здесь нужно менять только **три файла**:
+
+* `schema.py` — добавить настройки расчёта прогресса для исследования;
+* `task_status.py` — разрешить динамические статусы `В работе N/10`;
+* `sync.py` — рассчитывать статус по строкам `sourceData` и создавать `TaskStatus` уже после сохранения дочерней таблицы.
+
+`repository.py`, `excel_io.py`, `refresh_tasks.py` и VBA-часть для этого менять не нужно. `refresh_tasks.py` и так берёт последний текстовый статус без проверки его значения. 
+
+---
+
+# 1. `schema.py`
+
+## 1.1. Расширить `StudySchema`
+
+Найди:
+
+```python
+@dataclass(frozen=True)
+class StudySchema:
+    """
+    Описание одного типа исследования.
+
+    code:
+        Код, который удобно передавать из Excel: OP, AP, GC, SSF, GOR, BP, Rec, EMV.
+    result_table:
+        Родительская таблица результатов.
+    source_table:
+        Дочерняя таблица исходных данных. Может отсутствовать.
+    """
+
+    code: str
+    result_table: TableSchema
+    source_table: TableSchema | None = None
+```
+
+Сейчас `StudySchema` содержит только родительскую и дочернюю таблицы. 
+
+Замени на:
+
+```python
+@dataclass(frozen=True)
+class StudySchema:
+    """
+    Описание одного типа исследования.
+
+    progress_step_field:
+        Имя колонки дочерней таблицы, по которой рассчитывается прогресс.
+
+    progress_total_steps:
+        Число обычных этапов, отображаемое в статусе:
+        "В работе N/progress_total_steps".
+
+    completion_step:
+        Специальный финальный этап. Его наличие означает "Завершено".
+    """
+
+    code: str
+    result_table: TableSchema
+    source_table: TableSchema | None = None
+
+    progress_step_field: str | None = None
+    progress_total_steps: int | None = None
+    completion_step: int | None = None
+
+    @property
+    def has_progress_status(self) -> bool:
+        return (
+            self.source_table is not None
+            and self.progress_step_field is not None
+            and self.progress_total_steps is not None
+            and self.completion_step is not None
+        )
+```
+
+Свойство `has_progress_status` позволит потом использовать эту же логику для других исследований без проверок:
+
+```python
+if study.code == "CVD":
+```
+
+---
+
+## 1.2. Настроить CVD в `STUDIES`
+
+Раз ты уже добавил:
+
+```python
+CVD_RESULTS
+CVD_SOURCE_DATA
+```
+
+то в словаре `STUDIES` запись CVD сделай такой:
+
+```python
+"CVD": StudySchema(
+    code="CVD",
+    result_table=CVD_RESULTS,
+    source_table=CVD_SOURCE_DATA,
+    progress_step_field="step",
+    progress_total_steps=10,
+    completion_step=11,
+),
+```
+
+Остальные исследования оставляй как есть:
+
+```python
+"AP": StudySchema("AP", AP_RESULTS, AP_SOURCE_DATA),
+"GC": StudySchema("GC", GC_RESULTS, GC_SOURCE_DATA),
+```
+
+Для них `has_progress_status` будет `False`, и сохранение статусов останется прежним. Словарь исследований сейчас создаёт обычные `StudySchema` из двух таблиц, поэтому добавление необязательных полей не сломает старые записи. 
+
+---
+
+## 1.3. Проверь тип `step` в описании `CVD_SOURCE_DATA`
+
+Колонка должна быть описана именно как текст:
+
+```python
+_col(
+    db_name="step",
+    excel_name="step",
+    typ="TEXT",
+    value_type="text",
+),
+```
+
+Не ставь `value_type="integer"`, потому что в SQLite у тебя `step TEXT`.
+
+Для расчёта мы всё равно преобразуем значение в `int`.
+
+---
+
+# 2. `task_status.py`
+
+Сейчас `_normalize_status()` принимает только три фиксированных значения из `ALLOWED_STATUSES`, поэтому `В работе 3/10` будет отклонён. 
+
+## 2.1. Добавить импорт `re`
+
+В начале файла было:
+
+```python
+from __future__ import annotations
+
+import sqlite3
+from typing import Any
+```
+
+Сделай:
+
+```python
+from __future__ import annotations
+
+import re
+import sqlite3
+from typing import Any
+```
+
+---
+
+## 2.2. Добавить константу префикса
+
+В классе `TaskStatusRepository` после:
+
+```python
+COMPLETED_STATUS = "Завершено"
+VALIDATED_STATUS = "Валидировано"
+CANCELED_STATUS = "Отменено"
+```
+
+добавь:
+
+```python
+IN_PROGRESS_PREFIX = "В работе"
+```
+
+`ALLOWED_STATUSES` оставь прежним:
+
+```python
+ALLOWED_STATUSES = {
+    COMPLETED_STATUS,
+    VALIDATED_STATUS,
+    CANCELED_STATUS,
+}
+```
+
+Динамические статусы не нужно складывать в этот набор.
+
+---
+
+## 2.3. Заменить `_normalize_status()`
+
+Найди существующий метод:
+
+```python
+@classmethod
+def _normalize_status(cls, status: str) -> str:
+```
+
+и замени его целиком:
+
+```python
+@classmethod
+def _normalize_status(cls, status: str) -> str:
+    text = str(status).strip()
+
+    aliases = {
+        "completed": cls.COMPLETED_STATUS,
+        "complete": cls.COMPLETED_STATUS,
+        "done": cls.COMPLETED_STATUS,
+        "saved": cls.COMPLETED_STATUS,
+        "завершено": cls.COMPLETED_STATUS,
+
+        "validated": cls.VALIDATED_STATUS,
+        "valid": cls.VALIDATED_STATUS,
+        "валидировано": cls.VALIDATED_STATUS,
+        "проверено": cls.VALIDATED_STATUS,
+
+        "canceled": cls.CANCELED_STATUS,
+        "cancelled": cls.CANCELED_STATUS,
+        "cancel": cls.CANCELED_STATUS,
+        "отмена": cls.CANCELED_STATUS,
+        "отменено": cls.CANCELED_STATUS,
+    }
+
+    normalized = aliases.get(text.lower(), text)
+
+    if normalized in cls.ALLOWED_STATUSES:
+        return normalized
+
+    progress_match = re.fullmatch(
+        r"в\s+работе\s+(\d+)\s*/\s*(\d+)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    if progress_match is not None:
+        current_step = int(progress_match.group(1))
+        total_steps = int(progress_match.group(2))
+
+        if total_steps <= 0:
+            raise ValueError(
+                f"Некорректный статус '{status}': "
+                "общее количество этапов должно быть больше нуля"
+            )
+
+        if current_step < 1 or current_step > total_steps:
+            raise ValueError(
+                f"Некорректный статус '{status}': "
+                f"номер этапа должен быть от 1 до {total_steps}"
+            )
+
+        return f"{cls.IN_PROGRESS_PREFIX} {current_step}/{total_steps}"
+
+    raise ValueError(
+        f"Неизвестный статус '{status}'. Допустимо: "
+        f"{sorted(cls.ALLOWED_STATUSES)} или "
+        f"'{cls.IN_PROGRESS_PREFIX} N/M'"
+    )
+```
+
+Теперь:
 
 ```text
-Save_CVD()                  → сохраняем без передачи taskStatus в RunStudySync
-Save_CVD("Валидировано")    → передаем taskStatus:="Валидировано"
+В работе 3/10
+В работе 6/10
+В РАБОТЕ 6 / 10
 ```
 
-То есть в `Save_CVD` надо не всегда передавать `taskStatus:=""`, а делать ветвление.
+нормализуются к единому виду:
 
-Замени блок синхронизации на такой:
+```text
+В работе 6/10
+```
 
-```vb
-If parentRows.count > 0 Then
+Текущая логика `ensure_latest_status_for_result()` уже делает именно то, что нужно:
 
-    Dim syncResult As String
+* если последний статус такой же — новую строку не создаёт;
+* если статус изменился — выполняет `INSERT`;
+* старую строку не обновляет, кроме повторной валидации или отмены. 
 
-    If Trim$(taskStatus) <> "" Then
-        syncResult = RunStudySync("save", studies:="CVD", taskStatus:=taskStatus)
-    Else
-        syncResult = RunStudySync("save", studies:="CVD")
-    End If
+---
 
-    If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
+# 3. `sync.py`
 
-        Call DeleteEmptyRowsByColumns( _
-            CVDSourceDataTable, _
-            COL_CVD_ROW_ID_DB, _
-            Array(COL_CVD_STEP_DB) _
+Здесь основное изменение.
+
+Сейчас в `_save_parent_and_child()` статус создаётся **сразу после сохранения родителя**, когда `sourceData` ещё даже не прочитана:
+
+```python
+progress(f"Обновляю TaskStatus для {study.code}")
+self._ensure_task_statuses_for_results(...)
+```
+
+Поэтому статус CVD в этом месте рассчитать невозможно. 
+
+Нужно перенести создание статуса ниже — после подготовки и сохранения дочерних строк.
+
+---
+
+## 3.1. Удалить раннее обновление статуса
+
+В функции:
+
+```python
+def _save_parent_and_child(...)
+```
+
+найди блок сразу после:
+
+```python
+parent_save_result = self.repo.save_rows(parent_schema, parent_rows)
+parent_ids = parent_save_result.ids or []
+```
+
+Вот этот блок:
+
+```python
+progress(f"Обновляю TaskStatus для {study.code}")
+self._ensure_task_statuses_for_results(
+    study_code=study.code,
+    result_schema=parent_schema,
+    rows=parent_rows,
+    saved_ids=parent_ids,
+    status=task_status,
+    status_comment=status_comment,
+)
+```
+
+**удали полностью**.
+
+После удаления сразу должно идти:
+
+```python
+progress(f"Записываю parent ID обратно в Excel: {parent_schema.excel_table_name}")
+```
+
+---
+
+## 3.2. Добавить расчёт статусов после сохранения `sourceData`
+
+В той же функции найди:
+
+```python
+progress(f"Сохраняю дочернюю таблицу в БД: {child_schema.db_table}")
+child_save_result = self.repo.save_rows(child_schema, rows_to_save)
+saved_child_ids = child_save_result.ids or []
+```
+
+Сразу после этого добавь:
+
+```python
+status_by_result_id: dict[int, str] | None = None
+
+normalized_task_status = self.task_status._normalize_status(task_status)
+
+if (
+    study.has_progress_status
+    and normalized_task_status == TaskStatusRepository.COMPLETED_STATUS
+):
+    status_by_result_id = self._build_progress_statuses_by_result_id(
+        study=study,
+        child_rows=rows_to_save,
+    )
+
+progress(f"Обновляю TaskStatus для {study.code}")
+self._ensure_task_statuses_for_results(
+    study_code=study.code,
+    result_schema=parent_schema,
+    rows=parent_rows,
+    saved_ids=parent_ids,
+    status=task_status,
+    status_comment=status_comment,
+    status_by_result_id=status_by_result_id,
+)
+```
+
+Почему проверяем:
+
+```python
+normalized_task_status == COMPLETED_STATUS
+```
+
+Потому что обычное сохранение сейчас приходит в Python как `Завершено` по умолчанию. Для ступенчатого исследования мы заменяем этот стандартный статус на вычисленный.
+
+Но при явном вызове:
+
+```text
+Валидировано
+Отменено
+```
+
+статус по `step` вычислять нельзя — используется переданный статус.
+
+---
+
+## 3.3. Добавить новый метод расчёта прогресса
+
+В классе `StudySyncService` удобно добавить его перед:
+
+```python
+def _ensure_task_statuses_for_results(...)
+```
+
+Добавь:
+
+```python
+def _build_progress_statuses_by_result_id(
+        self,
+        *,
+        study: StudySchema,
+        child_rows: list[dict[str, Any]],
+) -> dict[int, str]:
+    """
+    Рассчитывает текущий статус отдельно для каждого результата.
+
+    Для CVD:
+    - наличие step = 11 -> "Завершено";
+    - иначе максимальный step от 1 до 10 ->
+      "В работе N/10".
+
+    Если у результата нет ни одной строки с step,
+    статус для него не возвращается.
+    """
+    if not study.has_progress_status:
+        return {}
+
+    child_schema = study.source_table
+
+    if child_schema is None or child_schema.fk_column is None:
+        raise ValueError(
+            f"{study.code}: для расчёта прогресса "
+            "должна быть указана дочерняя таблица и fk_column"
         )
 
-        Call Load_CVD_results_to_forms( _
-            "by_key", _
-            Array(COL_CVD_RESULT_ID_DB, COL_CVD_ROW_ID_DB) _
+    step_field = study.progress_step_field
+    total_steps = study.progress_total_steps
+    completion_step = study.completion_step
+
+    if (
+        step_field is None
+        or total_steps is None
+        or completion_step is None
+    ):
+        raise ValueError(
+            f"{study.code}: не полностью настроен расчёт прогресса"
         )
 
-        Save_CVD = MACRO_CHANGED
+    max_step_by_result_id: dict[int, int] = {}
 
-    Else
-        MsgBox "Синхронизация CVD не подтверждена как успешная." & vbCrLf & vbCrLf & syncResult, vbExclamation
-    End If
+    for child_row in child_rows:
+        result_id_raw = child_row.get(child_schema.fk_column)
+        step_raw = child_row.get(step_field)
 
-Else
-    Save_CVD = MACRO_NO_CHANGES
-End If
+        if self._is_empty_value(result_id_raw):
+            continue
+
+        if self._is_empty_value(step_raw):
+            continue
+
+        result_id = int(result_id_raw)
+        step = int(str(step_raw).strip())
+
+        previous_step = max_step_by_result_id.get(result_id)
+
+        if previous_step is None or step > previous_step:
+            max_step_by_result_id[result_id] = step
+
+    statuses: dict[int, str] = {}
+
+    for result_id, max_step in max_step_by_result_id.items():
+        if max_step == completion_step:
+            statuses[result_id] = TaskStatusRepository.COMPLETED_STATUS
+        else:
+            statuses[result_id] = (
+                f"{TaskStatusRepository.IN_PROGRESS_PREFIX} "
+                f"{max_step}/{total_steps}"
+            )
+
+    return statuses
 ```
 
-`Validate_CVD` тогда оставляем именно так:
+Ты уточнил, что `step` гарантированно будет только от `1` до `11`, поэтому здесь нет необходимости добавлять сложную фильтрацию неверных значений.
 
-```vb
-Public Function Validate_CVD() As macroResult
+Логика использует максимальное значение:
 
-    Validate_CVD = Save_CVD("Валидировано")
-
-End Function
+```text
+1, 2, 5 → В работе 5/10
+3, 8    → В работе 8/10
+10      → В работе 10/10
+2, 7, 11 → Завершено
 ```
 
-А обычный save/wrap должен вызывать просто:
+Поскольку `11` — максимальное возможное значение, проверка максимального шага полностью эквивалентна проверке наличия строки `step = 11`.
 
-```vb
-Public Function Save_CVD_wrap() As macroResult
+---
 
-    Save_CVD_wrap = Save_CVD()
+## 3.4. Расширить `_ensure_task_statuses_for_results()`
 
-End Function
+Сейчас сигнатура такая:
+
+```python
+def _ensure_task_statuses_for_results(
+        self,
+        *,
+        study_code: str,
+        result_schema: TableSchema,
+        rows: list[dict[str, Any]],
+        saved_ids: list[int],
+        status: str,
+        status_comment: str | None = None,
+) -> int:
 ```
 
-или если через твой `CallMacro`:
+Замени на:
 
-```vb
-CallMacro "Save_CVD", "CVD"
+```python
+def _ensure_task_statuses_for_results(
+        self,
+        *,
+        study_code: str,
+        result_schema: TableSchema,
+        rows: list[dict[str, Any]],
+        saved_ids: list[int],
+        status: str,
+        status_comment: str | None = None,
+        status_by_result_id: dict[int, str] | None = None,
+) -> int:
 ```
 
-Главное: **не надо удалять параметр из `Save_CVD`**. Он нужен как раз для режима валидации:
+Затем внутри цикла найди:
 
-```vb
-Public Function Save_CVD(Optional ByVal taskStatus As String = "") As macroResult
+```python
+for row, result_id in zip(rows, saved_ids):
+    task_id_raw = row.get("TaskId")
+
+    if task_id_raw is None or str(task_id_raw).strip() == "":
+        continue
+
+    taskid = int(task_id_raw)
+
+    was_created = self.task_status.ensure_latest_status_for_result(
+        taskid=taskid,
+        task_type=study_code,
+        status=status,
 ```
 
-Ещё один момент: если внутри `RunStudySync` у тебя даже при отсутствии `taskStatus` всё равно в Python уходит пустой `--task-status ""`, тогда нужно будет поправить уже `RunStudySync`: добавлять аргумент статуса только если `Len(Trim$(taskStatus)) > 0`. Но в самом `Save_CVD` правильная развилка именно такая.
+Перед вызовом `ensure_latest_status_for_result()` добавь определение фактического статуса:
+
+```python
+effective_status = status
+
+if status_by_result_id is not None:
+    effective_status = status_by_result_id.get(int(result_id))
+
+    # Для ступенчатого исследования без дочернего step
+    # TaskStatus пока не создаём.
+    if effective_status is None:
+        continue
+```
+
+И далее в вызове замени:
+
+```python
+status=status,
+```
+
+на:
+
+```python
+status=effective_status,
+```
+
+Также ниже замени:
+
+```python
+date_time=self._get_status_datetime(
+    status=status,
+```
+
+на:
+
+```python
+date_time=self._get_status_datetime(
+    status=effective_status,
+```
+
+Полный изменённый цикл будет выглядеть так:
+
+```python
+for row, result_id in zip(rows, saved_ids):
+    task_id_raw = row.get("TaskId")
+
+    if task_id_raw is None or str(task_id_raw).strip() == "":
+        continue
+
+    taskid = int(task_id_raw)
+
+    effective_status = status
+
+    if status_by_result_id is not None:
+        effective_status = status_by_result_id.get(int(result_id))
+
+        if effective_status is None:
+            continue
+
+    was_created = self.task_status.ensure_latest_status_for_result(
+        taskid=taskid,
+        task_type=study_code,
+        status=effective_status,
+        result_id=int(result_id),
+        date_time=self._get_status_datetime(
+            status=effective_status,
+            result_schema=result_schema,
+            row=row,
+        ),
+        status_comment=status_comment,
+    )
+
+    if was_created:
+        created += 1
+```
+
+Сама функция сейчас проходит по каждой строке результата, берёт `TaskId` и создаёт историю статусов через `TaskStatusRepository`. 
+
+---
+
+# Итоговая последовательность сохранения CVD
+
+После изменений она будет такой:
+
+```text
+1. Прочитать CVD_results.
+2. Сохранить CVD_results.
+3. Получить реальные resultIdCVD.
+4. Заменить временные resultIdCVD в CVD_sourceData.
+5. Прочитать и сохранить CVD_sourceData.
+6. Сгруппировать sourceData по resultIdCVD.
+7. Для каждого результата найти максимальный step.
+8. Рассчитать:
+   step 1–10 → В работе N/10
+   step 11   → Завершено
+9. Добавить новый TaskStatus, если он отличается от последнего.
+10. Записать ID обратно в Excel.
+```
+
+Примеры истории:
+
+```text
+В работе 3/10
+В работе 6/10
+В работе 10/10
+Завершено
+Валидировано
+```
+
+Повторная синхронизация при том же максимальном шаге:
+
+```text
+последний:     В работе 6/10
+рассчитанный:  В работе 6/10
+```
+
+новую строку не создаст.
+
+Переход:
+
+```text
+В работе 6/10 → В работе 8/10
+```
+
+создаст новую строку, не изменяя старую.
+
+## Больше ничего менять не требуется
+
+`refresh_tasks.py` выбирает последнюю запись `TaskStatus` по `statusid` и переносит её текст в колонку статуса, поэтому `В работе 7/10` там уже будет работать без доработок. 
+
+`TaskStatus` в SQLite тоже менять не нужно, поскольку `status` уже хранится как `TEXT`.
