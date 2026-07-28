@@ -1,123 +1,180 @@
-Да, проблема прямо в этом VBA-коде. Python здесь, скорее всего, ни при чём. Окно прогресса реализовано нестабильно сразу по нескольким причинам. 
-
-## Главная причина подвисания
-
-У тебя ожидание Python выглядит так:
+Да. Замени `RunStudySync` целиком на этот вариант. Логика команды, расчёта листов, чтения результата и сообщений не меняется. Добавлена только нормальная работа окна и гарантированная уборка при любой ошибке. 
 
 ```vba
-Do While exec.Status = 0
+Public Function RunStudySync( _
+    ByVal mode As String, _
+    Optional ByVal projectNumber As String = "", _
+    Optional ByVal studies As String = "", _
+    Optional ByVal taskStatus As String = "" _
+) As String
+
+    Dim targetBook As Workbook
+    Dim targetWorkbookPath As String
+
+    Dim shell As Object
+    Dim exec As Object
+
+    Dim cmd As String
+    Dim stdoutText As String
+    Dim stderrText As String
+    Dim progressFile As String
+
+    Dim ws As Worksheet
+
+    On Error GoTo CleanFail
+
+    If ActiveWorkbook Is Nothing Then
+        Err.Raise vbObjectError + 1002, , _
+                  "Нет активной книги с данными"
+    End If
+
+    If ActiveWorkbook.Name = ThisWorkbook.Name Then
+        Err.Raise vbObjectError + 1003, , _
+                  "Активна книга-надстройка, а не книга с данными"
+    End If
+
+    If Len(ActiveWorkbook.Path) = 0 Then
+        Err.Raise vbObjectError + 1004, , _
+                  "Книга с данными должна быть сохранена перед запуском синхронизации"
+    End If
+
+    Set targetBook = ActiveWorkbook
+    targetWorkbookPath = targetBook.FullName
+
+    mode = LCase$(Trim$(mode))
+
+    If mode <> "save" And mode <> "load" Then
+        Err.Raise vbObjectError + 1000, , _
+                  "mode должен быть save или load"
+    End If
+
+    If mode = "load" And Len(Trim$(projectNumber)) = 0 Then
+        Err.Raise vbObjectError + 1001, , _
+                  "Для режима load нужно указать projectNumber"
+    End If
+
+    If Len(Trim$(studies)) = 0 Then
+        studies = "OP AP GC SSF GOR BP REC EMV"
+    End If
+
+    ' Пересчёт только книги с данными.
+    For Each ws In targetBook.Worksheets
+        ws.Calculate
+    Next ws
+
+    cmd = Quote(GetWorkingPythonExe) & " -u " & _
+          Quote(SYNC_SCRIPT) & " " & _
+          "--mode " & mode & " " & _
+          "--workbook " & Quote(targetWorkbookPath) & " " & _
+          "--db " & Quote(DB_PATH) & " " & _
+          "--studies " & studies
+
+    If mode = "load" Then
+        cmd = cmd & " --project " & Quote(projectNumber)
+    End If
+
+    If Len(Trim$(taskStatus)) > 0 Then
+        cmd = cmd & " --status " & Quote(taskStatus)
+    End If
+
+    progressFile = Environ$("TEMP") & _
+                   "\python_progress_" & _
+                   Format$(Now, "yyyymmdd_hhnnss") & "_" & _
+                   CStr(Int(Rnd() * 1000000)) & _
+                   ".log"
+
+    cmd = cmd & " --progress-file " & Quote(progressFile)
+
+    Set shell = CreateObject("WScript.Shell")
+    Set exec = shell.Exec(cmd)
+
+    ' Показываем окно прогресса.
+    frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
+    frmProgress.Show vbModeless
+    frmProgress.Repaint
     DoEvents
 
-    If Timer - lastPoll >= 0.2 Then
-        ...
+    ' Ожидаем Python через общий безопасный цикл.
+    WaitForPythonProcess exec, progressFile
+
+    stdoutText = exec.StdOut.ReadAll
+    stderrText = exec.StdErr.ReadAll
+
+    If exec.ExitCode <> 0 Then
+        MsgBox _
+            "Ошибка выполнения Python-скрипта:" & _
+            vbCrLf & vbCrLf & _
+            stdoutText & vbCrLf & stderrText, _
+            vbCritical
+    Else
+        MsgBox _
+            "Готово:" & _
+            vbCrLf & vbCrLf & _
+            stdoutText, _
+            vbInformation
     End If
-Loop
+
+    RunStudySync = stdoutText
+
+CleanExit:
+    On Error Resume Next
+
+    Application.StatusBar = False
+
+    ' Обязательно закрываем именно существующее окно.
+    Unload frmProgress
+
+    ' Удаляем временный progress-файл.
+    If Len(progressFile) > 0 Then
+        If Len(Dir$(progressFile)) > 0 Then
+            Kill progressFile
+        End If
+    End If
+
+    Set exec = Nothing
+    Set shell = Nothing
+    Set targetBook = Nothing
+
+    On Error GoTo 0
+    Exit Function
+
+CleanFail:
+    Dim errNumber As Long
+    Dim errSource As String
+    Dim errDescription As String
+
+    errNumber = Err.Number
+    errSource = Err.Source
+    errDescription = Err.Description
+
+    On Error Resume Next
+
+    Application.StatusBar = False
+    Unload frmProgress
+
+    If Len(progressFile) > 0 Then
+        If Len(Dir$(progressFile)) > 0 Then
+            Kill progressFile
+        End If
+    End If
+
+    Set exec = Nothing
+    Set shell = Nothing
+    Set targetBook = Nothing
+
+    On Error GoTo 0
+
+    Err.Raise _
+        errNumber, _
+        errSource, _
+        errDescription
+
+End Function
 ```
 
-Этот цикл выполняется **без единой паузы**. Пока Python работает, Excel тысячи раз в секунду вызывает `DoEvents`.
+## `WaitForPythonProcess`
 
-В результате:
-
-* Excel нагружает одно ядро почти на 100%;
-* модельная форма постоянно получает события перерисовки;
-* пользователь может случайно повторно запустить макрос;
-* события Excel и Ribbon могут войти в код повторно;
-* форма начинает мигать, зависать или перестаёт закрываться;
-* состояние формы может рассинхронизироваться с уже завершившимся процессом Python.
-
-`DoEvents` не является задержкой. Он лишь отдаёт управление очереди сообщений Windows, после чего цикл тут же запускается снова.
-
-## Вторая проблема: отсутствует гарантированное закрытие формы
-
-В `RunStudySync` форма закрывается только по нормальному пути:
-
-```vba
-Application.StatusBar = False
-Unload frmProgress
-```
-
-Если после её показа произойдёт любая ошибка, например:
-
-* ошибка чтения progress-файла;
-* ошибка обращения к `exec.Status`;
-* ошибка `StdOut.ReadAll`;
-* ошибка внутри обработчика формы;
-* пользователь закрыл форму крестиком;
-* ошибка перерисовки;
-
-выполнение сразу выйдет из функции, а:
-
-```vba
-Unload frmProgress
-```
-
-не выполнится.
-
-Отсюда как раз симптом:
-
-> Python уже завершился, а окно осталось.
-
-## Третья проблема: модельную форму можно закрывать вручную
-
-На скриншоте у формы есть крестик. Если пользователь нажмёт его во время выполнения, объект `frmProgress` выгрузится, но цикл продолжит обращаться к:
-
-```vba
-frmProgress.lblStatus.Caption
-frmProgress.Repaint
-```
-
-VBA может затем автоматически создать новый скрытый экземпляр default instance формы или получить ошибку. Это часто даёт совершенно непредсказуемое поведение.
-
-## Четвёртая проблема: повторное чтение всего файла
-
-Каждые 0,2 секунды выполняется:
-
-```vba
-progressText = ReadUtf8TextFileSafe(progressFile)
-```
-
-А `ReadUtf8TextFileSafe` каждый раз:
-
-1. создаёт `ADODB.Stream`;
-2. открывает файл;
-3. загружает **весь файл**;
-4. преобразует его из UTF-8;
-5. возвращает весь текст;
-6. закрывает stream.
-
-То есть при росте файла ты постоянно перечитываешь его с начала. Это не главная причина, если лог маленький, но в сочетании с `DoEvents` добавляет лагов.
-
----
-
-# Что исправить
-
-Лучше вынести ожидание Python в одну общую функцию и использовать её и в `RunStudySync`, и в `RefreshTasksFromExternalWorkbook`.
-
-## 1. Добавь объявление `Sleep`
-
-В самое начало модуля, сразу после:
-
-```vba
-Option Explicit
-```
-
-добавь:
-
-```vba
-#If VBA7 Then
-    Private Declare PtrSafe Sub Sleep Lib "kernel32" ( _
-        ByVal dwMilliseconds As LongPtr _
-    )
-#Else
-    Private Declare Sub Sleep Lib "kernel32" ( _
-        ByVal dwMilliseconds As Long _
-    )
-#End If
-```
-
-## 2. Добавь общий метод ожидания процесса
-
-Помести его рядом с `ReadUtf8TextFileSafe`:
+Сверь свой вариант с этим. Если написал иначе, лучше заменить полностью:
 
 ```vba
 Private Sub WaitForPythonProcess( _
@@ -139,21 +196,29 @@ Private Sub WaitForPythonProcess( _
 
     Do While exec.Status = 0
 
-        ' Не даём циклу молотить тысячи раз в секунду.
+        ' Не даём циклу загружать Excel на 100%.
         Sleep LOOP_SLEEP_MS
 
-        ' Обрабатываем сообщения Windows/Excel.
+        ' Даём Excel обработать перерисовку формы.
         DoEvents
 
-        If SecondsElapsed(lastPoll, Timer) >= POLL_INTERVAL_SECONDS Then
+        If SecondsElapsed(lastPoll, Timer) >= _
+           POLL_INTERVAL_SECONDS Then
 
-            progressText = ReadUtf8TextFileSafe(progressFile)
+            progressText = _
+                ReadUtf8TextFileSafe(progressFile)
 
             If Len(progressText) > lastProgressLen Then
-                newChunk = Mid$(progressText, lastProgressLen + 1)
+
+                newChunk = Mid$( _
+                    progressText, _
+                    lastProgressLen + 1 _
+                )
+
                 lastProgressLen = Len(progressText)
 
                 UpdateProgressFromText newChunk
+
             End If
 
             lastPoll = Timer
@@ -162,18 +227,25 @@ Private Sub WaitForPythonProcess( _
 
     Loop
 
-    ' Забираем последнюю порцию после завершения Python.
+    ' Python мог дописать последнюю строку непосредственно
+    ' перед завершением процесса.
     progressText = ReadUtf8TextFileSafe(progressFile)
 
     If Len(progressText) > lastProgressLen Then
-        newChunk = Mid$(progressText, lastProgressLen + 1)
+
+        newChunk = Mid$( _
+            progressText, _
+            lastProgressLen + 1 _
+        )
+
         UpdateProgressFromText newChunk
+
     End If
 
 End Sub
 ```
 
-И рядом добавь защиту от перехода через полночь:
+И `SecondsElapsed`:
 
 ```vba
 Private Function SecondsElapsed( _
@@ -184,83 +256,153 @@ Private Function SecondsElapsed( _
     If currentTimer >= startTimer Then
         SecondsElapsed = currentTimer - startTimer
     Else
-        SecondsElapsed = 86400# - startTimer + currentTimer
+        SecondsElapsed = _
+            86400# - startTimer + currentTimer
     End If
 
 End Function
 ```
 
-Сейчас у тебя используется:
-
-```vba
-If Timer - lastPoll >= 0.2 Then
-```
-
-Если выполнение попадёт на полночь, `Timer` сбросится в ноль и условие долго не будет выполняться. Это редкий, но настоящий баг.
-
 ---
 
-# 3. Перепиши блок ожидания в `RunStudySync`
+# Где ещё находится такая же ошибка
 
-В `RunStudySync` удали весь участок от:
+Точно такой же скопированный цикл с окном есть в:
 
 ```vba
-Dim lastProgressLen As Long
+RefreshTasksFromExternalWorkbook
 ```
 
-до последнего чтения progress-файла:
+Там тоже сейчас вручную написано:
 
 ```vba
-If Len(progressText) > lastProgressLen Then
-    newChunk = Mid$(progressText, lastProgressLen + 1)
-    UpdateProgressFromText newChunk
-End If
+Do While exec.Status = 0
+    DoEvents
+
+    If Timer - lastPoll >= 0.2 Then
+        ...
+    End If
+Loop
 ```
 
-Вместо него оставь:
+Его тоже нужно заменить. Ниже готовая функция целиком.
 
 ```vba
-frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
-frmProgress.Show vbModeless
-frmProgress.Repaint
-DoEvents
+Public Function RefreshTasksFromExternalWorkbook( _
+    ByVal sourceWorkbookPath As String, _
+    ByVal projectNumber As String, _
+    Optional ByVal sourceParentSheet As String = "task", _
+    Optional ByVal sourceParentTable As String = "task", _
+    Optional ByVal sourceChildSheet As String = "task_mix", _
+    Optional ByVal sourceChildTable As String = "task_mix", _
+    Optional ByVal targetParentSheet As String = "Task", _
+    Optional ByVal targetParentTable As String = "Task", _
+    Optional ByVal targetChildSheet As String = "Task_mix", _
+    Optional ByVal targetChildTable As String = "Task_mix" _
+) As String
 
-WaitForPythonProcess exec, progressFile
-```
+    Dim targetBook As Workbook
+    Dim targetWorkbookPath As String
 
----
+    Dim shell As Object
+    Dim exec As Object
 
-# 4. Обязательно добавь обработку ошибок и гарантированную уборку
+    Dim cmd As String
+    Dim stdoutText As String
+    Dim stderrText As String
+    Dim progressFile As String
 
-Сейчас в `RunStudySync` нет `On Error GoTo`, поэтому форма может остаться навсегда.
+    On Error GoTo CleanFail
 
-После объявлений переменных добавь:
+    If ActiveWorkbook Is Nothing Then
+        Err.Raise vbObjectError + 1202, , _
+                  "Нет активной книги с данными"
+    End If
 
-```vba
-On Error GoTo CleanFail
-```
+    If ActiveWorkbook.Name = ThisWorkbook.Name Then
+        Err.Raise vbObjectError + 1203, , _
+                  "Активна книга-надстройка, а не книга с данными"
+    End If
 
-А нижнюю часть функции перепиши по такой схеме:
+    If Len(ActiveWorkbook.Path) = 0 Then
+        Err.Raise vbObjectError + 1204, , _
+                  "Книга с данными должна быть сохранена перед обновлением заданий"
+    End If
 
-```vba
-WaitForPythonProcess exec, progressFile
+    If Len(Trim$(sourceWorkbookPath)) = 0 Then
+        Err.Raise vbObjectError + 1205, , _
+                  "Не указан путь к внешней книге с заданиями"
+    End If
 
-stdoutText = exec.StdOut.ReadAll
-stderrText = exec.StdErr.ReadAll
+    If Dir$(sourceWorkbookPath) = "" Then
+        Err.Raise vbObjectError + 1206, , _
+                  "Внешняя книга с заданиями не найдена: " & _
+                  sourceWorkbookPath
+    End If
 
-If exec.ExitCode <> 0 Then
-    MsgBox _
-        "Ошибка выполнения Python-скрипта:" & _
-        vbCrLf & vbCrLf & _
-        stdoutText & vbCrLf & stderrText, _
-        vbCritical
-Else
-    MsgBox _
-        "Готово:" & vbCrLf & vbCrLf & stdoutText, _
-        vbInformation
-End If
+    If Len(Trim$(projectNumber)) = 0 Then
+        Err.Raise vbObjectError + 1207, , _
+                  "Не указан номер проекта"
+    End If
 
-RunStudySync = stdoutText
+    Set targetBook = ActiveWorkbook
+    targetWorkbookPath = targetBook.FullName
+
+    cmd = Quote(GetWorkingPythonExe) & " -u " & _
+          Quote(REFRESH_TASKS_SCRIPT) & " " & _
+          "--workbook " & Quote(targetWorkbookPath) & " " & _
+          "--db " & Quote(DB_PATH) & " " & _
+          "--source-workbook " & Quote(sourceWorkbookPath) & " " & _
+          "--project " & Quote(projectNumber) & " " & _
+          "--source-parent-sheet " & Quote(sourceParentSheet) & " " & _
+          "--source-parent-table " & Quote(sourceParentTable) & " " & _
+          "--source-child-sheet " & Quote(sourceChildSheet) & " " & _
+          "--source-child-table " & Quote(sourceChildTable) & " " & _
+          "--target-parent-sheet " & Quote(targetParentSheet) & " " & _
+          "--target-parent-table " & Quote(targetParentTable) & " " & _
+          "--target-child-sheet " & Quote(targetChildSheet) & " " & _
+          "--target-child-table " & Quote(targetChildTable)
+
+    Debug.Print cmd
+
+    progressFile = Environ$("TEMP") & _
+                   "\python_progress_" & _
+                   Format$(Now, "yyyymmdd_hhnnss") & "_" & _
+                   CStr(Int(Rnd() * 1000000)) & _
+                   ".log"
+
+    cmd = cmd & " --progress-file " & Quote(progressFile)
+
+    Set shell = CreateObject("WScript.Shell")
+    Set exec = shell.Exec(cmd)
+
+    frmProgress.lblStatus.Caption = _
+        "Запуск Python-скрипта..."
+
+    frmProgress.Show vbModeless
+    frmProgress.Repaint
+    DoEvents
+
+    WaitForPythonProcess exec, progressFile
+
+    stdoutText = exec.StdOut.ReadAll
+    stderrText = exec.StdErr.ReadAll
+
+    If exec.ExitCode <> 0 Then
+        MsgBox _
+            "Ошибка обновления заданий:" & _
+            vbCrLf & vbCrLf & _
+            stdoutText & vbCrLf & stderrText, _
+            vbCritical
+    Else
+        MsgBox _
+            "Задания обновлены:" & _
+            vbCrLf & vbCrLf & _
+            stdoutText, _
+            vbInformation
+    End If
+
+    RefreshTasksFromExternalWorkbook = stdoutText
 
 CleanExit:
     On Error Resume Next
@@ -307,47 +449,28 @@ CleanFail:
 
     On Error GoTo 0
 
-    Err.Raise errNumber, errSource, errDescription
+    Err.Raise _
+        errNumber, _
+        errSource, _
+        errDescription
+
+End Function
 ```
 
-Перед нормальным завершением нужен переход:
+## В модуль формы `frmProgress`
+
+Добавь это именно в код самой формы, не в обычный модуль:
 
 ```vba
-GoTo CleanExit
-```
+Option Explicit
 
-То есть после:
-
-```vba
-RunStudySync = stdoutText
-```
-
-добавь:
-
-```vba
-GoTo CleanExit
-```
-
-Теперь форма будет выгружена:
-
-* при успешном завершении;
-* при ошибке Python;
-* при ошибке VBA;
-* при ошибке чтения файла;
-* при ошибке обработки вывода.
-
----
-
-# 5. Запрети закрытие формы крестиком
-
-В модуле самой формы `frmProgress` добавь:
-
-```vba
 Private Sub UserForm_QueryClose( _
     Cancel As Integer, _
     CloseMode As Integer _
 )
 
+    ' Не разрешаем закрыть форму крестиком,
+    ' пока управляющий код сам её не выгрузит.
     If CloseMode = vbFormControlMenu Then
         Cancel = True
     End If
@@ -355,145 +478,27 @@ Private Sub UserForm_QueryClose( _
 End Sub
 ```
 
-Пользователь больше не сможет закрыть форму крестиком, пока макрос выполняется. Закрывать её будет только код:
+Иначе пользователь может закрыть окно во время цикла, а `UpdateProgressFromText` продолжит обращаться к `frmProgress`. Из-за default instance VBA способен потом создать форму заново, и получится эффект: Python завершён, но окно снова висит.
 
-```vba
-Unload frmProgress
-```
+## Остальные функции
 
-Можно также убрать крестик через WinAPI, но отмены `QueryClose` достаточно.
-
----
-
-# 6. Защити макрос от повторного запуска
-
-Из-за `DoEvents` пользователь способен повторно нажать кнопку Ribbon. Тогда запускаются два Python-процесса и оба используют один Excel.
-
-В верхней части модуля добавь:
-
-```vba
-Private mPythonTaskRunning As Boolean
-```
-
-В начале `RunStudySync`, до запуска Python:
-
-```vba
-If mPythonTaskRunning Then
-    Err.Raise _
-        vbObjectError + 1010, _
-        "RunStudySync", _
-        "Другой Python-скрипт уже выполняется."
-End If
-
-mPythonTaskRunning = True
-```
-
-А в обоих блоках уборки:
-
-```vba
-mPythonTaskRunning = False
-```
-
-Например:
-
-```vba
-CleanExit:
-    On Error Resume Next
-
-    mPythonTaskRunning = False
-    Application.StatusBar = False
-    Unload frmProgress
-```
-
-и аналогично в `CleanFail`.
-
-Это очень важно при модельной форме и `DoEvents`.
-
----
-
-# 7. Те же изменения нужны в `RefreshTasksFromExternalWorkbook`
-
-У тебя там полностью скопирован тот же нестабильный цикл:
-
-```vba
-Do While exec.Status = 0
-    DoEvents
-
-    If Timer - lastPoll >= 0.2 Then
-        ...
-    End If
-Loop
-```
-
-Его тоже замени на:
-
-```vba
-frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
-frmProgress.Show vbModeless
-frmProgress.Repaint
-DoEvents
-
-WaitForPythonProcess exec, progressFile
-```
-
-И обязательно добавь `CleanExit/CleanFail`, как в `RunStudySync`.
-
-Иначе синхронизация будет исправлена, но окно продолжит иногда висеть при обновлении заданий.
-
----
-
-## Ещё две ошибки, которые я заметил в этом же модуле
-
-Они не связаны с зависанием окна, но скоро проявятся с CVD.
-
-### `LoadStudyForms` не содержит CVD
-
-В `DefaultStudies()` CVD уже есть:
-
-```vba
-DefaultStudies = Array( _
-    "OP", "OPOH", "GC", "BP", "AP", "GOR", _
-    "SSF", "REC", "EMV", "JOIN", "CCE", "CVD" _
-)
-```
-
-Но в `LoadStudyForms` отсутствует:
-
-```vba
-Case "CVD"
-```
-
-Следовательно после успешной Python-загрузки код дойдёт до CVD и выдаст:
+В представленном модуле окно `frmProgress` используется только в двух местах:
 
 ```text
-Неизвестный тип исследования: CVD
+RunStudySync
+RefreshTasksFromExternalWorkbook
 ```
 
-Добавь:
+Именно их надо исправить.
 
-```vba
-Case "CVD"
-    Call Load_CVD_results_to_forms(formFillMode)
+Эти процедуры:
+
+```text
+SetTaskStatusOnly
+CreateQualityAct
+CreateOPOHQualityAct
 ```
 
-когда соответствующая процедура будет готова.
+тоже ждут Python через цикл `Do While exec.Status = 0`, но **окно прогресса они не показывают**. Для текущей проблемы их менять не требуется.
 
-### `IsKnownStudyCode` тоже не знает CVD и OPOH
-
-Сейчас:
-
-```vba
-Case "OP", "AP", "GC", "SSF", "GOR", "BP", _
-     "REC", "EMV", "CCE", "JOIN"
-```
-
-Замени на:
-
-```vba
-Case "OP", "OPOH", "AP", "GC", "SSF", "GOR", _
-     "BP", "REC", "EMV", "CCE", "JOIN", "CVD"
-```
-
-Иначе передача явного списка с `CVD` или `OPOH` может быть отклонена ещё до запуска Python. 
-
-После добавления `Sleep 25`, защиты от повторного запуска и гарантированного `Unload` окно перестанет вызывать ложные зависания Excel и всегда будет закрываться вместе с завершением операции.
+`ShowProgress` можно оставить как есть. Сейчас он фактически не используется этим новым ожиданием. `UpdateProgressFromText` и `ReadUtf8TextFileSafe` тоже оставляй без изменений.
