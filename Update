@@ -1,100 +1,131 @@
-Да, это из-за `cmd.exe`: при перенаправлении `1>file 2>file` Python пишет в консольной кодировке, а ты читаешь файл как UTF-8.
+Тут пока нельзя уверенно сказать, где именно пропадает строка: Python действительно нашёл запись и `replace_table_rows()` вернул `1`, но это число означает только количество строк в `db_rows`, а не проверку, что данные потом остались в таблице. Сам Python сначала записывает `GOR_results`, затем `GOR_sourceData`, а уже после завершения Python VBA запускает `Load_GOR_results_to_forms`. 
 
-Самое простое исправление — принудительно задать UTF-8 для Python-процесса.
+Надо за один запуск определить: **строка уже пустая сразу после Python или её портит VBA при переносе в форму**.
 
-В `RunStudySync` найди формирование `execCmd`:
+## Добавь временную диагностику в `LoadResearchesFromDB`
 
-```vba
-execCmd = _
-    Quote(Environ$("ComSpec")) & _
-    " /d /s /c " & _
-    Quote( _
-        pythonCmd & _
-        " 1>" & Quote(stdoutFile) & _
-        " 2>" & Quote(stderrFile) _
-    )
-```
-
-Замени на:
+Найди:
 
 ```vba
-execCmd = _
-    Quote(Environ$("ComSpec")) & _
-    " /d /s /c " & _
-    Quote( _
-        "set PYTHONUTF8=1&&" & _
-        "set PYTHONIOENCODING=utf-8&&" & _
-        pythonCmd & _
-        " 1>" & Quote(stdoutFile) & _
-        " 2>" & Quote(stderrFile) _
-    )
+syncResult = RunStudySync( _
+    mode:="load", _
+    projectNumber:=project, _
+    studies:=studiesText _
+)
+
+If InStr(1, syncResult, """ok"": true", vbTextCompare) = 0 Then
 ```
 
-То есть перед запуском Python задаются:
+Между ними временно вставь:
+
+```vba
+Dim gorResultTable As ListObject
+Dim gorSourceTable As ListObject
+
+Set gorResultTable = wb.Worksheets("GOR_results").ListObjects("GOR_results")
+Set gorSourceTable = wb.Worksheets("GOR_sourceData").ListObjects("GOR_sourceData")
+
+Debug.Print "=== СРАЗУ ПОСЛЕ PYTHON ==="
+Debug.Print "GOR_results ListRows:", gorResultTable.ListRows.Count
+Debug.Print "GOR_sourceData ListRows:", gorSourceTable.ListRows.Count
+
+If Not gorResultTable.DataBodyRange Is Nothing Then
+    Debug.Print "GOR resultId:", _
+        gorResultTable.ListColumns("resultIdGOR").DataBodyRange.Cells(1, 1).Value
+
+    Debug.Print "GOR sampleCode:", _
+        gorResultTable.ListColumns("sampleCode").DataBodyRange.Cells(1, 1).Value
+
+    Debug.Print "GOR analyseNumber:", _
+        gorResultTable.ListColumns("analyseNumber").DataBodyRange.Cells(1, 1).Value
+End If
+```
+
+Затем сразу после цикла:
+
+```vba
+For i = LBound(studiesArr) To UBound(studiesArr)
+    studyCode = UCase$(Trim$(CStr(studiesArr(i))))
+    LoadStudyForms wb, studyCode, formFillMode
+Next i
+```
+
+добавь:
+
+```vba
+Debug.Print "=== ПОСЛЕ ЗАГРУЗКИ В ФОРМЫ ==="
+Debug.Print "GOR_results ListRows:", gorResultTable.ListRows.Count
+
+If Not gorResultTable.DataBodyRange Is Nothing Then
+    Debug.Print "GOR resultId:", _
+        gorResultTable.ListColumns("resultIdGOR").DataBodyRange.Cells(1, 1).Value
+
+    Debug.Print "GOR sampleCode:", _
+        gorResultTable.ListColumns("sampleCode").DataBodyRange.Cells(1, 1).Value
+End If
+```
+
+## Как читать результат
+
+### Вариант 1: сразу после Python значения есть
+
+Например:
 
 ```text
-PYTHONUTF8=1
-PYTHONIOENCODING=utf-8
+GOR_results ListRows: 1
+GOR resultId: 123
+GOR sampleCode: 26-F083-...
 ```
 
-После этого твой существующий метод:
+а после `LoadStudyForms` они исчезли.
+
+Тогда виноват точно VBA-код переноса в формы или какая-то процедура, которая срабатывает при заполнении именованных диапазонов. Сама `Load_GOR_results_to_forms()` напрямую `GOR_results` не очищает: она читает строку, копирует её в именованные диапазоны и затем заполняет таблицу проб. 
+
+В таком случае наиболее вероятно, что при записи в форму срабатывает `Worksheet_Change` или другая событийная процедура, которая вызывает очистку/пересборку промежуточной таблицы.
+
+### Вариант 2: сразу после Python `ListRows = 1`, но поля пустые
+
+Тогда проблема в Python-записи. `rows_written = 1` сейчас возвращается даже если сформированная Excel-матрица оказалась пустой: метод просто возвращает `row_count` после `body.Value = matrix`. 
+
+Но с текущей схемой это маловероятно: `GOR_RESULTS` содержит правильные `resultIdGOR`, `sampleCode`, `analyseNumber` и остальные имена. 
+
+### Вариант 3: данные есть, но визуально таблица пустая
+
+Проверь фильтр. После загрузки выполни:
 
 ```vba
-stdoutText = ReadUtf8TextFileSafe(stdoutFile)
-stderrText = ReadUtf8TextFileSafe(stderrFile)
+With wb.Worksheets("GOR_results")
+    If .FilterMode Then
+        .ShowAllData
+    End If
+End With
 ```
 
-будет читать файлы правильно.
-
-Лучше ещё добавить пробелы вокруг `&&`, чтобы команда была понятнее:
+И аналогично:
 
 ```vba
-execCmd = _
-    Quote(Environ$("ComSpec")) & _
-    " /d /s /c " & _
-    Quote( _
-        "set PYTHONUTF8=1 && " & _
-        "set PYTHONIOENCODING=utf-8 && " & _
-        pythonCmd & _
-        " 1>" & Quote(stdoutFile) & _
-        " 2>" & Quote(stderrFile) _
-    )
+gorResultTable.Range.EntireRow.Hidden = False
 ```
 
-Но у `set` есть неприятная особенность: при записи с пробелом перед `&&` этот пробел может попасть в значение переменной. Поэтому безопаснее использовать форму:
+Иногда строка реально заполнена, но остался фильтр от предыдущего проекта.
+
+## Ещё одна важная проверка
+
+Запусти загрузку только GOR:
 
 ```vba
-execCmd = _
-    Quote(Environ$("ComSpec")) & _
-    " /d /s /c " & _
-    Quote( _
-        "set ""PYTHONUTF8=1"" && " & _
-        "set ""PYTHONIOENCODING=utf-8"" && " & _
-        pythonCmd & _
-        " 1>" & Quote(stdoutFile) & _
-        " 2>" & Quote(stderrFile) _
-    )
+LoadResearchesFromDB Array("GOR")
 ```
 
-Именно этот вариант рекомендую:
+Если при загрузке только GOR всё нормально, а при «загрузить все» строка исчезает, значит её очищает **какой-то следующий `Load_*_results_to_forms`**, либо срабатывает общее событие при заполнении других форм.
 
-```vba
-execCmd = _
-    Quote(Environ$("ComSpec")) & _
-    " /d /s /c " & _
-    Quote( _
-        "set ""PYTHONUTF8=1"" && " & _
-        "set ""PYTHONIOENCODING=utf-8"" && " & _
-        pythonCmd & _
-        " 1>" & Quote(stdoutFile) & _
-        " 2>" & Quote(stderrFile) _
-    )
+Если и при загрузке только GOR `GOR_results` сразу пустая, проблема уже локальна в GOR/Python.
+
+Покажи строки из Immediate Window для двух точек:
+
+```text
+=== СРАЗУ ПОСЛЕ PYTHON ===
+=== ПОСЛЕ ЗАГРУЗКИ В ФОРМЫ ===
 ```
 
-Больше ничего менять не нужно. Progress-файл у тебя Python и так пишет через:
-
-```python
-open(..., encoding="utf-8")
-```
-
-поэтому окно прогресса показывало кириллицу нормально. Слетела только кодировка перенаправленных `stdout` и `stderr`.
+По ним место ошибки определится однозначно.
