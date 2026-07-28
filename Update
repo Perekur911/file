@@ -1,4 +1,37 @@
-Да. Замени `RunStudySync` целиком на этот вариант. Логика команды, расчёта листов, чтения результата и сообщений не меняется. Добавлена только нормальная работа окна и гарантированная уборка при любой ошибке. 
+Вот теперь причина почти точно найдена. **Зависает не окно и не `TaskStatus` — возникает блокировка канала `StdOut`.**
+
+У тебя сейчас порядок такой:
+
+```vba
+Do While exec.Status = 0
+    ...
+Loop
+
+stdoutText = exec.StdOut.ReadAll
+stderrText = exec.StdErr.ReadAll
+```
+
+То есть VBA **не читает вывод Python, пока Python не завершится**. При загрузке всех исследований Python формирует большой итоговый JSON. Буфер `StdOut` заполняется, после чего:
+
+1. Python пытается дописать JSON в `stdout`;
+2. заполненный канал больше не принимает данные;
+3. Python ждёт, пока VBA прочитает канал;
+4. VBA ждёт, пока `exec.Status` перестанет быть `0`;
+5. оба процесса ждут друг друга бесконечно.
+
+Последняя запись в отдельном progress-файле остаётся:
+
+```text
+TaskStatus выгружена...
+```
+
+потому что после неё Python начинает печатать итоговый JSON и блокируется. При сохранении отчёт меньше, поэтому буфер обычно не успевает заполниться. Именно поэтому сохранение работает, а большая загрузка висит. В текущем VBA `StdOut.ReadAll` и `StdErr.ReadAll` действительно вызываются только после завершения цикла ожидания. 
+
+Самое надёжное решение — **не использовать каналы `StdOut/StdErr` для больших результатов**, а перенаправить их во временные файлы. Окно прогресса продолжит читать свой progress-файл как сейчас.
+
+# Перепиши `RunStudySync`
+
+Замени функцию целиком на эту:
 
 ```vba
 Public Function RunStudySync( _
@@ -14,10 +47,16 @@ Public Function RunStudySync( _
     Dim shell As Object
     Dim exec As Object
 
-    Dim cmd As String
+    Dim pythonCmd As String
+    Dim execCmd As String
+
     Dim stdoutText As String
     Dim stderrText As String
+
     Dim progressFile As String
+    Dim stdoutFile As String
+    Dim stderrFile As String
+    Dim tempSuffix As String
 
     Dim ws As Worksheet
 
@@ -62,43 +101,76 @@ Public Function RunStudySync( _
         ws.Calculate
     Next ws
 
-    cmd = Quote(GetWorkingPythonExe) & " -u " & _
-          Quote(SYNC_SCRIPT) & " " & _
-          "--mode " & mode & " " & _
-          "--workbook " & Quote(targetWorkbookPath) & " " & _
-          "--db " & Quote(DB_PATH) & " " & _
-          "--studies " & studies
+    ' Общий уникальный суффикс для временных файлов.
+    tempSuffix = _
+        Format$(Now, "yyyymmdd_hhnnss") & "_" & _
+        CStr(Int(Rnd() * 1000000))
+
+    progressFile = _
+        Environ$("TEMP") & _
+        "\python_progress_" & tempSuffix & ".log"
+
+    stdoutFile = _
+        Environ$("TEMP") & _
+        "\python_stdout_" & tempSuffix & ".log"
+
+    stderrFile = _
+        Environ$("TEMP") & _
+        "\python_stderr_" & tempSuffix & ".log"
+
+    pythonCmd = _
+        Quote(GetWorkingPythonExe) & " -u " & _
+        Quote(SYNC_SCRIPT) & " " & _
+        "--mode " & mode & " " & _
+        "--workbook " & Quote(targetWorkbookPath) & " " & _
+        "--db " & Quote(DB_PATH) & " " & _
+        "--studies " & studies
 
     If mode = "load" Then
-        cmd = cmd & " --project " & Quote(projectNumber)
+        pythonCmd = _
+            pythonCmd & _
+            " --project " & Quote(projectNumber)
     End If
 
     If Len(Trim$(taskStatus)) > 0 Then
-        cmd = cmd & " --status " & Quote(taskStatus)
+        pythonCmd = _
+            pythonCmd & _
+            " --status " & Quote(taskStatus)
     End If
 
-    progressFile = Environ$("TEMP") & _
-                   "\python_progress_" & _
-                   Format$(Now, "yyyymmdd_hhnnss") & "_" & _
-                   CStr(Int(Rnd() * 1000000)) & _
-                   ".log"
+    pythonCmd = _
+        pythonCmd & _
+        " --progress-file " & Quote(progressFile)
 
-    cmd = cmd & " --progress-file " & Quote(progressFile)
+    ' StdOut и StdErr направляем в файлы.
+    ' Иначе большой JSON может заполнить канал WScript.Exec
+    ' и вызвать взаимную блокировку Python и VBA.
+    execCmd = _
+        Quote(Environ$("ComSpec")) & _
+        " /d /s /c " & _
+        Quote( _
+            pythonCmd & _
+            " 1>" & Quote(stdoutFile) & _
+            " 2>" & Quote(stderrFile) _
+        )
+
+    Debug.Print execCmd
 
     Set shell = CreateObject("WScript.Shell")
-    Set exec = shell.Exec(cmd)
+    Set exec = shell.Exec(execCmd)
 
-    ' Показываем окно прогресса.
-    frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
+    frmProgress.lblStatus.Caption = _
+        "Запуск Python-скрипта..."
+
     frmProgress.Show vbModeless
     frmProgress.Repaint
     DoEvents
 
-    ' Ожидаем Python через общий безопасный цикл.
     WaitForPythonProcess exec, progressFile
 
-    stdoutText = exec.StdOut.ReadAll
-    stderrText = exec.StdErr.ReadAll
+    ' После завершения читаем вывод из файлов.
+    stdoutText = ReadUtf8TextFileSafe(stdoutFile)
+    stderrText = ReadUtf8TextFileSafe(stderrFile)
 
     If exec.ExitCode <> 0 Then
         MsgBox _
@@ -120,16 +192,11 @@ CleanExit:
     On Error Resume Next
 
     Application.StatusBar = False
-
-    ' Обязательно закрываем именно существующее окно.
     Unload frmProgress
 
-    ' Удаляем временный progress-файл.
-    If Len(progressFile) > 0 Then
-        If Len(Dir$(progressFile)) > 0 Then
-            Kill progressFile
-        End If
-    End If
+    DeleteFileIfExists progressFile
+    DeleteFileIfExists stdoutFile
+    DeleteFileIfExists stderrFile
 
     Set exec = Nothing
     Set shell = Nothing
@@ -152,11 +219,9 @@ CleanFail:
     Application.StatusBar = False
     Unload frmProgress
 
-    If Len(progressFile) > 0 Then
-        If Len(Dir$(progressFile)) > 0 Then
-            Kill progressFile
-        End If
-    End If
+    DeleteFileIfExists progressFile
+    DeleteFileIfExists stdoutFile
+    DeleteFileIfExists stderrFile
 
     Set exec = Nothing
     Set shell = Nothing
@@ -172,333 +237,85 @@ CleanFail:
 End Function
 ```
 
-## `WaitForPythonProcess`
+# Добавь helper удаления временных файлов
 
-Сверь свой вариант с этим. Если написал иначе, лучше заменить полностью:
+В этот же обычный модуль добавь:
 
 ```vba
-Private Sub WaitForPythonProcess( _
-    ByVal exec As Object, _
-    ByVal progressFile As String _
-)
+Private Sub DeleteFileIfExists(ByVal filePath As String)
 
-    Const POLL_INTERVAL_SECONDS As Double = 0.2
-    Const LOOP_SLEEP_MS As Long = 25
+    If Len(filePath) = 0 Then Exit Sub
 
-    Dim lastProgressLen As Long
-    Dim lastPoll As Double
+    On Error Resume Next
 
-    Dim progressText As String
-    Dim newChunk As String
-
-    lastProgressLen = 0
-    lastPoll = Timer
-
-    Do While exec.Status = 0
-
-        ' Не даём циклу загружать Excel на 100%.
-        Sleep LOOP_SLEEP_MS
-
-        ' Даём Excel обработать перерисовку формы.
-        DoEvents
-
-        If SecondsElapsed(lastPoll, Timer) >= _
-           POLL_INTERVAL_SECONDS Then
-
-            progressText = _
-                ReadUtf8TextFileSafe(progressFile)
-
-            If Len(progressText) > lastProgressLen Then
-
-                newChunk = Mid$( _
-                    progressText, _
-                    lastProgressLen + 1 _
-                )
-
-                lastProgressLen = Len(progressText)
-
-                UpdateProgressFromText newChunk
-
-            End If
-
-            lastPoll = Timer
-
-        End If
-
-    Loop
-
-    ' Python мог дописать последнюю строку непосредственно
-    ' перед завершением процесса.
-    progressText = ReadUtf8TextFileSafe(progressFile)
-
-    If Len(progressText) > lastProgressLen Then
-
-        newChunk = Mid$( _
-            progressText, _
-            lastProgressLen + 1 _
-        )
-
-        UpdateProgressFromText newChunk
-
+    If Len(Dir$(filePath)) > 0 Then
+        Kill filePath
     End If
+
+    On Error GoTo 0
 
 End Sub
 ```
 
-И `SecondsElapsed`:
+# Важное изменение
+
+Теперь в `RunStudySync` больше не должно быть:
 
 ```vba
-Private Function SecondsElapsed( _
-    ByVal startTimer As Double, _
-    ByVal currentTimer As Double _
-) As Double
-
-    If currentTimer >= startTimer Then
-        SecondsElapsed = currentTimer - startTimer
-    Else
-        SecondsElapsed = _
-            86400# - startTimer + currentTimer
-    End If
-
-End Function
+stdoutText = exec.StdOut.ReadAll
+stderrText = exec.StdErr.ReadAll
 ```
 
----
-
-# Где ещё находится такая же ошибка
-
-Точно такой же скопированный цикл с окном есть в:
+Вообще. Вывод читается только так:
 
 ```vba
-RefreshTasksFromExternalWorkbook
+stdoutText = ReadUtf8TextFileSafe(stdoutFile)
+stderrText = ReadUtf8TextFileSafe(stderrFile)
 ```
 
-Там тоже сейчас вручную написано:
+Именно это убирает взаимную блокировку.
+
+# `WaitForPythonProcess` оставь как есть
+
+Твой новый вариант с:
 
 ```vba
-Do While exec.Status = 0
-    DoEvents
-
-    If Timer - lastPoll >= 0.2 Then
-        ...
-    End If
-Loop
+Sleep 25
+DoEvents
 ```
 
-Его тоже нужно заменить. Ниже готовая функция целиком.
+нужен и остаётся. Он отвечает за нормальную работу интерфейса. Но сам по себе он не мог устранить заполнение `StdOut`.
 
-```vba
-Public Function RefreshTasksFromExternalWorkbook( _
-    ByVal sourceWorkbookPath As String, _
-    ByVal projectNumber As String, _
-    Optional ByVal sourceParentSheet As String = "task", _
-    Optional ByVal sourceParentTable As String = "task", _
-    Optional ByVal sourceChildSheet As String = "task_mix", _
-    Optional ByVal sourceChildTable As String = "task_mix", _
-    Optional ByVal targetParentSheet As String = "Task", _
-    Optional ByVal targetParentTable As String = "Task", _
-    Optional ByVal targetChildSheet As String = "Task_mix", _
-    Optional ByVal targetChildTable As String = "Task_mix" _
-) As String
-
-    Dim targetBook As Workbook
-    Dim targetWorkbookPath As String
-
-    Dim shell As Object
-    Dim exec As Object
-
-    Dim cmd As String
-    Dim stdoutText As String
-    Dim stderrText As String
-    Dim progressFile As String
-
-    On Error GoTo CleanFail
-
-    If ActiveWorkbook Is Nothing Then
-        Err.Raise vbObjectError + 1202, , _
-                  "Нет активной книги с данными"
-    End If
-
-    If ActiveWorkbook.Name = ThisWorkbook.Name Then
-        Err.Raise vbObjectError + 1203, , _
-                  "Активна книга-надстройка, а не книга с данными"
-    End If
-
-    If Len(ActiveWorkbook.Path) = 0 Then
-        Err.Raise vbObjectError + 1204, , _
-                  "Книга с данными должна быть сохранена перед обновлением заданий"
-    End If
-
-    If Len(Trim$(sourceWorkbookPath)) = 0 Then
-        Err.Raise vbObjectError + 1205, , _
-                  "Не указан путь к внешней книге с заданиями"
-    End If
-
-    If Dir$(sourceWorkbookPath) = "" Then
-        Err.Raise vbObjectError + 1206, , _
-                  "Внешняя книга с заданиями не найдена: " & _
-                  sourceWorkbookPath
-    End If
-
-    If Len(Trim$(projectNumber)) = 0 Then
-        Err.Raise vbObjectError + 1207, , _
-                  "Не указан номер проекта"
-    End If
-
-    Set targetBook = ActiveWorkbook
-    targetWorkbookPath = targetBook.FullName
-
-    cmd = Quote(GetWorkingPythonExe) & " -u " & _
-          Quote(REFRESH_TASKS_SCRIPT) & " " & _
-          "--workbook " & Quote(targetWorkbookPath) & " " & _
-          "--db " & Quote(DB_PATH) & " " & _
-          "--source-workbook " & Quote(sourceWorkbookPath) & " " & _
-          "--project " & Quote(projectNumber) & " " & _
-          "--source-parent-sheet " & Quote(sourceParentSheet) & " " & _
-          "--source-parent-table " & Quote(sourceParentTable) & " " & _
-          "--source-child-sheet " & Quote(sourceChildSheet) & " " & _
-          "--source-child-table " & Quote(sourceChildTable) & " " & _
-          "--target-parent-sheet " & Quote(targetParentSheet) & " " & _
-          "--target-parent-table " & Quote(targetParentTable) & " " & _
-          "--target-child-sheet " & Quote(targetChildSheet) & " " & _
-          "--target-child-table " & Quote(targetChildTable)
-
-    Debug.Print cmd
-
-    progressFile = Environ$("TEMP") & _
-                   "\python_progress_" & _
-                   Format$(Now, "yyyymmdd_hhnnss") & "_" & _
-                   CStr(Int(Rnd() * 1000000)) & _
-                   ".log"
-
-    cmd = cmd & " --progress-file " & Quote(progressFile)
-
-    Set shell = CreateObject("WScript.Shell")
-    Set exec = shell.Exec(cmd)
-
-    frmProgress.lblStatus.Caption = _
-        "Запуск Python-скрипта..."
-
-    frmProgress.Show vbModeless
-    frmProgress.Repaint
-    DoEvents
-
-    WaitForPythonProcess exec, progressFile
-
-    stdoutText = exec.StdOut.ReadAll
-    stderrText = exec.StdErr.ReadAll
-
-    If exec.ExitCode <> 0 Then
-        MsgBox _
-            "Ошибка обновления заданий:" & _
-            vbCrLf & vbCrLf & _
-            stdoutText & vbCrLf & stderrText, _
-            vbCritical
-    Else
-        MsgBox _
-            "Задания обновлены:" & _
-            vbCrLf & vbCrLf & _
-            stdoutText, _
-            vbInformation
-    End If
-
-    RefreshTasksFromExternalWorkbook = stdoutText
-
-CleanExit:
-    On Error Resume Next
-
-    Application.StatusBar = False
-    Unload frmProgress
-
-    If Len(progressFile) > 0 Then
-        If Len(Dir$(progressFile)) > 0 Then
-            Kill progressFile
-        End If
-    End If
-
-    Set exec = Nothing
-    Set shell = Nothing
-    Set targetBook = Nothing
-
-    On Error GoTo 0
-    Exit Function
-
-CleanFail:
-    Dim errNumber As Long
-    Dim errSource As String
-    Dim errDescription As String
-
-    errNumber = Err.Number
-    errSource = Err.Source
-    errDescription = Err.Description
-
-    On Error Resume Next
-
-    Application.StatusBar = False
-    Unload frmProgress
-
-    If Len(progressFile) > 0 Then
-        If Len(Dir$(progressFile)) > 0 Then
-            Kill progressFile
-        End If
-    End If
-
-    Set exec = Nothing
-    Set shell = Nothing
-    Set targetBook = Nothing
-
-    On Error GoTo 0
-
-    Err.Raise _
-        errNumber, _
-        errSource, _
-        errDescription
-
-End Function
-```
-
-## В модуль формы `frmProgress`
-
-Добавь это именно в код самой формы, не в обычный модуль:
-
-```vba
-Option Explicit
-
-Private Sub UserForm_QueryClose( _
-    Cancel As Integer, _
-    CloseMode As Integer _
-)
-
-    ' Не разрешаем закрыть форму крестиком,
-    ' пока управляющий код сам её не выгрузит.
-    If CloseMode = vbFormControlMenu Then
-        Cancel = True
-    End If
-
-End Sub
-```
-
-Иначе пользователь может закрыть окно во время цикла, а `UpdateProgressFromText` продолжит обращаться к `frmProgress`. Из-за default instance VBA способен потом создать форму заново, и получится эффект: Python завершён, но окно снова висит.
-
-## Остальные функции
-
-В представленном модуле окно `frmProgress` используется только в двух местах:
+Теперь механизмы разделены:
 
 ```text
-RunStudySync
-RefreshTasksFromExternalWorkbook
+progressFile
+    → короткие сообщения для окна
+
+stdoutFile
+    → большой итоговый JSON
+
+stderrFile
+    → ошибки Python
 ```
 
-Именно их надо исправить.
+# Где ещё сделать такое же изменение
 
-Эти процедуры:
+В `RefreshTasksFromExternalWorkbook` проблема теоретически такая же, но там итоговый JSON обычно намного меньше. Тем не менее лучше позже перенаправить `stdout/stderr` туда аналогичным способом.
+
+Для текущего вечного зависания при `load` достаточно сначала заменить именно `RunStudySync`.
+
+После изменения последовательность будет такой:
 
 ```text
-SetTaskStatusOnly
-CreateQualityAct
-CreateOPOHQualityAct
+TaskStatus выгружена...
+Python пишет большой JSON в файл
+Python свободно завершается
+exec.Status становится 1
+VBA выходит из ожидания
+читает JSON из файла
+закрывает frmProgress
+продолжает LoadStudyForms
 ```
 
-тоже ждут Python через цикл `Do While exec.Status = 0`, но **окно прогресса они не показывают**. Для текущей проблемы их менять не требуется.
-
-`ShowProgress` можно оставить как есть. Сейчас он фактически не используется этим новым ожиданием. `UpdateProgressFromText` и `ReadUtf8TextFileSafe` тоже оставляй без изменений.
+Это очень точно объясняет, почему зависание всегда происходило на последнем сообщении и чаще именно при загрузке всех исследований.
