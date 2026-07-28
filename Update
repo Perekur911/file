@@ -1,321 +1,100 @@
-Вот теперь причина почти точно найдена. **Зависает не окно и не `TaskStatus` — возникает блокировка канала `StdOut`.**
+Да, это из-за `cmd.exe`: при перенаправлении `1>file 2>file` Python пишет в консольной кодировке, а ты читаешь файл как UTF-8.
 
-У тебя сейчас порядок такой:
+Самое простое исправление — принудительно задать UTF-8 для Python-процесса.
+
+В `RunStudySync` найди формирование `execCmd`:
 
 ```vba
-Do While exec.Status = 0
-    ...
-Loop
-
-stdoutText = exec.StdOut.ReadAll
-stderrText = exec.StdErr.ReadAll
+execCmd = _
+    Quote(Environ$("ComSpec")) & _
+    " /d /s /c " & _
+    Quote( _
+        pythonCmd & _
+        " 1>" & Quote(stdoutFile) & _
+        " 2>" & Quote(stderrFile) _
+    )
 ```
 
-То есть VBA **не читает вывод Python, пока Python не завершится**. При загрузке всех исследований Python формирует большой итоговый JSON. Буфер `StdOut` заполняется, после чего:
+Замени на:
 
-1. Python пытается дописать JSON в `stdout`;
-2. заполненный канал больше не принимает данные;
-3. Python ждёт, пока VBA прочитает канал;
-4. VBA ждёт, пока `exec.Status` перестанет быть `0`;
-5. оба процесса ждут друг друга бесконечно.
+```vba
+execCmd = _
+    Quote(Environ$("ComSpec")) & _
+    " /d /s /c " & _
+    Quote( _
+        "set PYTHONUTF8=1&&" & _
+        "set PYTHONIOENCODING=utf-8&&" & _
+        pythonCmd & _
+        " 1>" & Quote(stdoutFile) & _
+        " 2>" & Quote(stderrFile) _
+    )
+```
 
-Последняя запись в отдельном progress-файле остаётся:
+То есть перед запуском Python задаются:
 
 ```text
-TaskStatus выгружена...
+PYTHONUTF8=1
+PYTHONIOENCODING=utf-8
 ```
 
-потому что после неё Python начинает печатать итоговый JSON и блокируется. При сохранении отчёт меньше, поэтому буфер обычно не успевает заполниться. Именно поэтому сохранение работает, а большая загрузка висит. В текущем VBA `StdOut.ReadAll` и `StdErr.ReadAll` действительно вызываются только после завершения цикла ожидания. 
-
-Самое надёжное решение — **не использовать каналы `StdOut/StdErr` для больших результатов**, а перенаправить их во временные файлы. Окно прогресса продолжит читать свой progress-файл как сейчас.
-
-# Перепиши `RunStudySync`
-
-Замени функцию целиком на эту:
-
-```vba
-Public Function RunStudySync( _
-    ByVal mode As String, _
-    Optional ByVal projectNumber As String = "", _
-    Optional ByVal studies As String = "", _
-    Optional ByVal taskStatus As String = "" _
-) As String
-
-    Dim targetBook As Workbook
-    Dim targetWorkbookPath As String
-
-    Dim shell As Object
-    Dim exec As Object
-
-    Dim pythonCmd As String
-    Dim execCmd As String
-
-    Dim stdoutText As String
-    Dim stderrText As String
-
-    Dim progressFile As String
-    Dim stdoutFile As String
-    Dim stderrFile As String
-    Dim tempSuffix As String
-
-    Dim ws As Worksheet
-
-    On Error GoTo CleanFail
-
-    If ActiveWorkbook Is Nothing Then
-        Err.Raise vbObjectError + 1002, , _
-                  "Нет активной книги с данными"
-    End If
-
-    If ActiveWorkbook.Name = ThisWorkbook.Name Then
-        Err.Raise vbObjectError + 1003, , _
-                  "Активна книга-надстройка, а не книга с данными"
-    End If
-
-    If Len(ActiveWorkbook.Path) = 0 Then
-        Err.Raise vbObjectError + 1004, , _
-                  "Книга с данными должна быть сохранена перед запуском синхронизации"
-    End If
-
-    Set targetBook = ActiveWorkbook
-    targetWorkbookPath = targetBook.FullName
-
-    mode = LCase$(Trim$(mode))
-
-    If mode <> "save" And mode <> "load" Then
-        Err.Raise vbObjectError + 1000, , _
-                  "mode должен быть save или load"
-    End If
-
-    If mode = "load" And Len(Trim$(projectNumber)) = 0 Then
-        Err.Raise vbObjectError + 1001, , _
-                  "Для режима load нужно указать projectNumber"
-    End If
-
-    If Len(Trim$(studies)) = 0 Then
-        studies = "OP AP GC SSF GOR BP REC EMV"
-    End If
-
-    ' Пересчёт только книги с данными.
-    For Each ws In targetBook.Worksheets
-        ws.Calculate
-    Next ws
-
-    ' Общий уникальный суффикс для временных файлов.
-    tempSuffix = _
-        Format$(Now, "yyyymmdd_hhnnss") & "_" & _
-        CStr(Int(Rnd() * 1000000))
-
-    progressFile = _
-        Environ$("TEMP") & _
-        "\python_progress_" & tempSuffix & ".log"
-
-    stdoutFile = _
-        Environ$("TEMP") & _
-        "\python_stdout_" & tempSuffix & ".log"
-
-    stderrFile = _
-        Environ$("TEMP") & _
-        "\python_stderr_" & tempSuffix & ".log"
-
-    pythonCmd = _
-        Quote(GetWorkingPythonExe) & " -u " & _
-        Quote(SYNC_SCRIPT) & " " & _
-        "--mode " & mode & " " & _
-        "--workbook " & Quote(targetWorkbookPath) & " " & _
-        "--db " & Quote(DB_PATH) & " " & _
-        "--studies " & studies
-
-    If mode = "load" Then
-        pythonCmd = _
-            pythonCmd & _
-            " --project " & Quote(projectNumber)
-    End If
-
-    If Len(Trim$(taskStatus)) > 0 Then
-        pythonCmd = _
-            pythonCmd & _
-            " --status " & Quote(taskStatus)
-    End If
-
-    pythonCmd = _
-        pythonCmd & _
-        " --progress-file " & Quote(progressFile)
-
-    ' StdOut и StdErr направляем в файлы.
-    ' Иначе большой JSON может заполнить канал WScript.Exec
-    ' и вызвать взаимную блокировку Python и VBA.
-    execCmd = _
-        Quote(Environ$("ComSpec")) & _
-        " /d /s /c " & _
-        Quote( _
-            pythonCmd & _
-            " 1>" & Quote(stdoutFile) & _
-            " 2>" & Quote(stderrFile) _
-        )
-
-    Debug.Print execCmd
-
-    Set shell = CreateObject("WScript.Shell")
-    Set exec = shell.Exec(execCmd)
-
-    frmProgress.lblStatus.Caption = _
-        "Запуск Python-скрипта..."
-
-    frmProgress.Show vbModeless
-    frmProgress.Repaint
-    DoEvents
-
-    WaitForPythonProcess exec, progressFile
-
-    ' После завершения читаем вывод из файлов.
-    stdoutText = ReadUtf8TextFileSafe(stdoutFile)
-    stderrText = ReadUtf8TextFileSafe(stderrFile)
-
-    If exec.ExitCode <> 0 Then
-        MsgBox _
-            "Ошибка выполнения Python-скрипта:" & _
-            vbCrLf & vbCrLf & _
-            stdoutText & vbCrLf & stderrText, _
-            vbCritical
-    Else
-        MsgBox _
-            "Готово:" & _
-            vbCrLf & vbCrLf & _
-            stdoutText, _
-            vbInformation
-    End If
-
-    RunStudySync = stdoutText
-
-CleanExit:
-    On Error Resume Next
-
-    Application.StatusBar = False
-    Unload frmProgress
-
-    DeleteFileIfExists progressFile
-    DeleteFileIfExists stdoutFile
-    DeleteFileIfExists stderrFile
-
-    Set exec = Nothing
-    Set shell = Nothing
-    Set targetBook = Nothing
-
-    On Error GoTo 0
-    Exit Function
-
-CleanFail:
-    Dim errNumber As Long
-    Dim errSource As String
-    Dim errDescription As String
-
-    errNumber = Err.Number
-    errSource = Err.Source
-    errDescription = Err.Description
-
-    On Error Resume Next
-
-    Application.StatusBar = False
-    Unload frmProgress
-
-    DeleteFileIfExists progressFile
-    DeleteFileIfExists stdoutFile
-    DeleteFileIfExists stderrFile
-
-    Set exec = Nothing
-    Set shell = Nothing
-    Set targetBook = Nothing
-
-    On Error GoTo 0
-
-    Err.Raise _
-        errNumber, _
-        errSource, _
-        errDescription
-
-End Function
-```
-
-# Добавь helper удаления временных файлов
-
-В этот же обычный модуль добавь:
-
-```vba
-Private Sub DeleteFileIfExists(ByVal filePath As String)
-
-    If Len(filePath) = 0 Then Exit Sub
-
-    On Error Resume Next
-
-    If Len(Dir$(filePath)) > 0 Then
-        Kill filePath
-    End If
-
-    On Error GoTo 0
-
-End Sub
-```
-
-# Важное изменение
-
-Теперь в `RunStudySync` больше не должно быть:
-
-```vba
-stdoutText = exec.StdOut.ReadAll
-stderrText = exec.StdErr.ReadAll
-```
-
-Вообще. Вывод читается только так:
+После этого твой существующий метод:
 
 ```vba
 stdoutText = ReadUtf8TextFileSafe(stdoutFile)
 stderrText = ReadUtf8TextFileSafe(stderrFile)
 ```
 
-Именно это убирает взаимную блокировку.
+будет читать файлы правильно.
 
-# `WaitForPythonProcess` оставь как есть
-
-Твой новый вариант с:
+Лучше ещё добавить пробелы вокруг `&&`, чтобы команда была понятнее:
 
 ```vba
-Sleep 25
-DoEvents
+execCmd = _
+    Quote(Environ$("ComSpec")) & _
+    " /d /s /c " & _
+    Quote( _
+        "set PYTHONUTF8=1 && " & _
+        "set PYTHONIOENCODING=utf-8 && " & _
+        pythonCmd & _
+        " 1>" & Quote(stdoutFile) & _
+        " 2>" & Quote(stderrFile) _
+    )
 ```
 
-нужен и остаётся. Он отвечает за нормальную работу интерфейса. Но сам по себе он не мог устранить заполнение `StdOut`.
+Но у `set` есть неприятная особенность: при записи с пробелом перед `&&` этот пробел может попасть в значение переменной. Поэтому безопаснее использовать форму:
 
-Теперь механизмы разделены:
-
-```text
-progressFile
-    → короткие сообщения для окна
-
-stdoutFile
-    → большой итоговый JSON
-
-stderrFile
-    → ошибки Python
+```vba
+execCmd = _
+    Quote(Environ$("ComSpec")) & _
+    " /d /s /c " & _
+    Quote( _
+        "set ""PYTHONUTF8=1"" && " & _
+        "set ""PYTHONIOENCODING=utf-8"" && " & _
+        pythonCmd & _
+        " 1>" & Quote(stdoutFile) & _
+        " 2>" & Quote(stderrFile) _
+    )
 ```
 
-# Где ещё сделать такое же изменение
+Именно этот вариант рекомендую:
 
-В `RefreshTasksFromExternalWorkbook` проблема теоретически такая же, но там итоговый JSON обычно намного меньше. Тем не менее лучше позже перенаправить `stdout/stderr` туда аналогичным способом.
-
-Для текущего вечного зависания при `load` достаточно сначала заменить именно `RunStudySync`.
-
-После изменения последовательность будет такой:
-
-```text
-TaskStatus выгружена...
-Python пишет большой JSON в файл
-Python свободно завершается
-exec.Status становится 1
-VBA выходит из ожидания
-читает JSON из файла
-закрывает frmProgress
-продолжает LoadStudyForms
+```vba
+execCmd = _
+    Quote(Environ$("ComSpec")) & _
+    " /d /s /c " & _
+    Quote( _
+        "set ""PYTHONUTF8=1"" && " & _
+        "set ""PYTHONIOENCODING=utf-8"" && " & _
+        pythonCmd & _
+        " 1>" & Quote(stdoutFile) & _
+        " 2>" & Quote(stderrFile) _
+    )
 ```
 
-Это очень точно объясняет, почему зависание всегда происходило на последнем сообщении и чаще именно при загрузке всех исследований.
+Больше ничего менять не нужно. Progress-файл у тебя Python и так пишет через:
+
+```python
+open(..., encoding="utf-8")
+```
+
+поэтому окно прогресса показывало кириллицу нормально. Слетела только кодировка перенаправленных `stdout` и `stderr`.
