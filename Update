@@ -1,324 +1,285 @@
+Да, проблема прямо в этом VBA-коде. Python здесь, скорее всего, ни при чём. Окно прогресса реализовано нестабильно сразу по нескольким причинам. 
+
+## Главная причина подвисания
+
+У тебя ожидание Python выглядит так:
+
+```vba
+Do While exec.Status = 0
+    DoEvents
+
+    If Timer - lastPoll >= 0.2 Then
+        ...
+    End If
+Loop
+```
+
+Этот цикл выполняется **без единой паузы**. Пока Python работает, Excel тысячи раз в секунду вызывает `DoEvents`.
+
+В результате:
+
+* Excel нагружает одно ядро почти на 100%;
+* модельная форма постоянно получает события перерисовки;
+* пользователь может случайно повторно запустить макрос;
+* события Excel и Ribbon могут войти в код повторно;
+* форма начинает мигать, зависать или перестаёт закрываться;
+* состояние формы может рассинхронизироваться с уже завершившимся процессом Python.
+
+`DoEvents` не является задержкой. Он лишь отдаёт управление очереди сообщений Windows, после чего цикл тут же запускается снова.
+
+## Вторая проблема: отсутствует гарантированное закрытие формы
+
+В `RunStudySync` форма закрывается только по нормальному пути:
+
+```vba
+Application.StatusBar = False
+Unload frmProgress
+```
+
+Если после её показа произойдёт любая ошибка, например:
+
+* ошибка чтения progress-файла;
+* ошибка обращения к `exec.Status`;
+* ошибка `StdOut.ReadAll`;
+* ошибка внутри обработчика формы;
+* пользователь закрыл форму крестиком;
+* ошибка перерисовки;
+
+выполнение сразу выйдет из функции, а:
+
+```vba
+Unload frmProgress
+```
+
+не выполнится.
+
+Отсюда как раз симптом:
+
+> Python уже завершился, а окно осталось.
+
+## Третья проблема: модельную форму можно закрывать вручную
+
+На скриншоте у формы есть крестик. Если пользователь нажмёт его во время выполнения, объект `frmProgress` выгрузится, но цикл продолжит обращаться к:
+
+```vba
+frmProgress.lblStatus.Caption
+frmProgress.Repaint
+```
+
+VBA может затем автоматически создать новый скрытый экземпляр default instance формы или получить ошибку. Это часто даёт совершенно непредсказуемое поведение.
+
+## Четвёртая проблема: повторное чтение всего файла
+
+Каждые 0,2 секунды выполняется:
+
+```vba
+progressText = ReadUtf8TextFileSafe(progressFile)
+```
+
+А `ReadUtf8TextFileSafe` каждый раз:
+
+1. создаёт `ADODB.Stream`;
+2. открывает файл;
+3. загружает **весь файл**;
+4. преобразует его из UTF-8;
+5. возвращает весь текст;
+6. закрывает stream.
+
+То есть при росте файла ты постоянно перечитываешь его с начала. Это не главная причина, если лог маленький, но в сочетании с `DoEvents` добавляет лагов.
+
+---
+
+# Что исправить
+
+Лучше вынести ожидание Python в одну общую функцию и использовать её и в `RunStudySync`, и в `RefreshTasksFromExternalWorkbook`.
+
+## 1. Добавь объявление `Sleep`
+
+В самое начало модуля, сразу после:
+
+```vba
 Option Explicit
+```
 
-'Private Const PYTHON_EXE As String = "C:\Users\Perek\PycharmProjects\excel-sqlite\.venv\Scripts\python.exe"
-'Private Const SYNC_SCRIPT As String = "C:\Users\Perek\PycharmProjects\excel-sqlite\sync.py"
-'Private Const DB_PATH As String = "D:\sqlite\results.db"
+добавь:
 
-'Private Const PYTHON_EXE As String = "C:\PycharmProjects\ExcelSqLite\.venv\Scripts\python.exe"
-'Private Const SYNC_SCRIPT As String = "C:\PycharmProjects\ExcelSqLite\sync.py"
-'Private Const DB_PATH As String = "C:\sqlite\results.db"
+```vba
+#If VBA7 Then
+    Private Declare PtrSafe Sub Sleep Lib "kernel32" ( _
+        ByVal dwMilliseconds As LongPtr _
+    )
+#Else
+    Private Declare Sub Sleep Lib "kernel32" ( _
+        ByVal dwMilliseconds As Long _
+    )
+#End If
+```
 
-Private Const PYTHON_EXE As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\.venv\Scripts\python.exe"
-Private Const SYNC_SCRIPT As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sync.py"
-Private Const DB_PATH As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db"
+## 2. Добавь общий метод ожидания процесса
 
-Public Const REFRESH_TASKS_SCRIPT As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\refresh_tasks.py"
-Public Const EXTERNAL_BOOK_TASKS_PATH As String = "L:\LRC\exchange\КСП Лайт\Журнал_заданий_флюиды.xlsx" ' "L:\LRC\exchange\КСП Лайт\Журнал_заданий_флюиды — копия.xlsx"
+Помести его рядом с `ReadUtf8TextFileSafe`:
 
-Public Const CREATE_QUALITY_ACT_SCRIPT As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\create_quality_act.py"
-Public Const QUALITY_ACT_TEMPLATE As String = "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\Работа\База данных результатов\Акт качества.xlsx"
+```vba
+Private Sub WaitForPythonProcess( _
+    ByVal exec As Object, _
+    ByVal progressFile As String _
+)
 
-Private Const OPOH_QUALITY_ACT_SCRIPT As String = _
-    "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\create_opoh_quality_act.py"
+    Const POLL_INTERVAL_SECONDS As Double = 0.2
+    Const LOOP_SLEEP_MS As Long = 25
 
-Private Const OPOH_QUALITY_ACT_TEMPLATE As String = _
-    "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\Акт качества глубинок.xlsx"
-    
-
-Public Function RunStudySync( _
-    ByVal mode As String, _
-    Optional ByVal projectNumber As String = "", _
-    Optional ByVal studies As String = "", _
-    Optional ByVal taskStatus As String = "" _
-) As String
-    
-    Dim targetBook As Workbook
-    Dim targetWorkbookPath As String
-    
-    Dim shell As Object
-    Dim exec As Object
-    Dim cmd As String
-    Dim stdoutText As String
-    Dim stderrText As String
-    
-    If ActiveWorkbook Is Nothing Then
-        Err.Raise vbObjectError + 1002, , "Нет активной книги с данными"
-    End If
-    
-    If ActiveWorkbook.name = ThisWorkbook.name Then
-        Err.Raise vbObjectError + 1003, , "Активна книга-надстройка, а не книга с данными"
-    End If
-    
-    If Len(ActiveWorkbook.path) = 0 Then
-        Err.Raise vbObjectError + 1004, , "Книга с данными должна быть сохранена перед запуском синхронизации"
-    End If
-    
-    Set targetBook = ActiveWorkbook
-    targetWorkbookPath = targetBook.fullName
-    
-    mode = LCase$(Trim$(mode))
-    
-    If mode <> "save" And mode <> "load" Then
-        Err.Raise vbObjectError + 1000, , "mode должен быть save или load"
-    End If
-    
-    If mode = "load" And Len(Trim$(projectNumber)) = 0 Then
-        Err.Raise vbObjectError + 1001, , "Для режима load нужно указать projectNumber"
-    End If
-    
-    If Len(Trim$(studies)) = 0 Then
-        studies = "OP AP GC SSF GOR BP REC EMV"
-    End If
-    
-    ' Пересчёт только книги с данными.
-    Dim ws As Worksheet
-
-    For Each ws In targetBook.Worksheets
-        ws.Calculate
-    Next ws
-    
-    cmd = Quote(GetWorkingPythonExe) & " -u " & _
-          Quote(SYNC_SCRIPT) & " " & _
-          "--mode " & mode & " " & _
-          "--workbook " & Quote(targetWorkbookPath) & " " & _
-          "--db " & Quote(DB_PATH) & " " & _
-          "--studies " & studies
-    
-    If mode = "load" Then
-        cmd = cmd & " --project " & Quote(projectNumber)
-    End If
-    
-    If Len(Trim$(taskStatus)) > 0 Then
-        cmd = cmd & " --status " & Quote(taskStatus)
-    End If
-    
-    'Debug.Print cmd
-    
-    Dim progressFile As String
-    progressFile = Environ$("TEMP") & "\python_progress_" & _
-               Format$(Now, "yyyymmdd_hhnnss") & "_" & _
-               CStr(Int(Rnd() * 1000000)) & ".log"
-    
-    cmd = cmd & " --progress-file " & Quote(progressFile)
-    
-    Set shell = CreateObject("WScript.Shell")
-    Set exec = shell.exec(cmd)
-    
     Dim lastProgressLen As Long
     Dim lastPoll As Double
+
     Dim progressText As String
     Dim newChunk As String
-    
-    frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
-    frmProgress.show vbModeless
-    DoEvents
-    
+
     lastProgressLen = 0
     lastPoll = Timer
-    
-    Do While exec.status = 0
+
+    Do While exec.Status = 0
+
+        ' Не даём циклу молотить тысячи раз в секунду.
+        Sleep LOOP_SLEEP_MS
+
+        ' Обрабатываем сообщения Windows/Excel.
         DoEvents
-        
-        If Timer - lastPoll >= 0.2 Then
+
+        If SecondsElapsed(lastPoll, Timer) >= POLL_INTERVAL_SECONDS Then
+
             progressText = ReadUtf8TextFileSafe(progressFile)
-            
+
             If Len(progressText) > lastProgressLen Then
                 newChunk = Mid$(progressText, lastProgressLen + 1)
                 lastProgressLen = Len(progressText)
+
                 UpdateProgressFromText newChunk
             End If
-            
+
             lastPoll = Timer
+
         End If
+
     Loop
-    
+
+    ' Забираем последнюю порцию после завершения Python.
     progressText = ReadUtf8TextFileSafe(progressFile)
-    
+
     If Len(progressText) > lastProgressLen Then
         newChunk = Mid$(progressText, lastProgressLen + 1)
         UpdateProgressFromText newChunk
     End If
-    
-    stdoutText = exec.StdOut.ReadAll
-    stderrText = exec.StdErr.ReadAll
-    
-    Application.StatusBar = False
-    Unload frmProgress
-    
-    If exec.exitCode <> 0 Then
-        MsgBox "Ошибка выполнения Python-скрипта:" & vbCrLf & vbCrLf & _
-               stdoutText & vbCrLf & stderrText, vbCritical
-    Else
-        MsgBox "Готово:" & vbCrLf & vbCrLf & stdoutText, vbInformation
-    End If
-    
-    RunStudySync = stdoutText
-End Function
 
-Public Function SetTaskStatusOnly( _
-    ByVal taskId As Long, _
-    ByVal taskType As String, _
-    ByVal taskStatus As String, _
-    ByVal statusComment As String, _
-    Optional ByVal resultId As Variant, _
-    Optional ByVal dateTimeText As String = "" _
-) As String
+End Sub
+```
 
-    Dim shell As Object
-    Dim exec As Object
-    Dim cmd As String
-    Dim stdoutText As String
-    Dim stderrText As String
-    
-    If taskId <= 0 Then
-        SetTaskStatusOnly = "NoTaskId"
-        Exit Function
-    End If
-    
-    taskType = UCase$(Trim$(taskType))
-    taskStatus = Trim$(taskStatus)
-    
-    If Len(taskType) = 0 Then
-        Err.Raise vbObjectError + 1102, , "Нужно указать taskType"
-    End If
-    
-    If Len(taskStatus) = 0 Then
-        Err.Raise vbObjectError + 1103, , "Нужно указать taskStatus"
-    End If
-    
-    If statusComment = "" And taskStatus = "Отмена" Then
-        MsgBox "Нужно указать statusComment"
-        SetTaskStatusOnly = "NoComment"
-        Exit Function
-    End If
-    
-    cmd = Quote(GetWorkingPythonExe) & " -u " & _
-          Quote(SYNC_SCRIPT) & " " & _
-          "--mode status " & _
-          "--db " & Quote(DB_PATH) & " " & _
-          "--task-id " & CStr(taskId) & " " & _
-          "--task-type " & Quote(taskType) & " " & _
-          "--status " & Quote(taskStatus) & " " & _
-          "--status-comment " & Quote(statusComment)
-          
-    If Not IsMissing(resultId) Then
-        If Len(Trim$(CStr(resultId))) > 0 Then
-            cmd = cmd & " --result-id " & CStr(CLng(val(resultId)))
-        End If
-    End If
-    
-    If Len(Trim$(dateTimeText)) > 0 Then
-        cmd = cmd & " --date-time " & Quote(dateTimeText)
-    End If
-    
-    Debug.Print cmd
-    
-    Set shell = CreateObject("WScript.Shell")
-    Set exec = shell.exec(cmd)
-    
-    Do While exec.status = 0
-        DoEvents
-    Loop
-    
-    stdoutText = exec.StdOut.ReadAll
-    stderrText = exec.StdErr.ReadAll
-    
-    If exec.exitCode <> 0 Then
-        MsgBox "Ошибка изменения статуса задания:" & vbCrLf & vbCrLf & _
-               stdoutText & vbCrLf & stderrText, vbCritical
+И рядом добавь защиту от перехода через полночь:
+
+```vba
+Private Function SecondsElapsed( _
+    ByVal startTimer As Double, _
+    ByVal currentTimer As Double _
+) As Double
+
+    If currentTimer >= startTimer Then
+        SecondsElapsed = currentTimer - startTimer
     Else
-        MsgBox "Готово:" & vbCrLf & vbCrLf & stdoutText, vbInformation
+        SecondsElapsed = 86400# - startTimer + currentTimer
     End If
-    
-    SetTaskStatusOnly = stdoutText
 
 End Function
+```
 
+Сейчас у тебя используется:
 
-Private Function Quote(ByVal text As String) As String
-    Quote = """" & text & """"
-End Function
+```vba
+If Timer - lastPoll >= 0.2 Then
+```
 
+Если выполнение попадёт на полночь, `Timer` сбросится в ноль и условие долго не будет выполняться. Это редкий, но настоящий баг.
 
-Public Sub LoadResearchesFromDB( _
-    Optional ByVal studies As Variant, _
-    Optional ByVal projectNumber As String = "", _
-    Optional ByVal formFillMode As String = "sequential" _
-)
+---
 
-    Dim wb As Workbook
-    Set wb = ActiveWorkbook
+# 3. Перепиши блок ожидания в `RunStudySync`
 
-    If wb Is Nothing Then
-        Err.Raise vbObjectError + 1101, , "Нет активной книги с данными"
-    End If
-    
-    If wb.name = ThisWorkbook.name Then
-        Err.Raise vbObjectError + 1102, , "Активна книга-надстройка, а не книга с данными"
-    End If
-    
-    If Len(wb.path) = 0 Then
-        Err.Raise vbObjectError + 1103, , "Книга с данными должна быть сохранена перед загрузкой"
-    End If
+В `RunStudySync` удали весь участок от:
 
-    Dim project As String
-    
-    If Len(Trim$(projectNumber)) > 0 Then
-        project = Trim$(projectNumber)
-    Else
-        project = GetCurrentProject(wb)
-    End If
+```vba
+Dim lastProgressLen As Long
+```
 
-    Dim studiesArr As Variant
-    
-    If IsMissing(studies) Then
-        studiesArr = DefaultStudies()
-    Else
-        studiesArr = NormalizeStudiesOrDefault(studies)
-    End If
+до последнего чтения progress-файла:
 
-    Dim studiesText As String
-    studiesText = JoinVariantArray(studiesArr, " ")
-    
-    formFillMode = LCase$(Trim$(formFillMode))
-    
-    If formFillMode <> "sequential" And formFillMode <> "by_key" Then
-        Err.Raise vbObjectError + 1104, , "formFillMode должен быть 'sequential' или 'by_key'"
-    End If
+```vba
+If Len(progressText) > lastProgressLen Then
+    newChunk = Mid$(progressText, lastProgressLen + 1)
+    UpdateProgressFromText newChunk
+End If
+```
 
-    Dim macroStarted As Boolean
-    Dim syncResult As String
-    
-    On Error GoTo CleanFail
+Вместо него оставь:
 
-    StartMacro wb, studiesArr, True
-    macroStarted = True
+```vba
+frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
+frmProgress.Show vbModeless
+frmProgress.Repaint
+DoEvents
 
-    syncResult = RunStudySync( _
-        mode:="load", _
-        projectNumber:=project, _
-        studies:=studiesText _
-    )
+WaitForPythonProcess exec, progressFile
+```
 
-    If InStr(1, syncResult, """ok"": true", vbTextCompare) = 0 Then
-        MsgBox "Загрузка из БД не подтверждена как успешная." & vbCrLf & vbCrLf & _
-               syncResult, vbExclamation
-        GoTo CleanExit
-    End If
+---
 
-    Dim i As Long
-    Dim studyCode As String
+# 4. Обязательно добавь обработку ошибок и гарантированную уборку
 
-    For i = LBound(studiesArr) To UBound(studiesArr)
-        studyCode = UCase$(Trim$(CStr(studiesArr(i))))
-        LoadStudyForms wb, studyCode, formFillMode
-    Next i
+Сейчас в `RunStudySync` нет `On Error GoTo`, поэтому форма может остаться навсегда.
+
+После объявлений переменных добавь:
+
+```vba
+On Error GoTo CleanFail
+```
+
+А нижнюю часть функции перепиши по такой схеме:
+
+```vba
+WaitForPythonProcess exec, progressFile
+
+stdoutText = exec.StdOut.ReadAll
+stderrText = exec.StdErr.ReadAll
+
+If exec.ExitCode <> 0 Then
+    MsgBox _
+        "Ошибка выполнения Python-скрипта:" & _
+        vbCrLf & vbCrLf & _
+        stdoutText & vbCrLf & stderrText, _
+        vbCritical
+Else
+    MsgBox _
+        "Готово:" & vbCrLf & vbCrLf & stdoutText, _
+        vbInformation
+End If
+
+RunStudySync = stdoutText
 
 CleanExit:
-    If macroStarted Then
-        EndMacro wb, studiesArr, True
+    On Error Resume Next
+
+    Application.StatusBar = False
+    Unload frmProgress
+
+    If Len(progressFile) > 0 Then
+        If Len(Dir$(progressFile)) > 0 Then
+            Kill progressFile
+        End If
     End If
-    Exit Sub
+
+    Set exec = Nothing
+    Set shell = Nothing
+    Set targetBook = Nothing
+
+    On Error GoTo 0
+    Exit Function
 
 CleanFail:
     Dim errNumber As Long
@@ -330,901 +291,209 @@ CleanFail:
     errDescription = Err.Description
 
     On Error Resume Next
-    If macroStarted Then
-        EndMacro wb, studiesArr, True
+
+    Application.StatusBar = False
+    Unload frmProgress
+
+    If Len(progressFile) > 0 Then
+        If Len(Dir$(progressFile)) > 0 Then
+            Kill progressFile
+        End If
     End If
+
+    Set exec = Nothing
+    Set shell = Nothing
+    Set targetBook = Nothing
+
     On Error GoTo 0
 
     Err.Raise errNumber, errSource, errDescription
+```
 
-End Sub
+Перед нормальным завершением нужен переход:
 
-Private Function GetCurrentProject(ByVal wb As Workbook) As String
+```vba
+GoTo CleanExit
+```
 
-    Dim wsOP As Worksheet
-    Set wsOP = wb.Worksheets("OP")
+То есть после:
 
-    GetCurrentProject = CStr(wsOP.ListObjects("ChoosenProject").DataBodyRange(1, 1).value)
+```vba
+RunStudySync = stdoutText
+```
 
-    If Len(Trim$(GetCurrentProject)) = 0 Then
-        Err.Raise vbObjectError + 1000, , "Не выбран проект в таблице ChoosenProject."
-    End If
+добавь:
 
-End Function
+```vba
+GoTo CleanExit
+```
 
-Private Function DefaultStudies() As Variant
-    DefaultStudies = Array("OP", "OPOH", "GC", "BP", "AP", "GOR", "SSF", "REC", "EMV", "JOIN", "CCE", "CVD")
-End Function
+Теперь форма будет выгружена:
 
+* при успешном завершении;
+* при ошибке Python;
+* при ошибке VBA;
+* при ошибке чтения файла;
+* при ошибке обработки вывода.
 
-Private Function JoinVariantArray( _
-    ByVal arr As Variant, _
-    Optional ByVal separator As String = " " _
-) As String
+---
 
-    Dim parts() As String
-    Dim i As Long
-    Dim n As Long
+# 5. Запрети закрытие формы крестиком
 
-    ReDim parts(0 To UBound(arr) - LBound(arr))
+В модуле самой формы `frmProgress` добавь:
 
-    For i = LBound(arr) To UBound(arr)
-        parts(n) = UCase$(Trim$(CStr(arr(i))))
-        n = n + 1
-    Next i
-
-    JoinVariantArray = JOIN(parts, separator)
-
-End Function
-
-
-Private Sub LoadStudyForms( _
-    ByVal wb As Workbook, _
-    ByVal studyCode As String, _
-    ByVal formFillMode As String _
+```vba
+Private Sub UserForm_QueryClose( _
+    Cancel As Integer, _
+    CloseMode As Integer _
 )
 
-    Select Case UCase$(Trim$(studyCode))
-        Case "OP"
-            Call Load_OP_results_to_forms
-        
-        Case "OPOH"
-            Call Load_OPOH_results_to_forms(formFillMode)
-            
-        Case "AP"
-            Call Load_AP_results_to_forms(formFillMode)
-        
-        Case "GC"
-            Call Load_GC_results_to_forms(formFillMode)
-        
-        Case "BP"
-            Call Load_BP_results_to_forms(formFillMode)
-            
-        Case "REC"
-            Call Load_Rec_results_to_forms(formFillMode)
-        
-        Case "GOR"
-            Call Load_GOR_results_to_forms(formFillMode)
-        
-        Case "SSF"
-            Call Load_SSF_results_to_forms(formFillMode)
-    
-        Case "EMV"
-            Call Load_EMV_results_to_forms(formFillMode)
-        
-        Case "JOIN"
-            Call Load_JOIN_results_to_forms(formFillMode)
-        
-        Case "CCE"
-            Call Load_CCE_results_to_forms(formFillMode)
-    
-        Case Else
-            Err.Raise vbObjectError + 1001, , "Неизвестный тип исследования: " & studyCode
-    End Select
-
-End Sub
-
-Private Function NormalizeStudiesOrDefault(Optional ByVal studies As Variant) As Variant
-
-    If IsMissing(studies) Then
-        NormalizeStudiesOrDefault = DefaultStudies()
-        Exit Function
-    End If
-    
-    If IsEmpty(studies) Then
-        NormalizeStudiesOrDefault = DefaultStudies()
-        Exit Function
-    End If
-
-    Dim dict As Object
-    Set dict = CreateObject("Scripting.Dictionary")
-    dict.CompareMode = vbTextCompare
-
-    Dim i As Long
-
-    If IsArray(studies) Then
-        For i = LBound(studies) To UBound(studies)
-            AddStudiesFromText dict, CStr(studies(i))
-        Next i
-    Else
-        AddStudiesFromText dict, CStr(studies)
-    End If
-
-    If dict.count = 0 Then
-        NormalizeStudiesOrDefault = DefaultStudies()
-        Exit Function
-    End If
-
-    If dict.Exists("ALL") Or dict.Exists("*") Then
-        NormalizeStudiesOrDefault = DefaultStudies()
-        Exit Function
-    End If
-
-    Dim key As Variant
-    
-    For Each key In dict.Keys
-        If Not IsKnownStudyCode(CStr(key)) Then
-            Err.Raise vbObjectError + 1201, , "Неизвестный тип исследования: " & CStr(key)
-        End If
-    Next key
-
-    Dim result() As String
-    ReDim result(0 To dict.count - 1)
-
-    i = 0
-    For Each key In dict.Keys
-        result(i) = UCase$(CStr(key))
-        i = i + 1
-    Next key
-
-    NormalizeStudiesOrDefault = result
-
-End Function
-
-
-Private Sub AddStudiesFromText( _
-    ByVal dict As Object, _
-    ByVal text As String _
-)
-
-    text = UCase$(Trim$(text))
-    
-    If Len(text) = 0 Then Exit Sub
-    
-    text = Replace(text, ";", " ")
-    text = Replace(text, ",", " ")
-    text = Replace(text, vbCrLf, " ")
-    text = Replace(text, vbLf, " ")
-    text = Replace(text, vbTab, " ")
-
-    Do While InStr(1, text, "  ", vbBinaryCompare) > 0
-        text = Replace(text, "  ", " ")
-    Loop
-
-    Dim parts() As String
-    parts = Split(text, " ")
-
-    Dim i As Long
-    Dim studyCode As String
-
-    For i = LBound(parts) To UBound(parts)
-        studyCode = UCase$(Trim$(parts(i)))
-
-        If Len(studyCode) > 0 Then
-            If Not dict.Exists(studyCode) Then
-                dict.Add studyCode, True
-            End If
-        End If
-    Next i
-
-End Sub
-
-
-Private Function IsKnownStudyCode(ByVal studyCode As String) As Boolean
-
-    Select Case UCase$(Trim$(studyCode))
-        Case "OP", "AP", "GC", "SSF", "GOR", "BP", "REC", "EMV", "CCE", "JOIN"
-            IsKnownStudyCode = True
-        Case Else
-            IsKnownStudyCode = False
-    End Select
-
-End Function
-
-Public Function RefreshTasksFromExternalWorkbook( _
-    ByVal sourceWorkbookPath As String, _
-    ByVal projectNumber As String, _
-    Optional ByVal sourceParentSheet As String = "task", _
-    Optional ByVal sourceParentTable As String = "task", _
-    Optional ByVal sourceChildSheet As String = "task_mix", _
-    Optional ByVal sourceChildTable As String = "task_mix", _
-    Optional ByVal targetParentSheet As String = "Task", _
-    Optional ByVal targetParentTable As String = "Task", _
-    Optional ByVal targetChildSheet As String = "Task_mix", _
-    Optional ByVal targetChildTable As String = "Task_mix" _
-) As String
-
-    Dim targetBook As Workbook
-    Dim targetWorkbookPath As String
-    
-    Dim shell As Object
-    Dim exec As Object
-    Dim cmd As String
-    Dim stdoutText As String
-    Dim stderrText As String
-    
-    If ActiveWorkbook Is Nothing Then
-        Err.Raise vbObjectError + 1202, , "Нет активной книги с данными"
-    End If
-    
-    If ActiveWorkbook.name = ThisWorkbook.name Then
-        Err.Raise vbObjectError + 1203, , "Активна книга-надстройка, а не книга с данными"
-    End If
-    
-    If Len(ActiveWorkbook.path) = 0 Then
-        Err.Raise vbObjectError + 1204, , "Книга с данными должна быть сохранена перед обновлением заданий"
-    End If
-    
-    If Len(Trim$(sourceWorkbookPath)) = 0 Then
-        Err.Raise vbObjectError + 1205, , "Не указан путь к внешней книге с заданиями"
-    End If
-    
-    If Dir(sourceWorkbookPath) = "" Then
-        Err.Raise vbObjectError + 1206, , "Внешняя книга с заданиями не найдена: " & sourceWorkbookPath
-    End If
-    
-    If Len(Trim$(projectNumber)) = 0 Then
-        Err.Raise vbObjectError + 1207, , "Не указан номер проекта"
-    End If
-    
-    Set targetBook = ActiveWorkbook
-    targetWorkbookPath = targetBook.fullName
-    
-    cmd = Quote(GetWorkingPythonExe) & " -u " & _
-          Quote(REFRESH_TASKS_SCRIPT) & " " & _
-          "--workbook " & Quote(targetWorkbookPath) & " " & _
-          "--db " & Quote(DB_PATH) & " " & _
-          "--source-workbook " & Quote(sourceWorkbookPath) & " " & _
-          "--project " & Quote(projectNumber) & " " & _
-          "--source-parent-sheet " & Quote(sourceParentSheet) & " " & _
-          "--source-parent-table " & Quote(sourceParentTable) & " " & _
-          "--source-child-sheet " & Quote(sourceChildSheet) & " " & _
-          "--source-child-table " & Quote(sourceChildTable) & " " & _
-          "--target-parent-sheet " & Quote(targetParentSheet) & " " & _
-          "--target-parent-table " & Quote(targetParentTable) & " " & _
-          "--target-child-sheet " & Quote(targetChildSheet) & " " & _
-          "--target-child-table " & Quote(targetChildTable)
-    
-    Debug.Print cmd
-    
-    Dim progressFile As String
-    progressFile = Environ$("TEMP") & "\python_progress_" & _
-               Format$(Now, "yyyymmdd_hhnnss") & "_" & _
-               CStr(Int(Rnd() * 1000000)) & ".log"
-    
-    cmd = cmd & " --progress-file " & Quote(progressFile)
-    
-    Set shell = CreateObject("WScript.Shell")
-    Set exec = shell.exec(cmd)
-    
-    Dim lastProgressLen As Long
-    Dim lastPoll As Double
-    Dim progressText As String
-    Dim newChunk As String
-    
-    frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
-    frmProgress.show vbModeless
-    DoEvents
-    
-    lastProgressLen = 0
-    lastPoll = Timer
-    
-    Do While exec.status = 0
-        DoEvents
-        
-        If Timer - lastPoll >= 0.2 Then
-            progressText = ReadUtf8TextFileSafe(progressFile)
-            
-            If Len(progressText) > lastProgressLen Then
-                newChunk = Mid$(progressText, lastProgressLen + 1)
-                lastProgressLen = Len(progressText)
-                UpdateProgressFromText newChunk
-            End If
-            
-            lastPoll = Timer
-        End If
-    Loop
-    
-    progressText = ReadUtf8TextFileSafe(progressFile)
-    
-    If Len(progressText) > lastProgressLen Then
-        newChunk = Mid$(progressText, lastProgressLen + 1)
-        UpdateProgressFromText newChunk
-    End If
-    
-    stdoutText = exec.StdOut.ReadAll
-    stderrText = exec.StdErr.ReadAll
-    
-    Application.StatusBar = False
-    Unload frmProgress
-    
-    If exec.exitCode <> 0 Then
-        MsgBox "Ошибка обновления заданий:" & vbCrLf & vbCrLf & _
-               stdoutText & vbCrLf & stderrText, vbCritical
-    Else
-        MsgBox "Задания обновлены:" & vbCrLf & vbCrLf & stdoutText, vbInformation
-    End If
-    
-    RefreshTasksFromExternalWorkbook = stdoutText
-
-End Function
-
-Public Sub RefreshTasks_SelectFile()
-    
-    Dim OP_list As Worksheet
-    Set OP_list = ActiveWorkbook.Worksheets("OP")
-    
-    If Not OP_list.Range("ChoosenProject[Project]").value Like "2#-F###" Then
-        MsgBox "Не верно указан номер проекта. Укажите номер проекта в формате 2#-F###, где # - является числом, и повторите."
-        Exit Sub
-    ElseIf OP_list.Range("ChoosenProject[Project]").value Like "2#-F000" Then
-        Exit Sub
-    End If
-    
-    
-    Dim projectNumber As String
-    projectNumber = OP_list.Range("ChoosenProject[Project]").value
-    
-    If Len(Trim$(projectNumber)) = 0 Then Exit Sub
-    
-    Call RefreshTasksFromExternalWorkbook( _
-        EXTERNAL_BOOK_TASKS_PATH, _
-        projectNumber, _
-        "ГТИ", _
-        "Журнал_ГТИ", _
-        "Смешение", _
-        "ЖУрнал_объединения", _
-        "Task", _
-        "Task", _
-        "Task_mix", _
-        "Task_mix" _
-    )
-
-End Sub
-
-Public Function CreateQualityAct( _
-                Optional ByVal templatePath As String = "", _
-                Optional ByVal outputDir As String = "" _
-                ) As String
-
-    Dim targetBook As Workbook
-    Dim targetWorkbookPath As String
-    
-    Dim shell As Object
-    Dim exec As Object
-    Dim cmd As String
-    
-    Dim stdoutText As String
-    Dim stderrText As String
-    
-    If ActiveWorkbook Is Nothing Then
-        Err.Raise vbObjectError + 1202, , "Нет активной книги с данными"
-    End If
-    
-    If ActiveWorkbook.name = ThisWorkbook.name Then
-        Err.Raise vbObjectError + 1203, , "Активна книга-надстройка, а не книга с данными"
-    End If
-    
-    If Len(ActiveWorkbook.path) = 0 Then
-        Err.Raise vbObjectError + 1204, , "Книга с данными должна быть сохранена перед обновлением заданий"
-    End If
-    
-    Set targetBook = ActiveWorkbook
-    targetWorkbookPath = targetBook.fullName
-    
-    cmd = Quote(GetWorkingPythonExe) & " " & _
-            Quote(CREATE_QUALITY_ACT_SCRIPT) & " " & _
-            "--workbook " & _
-            Quote(targetWorkbookPath)
-    
-    If Len(Trim$(templatePath)) > 0 Then
-        cmd = cmd & " --template " & Quote(templatePath)
-    End If
-    
-    If Len(Trim$(outputDir)) Then
-        cmd = cmd & " --output-dir " & Quote(outputDir)
-    End If
-    
-    Debug.Print cmd
-    
-    Set shell = CreateObject("WScript.Shell")
-    Set exec = shell.exec(cmd)
-    
-    Do While exec.status = 0
-        DoEvents
-    Loop
-    
-    stdoutText = exec.StdOut.ReadAll
-    stderrText = exec.StdErr.ReadAll
-    
-    If exec.exitCode <> 0 Then
-        MsgBox "Ошибка создания акта качетсва: " & vbCrLf & vbCrLf & _
-                stdoutText & vbCrLf & stderrText, vbCritical
-    Else
-        MsgBox "Акт качества создан: " & vbCrLf & vbCrLf & _
-                stdoutText, vbInformation
-    End If
-    
-    CreateQualityAct = stdoutText
-End Function
-
-
-Public Sub CreateOPOHQualityAct()
-
-    Dim targetBook As Workbook
-    Dim targetWorkbookPath As String
-
-    Dim shell As Object
-    Dim exec As Object
-    Dim cmd As String
-    Dim stdoutText As String
-    Dim stderrText As String
-
-    If ActiveWorkbook Is Nothing Then
-        MsgBox "Нет активной книги с данными.", vbExclamation
-        Exit Sub
-    End If
-
-    If ActiveWorkbook.name = ThisWorkbook.name Then
-        MsgBox "Активна книга-надстройка, а не книга с данными.", vbExclamation
-        Exit Sub
-    End If
-
-    If Len(ActiveWorkbook.path) = 0 Then
-        MsgBox "Книга с данными должна быть сохранена перед созданием акта.", vbExclamation
-        Exit Sub
-    End If
-
-    Set targetBook = ActiveWorkbook
-    targetWorkbookPath = targetBook.fullName
-
-    cmd = Quote(PYTHON_EXE) & " -u " & _
-          Quote(OPOH_QUALITY_ACT_SCRIPT) & " " & _
-          "--workbook " & Quote(targetWorkbookPath) & " " & _
-          "--template " & Quote(OPOH_QUALITY_ACT_TEMPLATE)
-
-    Debug.Print cmd
-
-    Set shell = CreateObject("WScript.Shell")
-    Set exec = shell.exec(cmd)
-
-    Do While exec.status = 0
-        DoEvents
-    Loop
-
-    stdoutText = exec.StdOut.ReadAll
-    stderrText = exec.StdErr.ReadAll
-
-    If exec.exitCode <> 0 Then
-        MsgBox "Ошибка создания акта качества глубинных проб:" & vbCrLf & vbCrLf & _
-               stdoutText & vbCrLf & stderrText, vbCritical
-    Else
-        MsgBox "Акт качества глубинных проб создан:" & vbCrLf & vbCrLf & _
-               stdoutText, vbInformation
+    If CloseMode = vbFormControlMenu Then
+        Cancel = True
     End If
 
 End Sub
+```
 
-Private Sub ShowProgress(ByVal text As String)
+Пользователь больше не сможет закрыть форму крестиком, пока макрос выполняется. Закрывать её будет только код:
 
+```vba
+Unload frmProgress
+```
+
+Можно также убрать крестик через WinAPI, но отмены `QueryClose` достаточно.
+
+---
+
+# 6. Защити макрос от повторного запуска
+
+Из-за `DoEvents` пользователь способен повторно нажать кнопку Ribbon. Тогда запускаются два Python-процесса и оба используют один Excel.
+
+В верхней части модуля добавь:
+
+```vba
+Private mPythonTaskRunning As Boolean
+```
+
+В начале `RunStudySync`, до запуска Python:
+
+```vba
+If mPythonTaskRunning Then
+    Err.Raise _
+        vbObjectError + 1010, _
+        "RunStudySync", _
+        "Другой Python-скрипт уже выполняется."
+End If
+
+mPythonTaskRunning = True
+```
+
+А в обоих блоках уборки:
+
+```vba
+mPythonTaskRunning = False
+```
+
+Например:
+
+```vba
+CleanExit:
     On Error Resume Next
 
-    frmProgress.lblStatus.Caption = text
-    frmProgress.Repaint
+    mPythonTaskRunning = False
+    Application.StatusBar = False
+    Unload frmProgress
+```
 
-    Application.StatusBar = text
+и аналогично в `CleanFail`.
 
+Это очень важно при модельной форме и `DoEvents`.
+
+---
+
+# 7. Те же изменения нужны в `RefreshTasksFromExternalWorkbook`
+
+У тебя там полностью скопирован тот же нестабильный цикл:
+
+```vba
+Do While exec.Status = 0
     DoEvents
 
-    On Error GoTo 0
-
-End Sub
-
-Private Function ReadUtf8TextFileSafe(ByVal filePath As String) As String
-
-    On Error GoTo Fail
-    
-    If Len(Dir(filePath)) = 0 Then Exit Function
-    
-    Dim stream As Object
-    Set stream = CreateObject("ADODB.Stream")
-    
-    stream.Type = 2
-    stream.Charset = "utf-8"
-    stream.Open
-    stream.LoadFromFile filePath
-    
-    ReadUtf8TextFileSafe = stream.ReadText
-    
-    stream.Close
-    Exit Function
-
-Fail:
-    ReadUtf8TextFileSafe = ""
-
-End Function
-
-Private Sub UpdateProgressFromText(ByVal text As String)
-
-    Dim lines() As String
-    Dim i As Long
-    Dim lineText As String
-    
-    text = Replace(text, vbCrLf, vbLf)
-    text = Replace(text, vbCr, vbLf)
-    
-    lines = Split(text, vbLf)
-    
-    For i = LBound(lines) To UBound(lines)
-        lineText = Trim$(lines(i))
-        
-        If Len(lineText) > 0 Then
-            Debug.Print lineText
-            Application.StatusBar = lineText
-            
-            frmProgress.lblStatus.Caption = lineText
-            frmProgress.Repaint
-        End If
-    Next i
-
-End Sub
-
-Public Sub Load_All()
-    LoadResearchesFromDB
-End Sub
-
-Public Sub CreateActQuality_Click()
-    
-    Dim lifSheet As Worksheet
-    Set lifSheet = ActiveWorkbook.Worksheets("All_samples")
-    
-    Dim tbl As ListObject
-    Set tbl = lifSheet.ListObjects(1)
-    Dim rng As Range
-    Set rng = tbl.ListColumns("GCR_TR3").DataBodyRange.Find( _
-                                            What:="MDT", _
-                                            LookIn:=xlValues, _
-                                            LookAt:=xlWhole, _
-                                            MatchCase:=False)
-                                            
-    If rng Is Nothing Then
-        Call CreateQualityAct(templatePath:=QUALITY_ACT_TEMPLATE)
-    Else
-        Call CreateOPOHQualityAct
+    If Timer - lastPoll >= 0.2 Then
+        ...
     End If
-    
-End Sub
+Loop
+```
 
-Private Function GetWorkingPythonExe() As String
+Его тоже замени на:
 
-    Dim candidates As Variant
-    Dim pythonPath As Variant
-    Dim shell As Object
-    Dim process As Object
-    Dim command As String
+```vba
+frmProgress.lblStatus.Caption = "Запуск Python-скрипта..."
+frmProgress.Show vbModeless
+frmProgress.Repaint
+DoEvents
 
-    candidates = Array( _
-        Environ$("USERPROFILE") & _
-            "\.venvs\sqlite-excel\Scripts\python.exe", _
-        PYTHON_EXE _
-    )
+WaitForPythonProcess exec, progressFile
+```
 
-    Set shell = CreateObject("WScript.Shell")
+И обязательно добавь `CleanExit/CleanFail`, как в `RunStudySync`.
 
-    For Each pythonPath In candidates
+Иначе синхронизация будет исправлена, но окно продолжит иногда висеть при обновлении заданий.
 
-        If Len(Dir$(CStr(pythonPath))) > 0 Then
+---
 
-'            On Error Resume Next
-'
-'            command = """" & CStr(pythonPath) & """ --version"
-'
-'            Set process = shell.exec(command)
-'
-'            If Err.Number = 0 Then
-'
-'                Do While process.status = 0
-'                    DoEvents
-'                Loop
+## Ещё две ошибки, которые я заметил в этом же модуле
 
-                'If process.exitCode = 0 Then
-                    GetWorkingPythonExe = CStr(pythonPath)
-                    'On Error GoTo 0
-                    Exit Function
-                'End If
+Они не связаны с зависанием окна, но скоро проявятся с CVD.
 
-            'End If
+### `LoadStudyForms` не содержит CVD
 
-            'Err.Clear
-            'Set process = Nothing
-            'On Error GoTo 0
+В `DefaultStudies()` CVD уже есть:
 
-        End If
+```vba
+DefaultStudies = Array( _
+    "OP", "OPOH", "GC", "BP", "AP", "GOR", _
+    "SSF", "REC", "EMV", "JOIN", "CCE", "CVD" _
+)
+```
 
-    Next pythonPath
+Но в `LoadStudyForms` отсутствует:
 
-    Err.Raise _
-        vbObjectError + 1001, _
-        "GetWorkingPythonExe", _
-        "Не найден рабочий интерпретатор Python."
+```vba
+Case "CVD"
+```
 
-End Function
+Следовательно после успешной Python-загрузки код дойдёт до CVD и выдаст:
 
-Public Function Save_All() As macroResult
-    
-    Dim totalResult As macroResult
-    Dim currentResult As macroResult
+```text
+Неизвестный тип исследования: CVD
+```
 
-    totalResult = MACRO_NO_CHANGES
+Добавь:
 
-    currentResult = Save_OP()
-
-    If currentResult = MACRO_FAILED Then
-        Save_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Save_OPOH()
-
-    If currentResult = MACRO_FAILED Then
-        Save_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-
-    currentResult = Save_AP()
-
-    If currentResult = MACRO_FAILED Then
-        Save_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-
-
-    currentResult = Save_GOR()
-
-    If currentResult = MACRO_FAILED Then
-        Save_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-
-
-    currentResult = Save_CCE()
-
-    If currentResult = MACRO_FAILED Then
-        Save_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-
-    currentResult = Save_GC()
-
-    If currentResult = MACRO_FAILED Then
-        Save_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Save_BP()
-
-    If currentResult = MACRO_FAILED Then
-        Save_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Save_JOIN()
-
-    If currentResult = MACRO_FAILED Then
-        Save_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Save_SSF()
-
-    If currentResult = MACRO_FAILED Then
-        Save_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Save_EMV()
-
-    If currentResult = MACRO_FAILED Then
-        Save_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Save_Rec()
-
-    If currentResult = MACRO_FAILED Then
-        Save_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    Save_All = totalResult
-    
-End Function
-
-Public Function Validate_All() As macroResult
-    
-    Dim totalResult As macroResult
-    Dim currentResult As macroResult
-
-    totalResult = MACRO_NO_CHANGES
-
-    currentResult = Validate_OP()
-
-    If currentResult = MACRO_FAILED Then
-        Validate_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Validate_OPOH()
-
-    If currentResult = MACRO_FAILED Then
-        Validate_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-
-    currentResult = Validate_AP()
-
-    If currentResult = MACRO_FAILED Then
-        Validate_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-
-
-    currentResult = Validate_GOR()
-
-    If currentResult = MACRO_FAILED Then
-        Validate_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-
-
-    currentResult = Validate_CCE()
-
-    If currentResult = MACRO_FAILED Then
-        Validate_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-
-    currentResult = Validate_GC()
-
-    If currentResult = MACRO_FAILED Then
-        Validate_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Validate_BP()
-
-    If currentResult = MACRO_FAILED Then
-        Validate_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Validate_JOIN()
-
-    If currentResult = MACRO_FAILED Then
-        Validate_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Validate_SSF()
-
-    If currentResult = MACRO_FAILED Then
-        Validate_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Validate_EMV()
-
-    If currentResult = MACRO_FAILED Then
-        Validate_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    currentResult = Validate_Rec()
-
-    If currentResult = MACRO_FAILED Then
-        Validate_All = MACRO_FAILED
-        Exit Function
-    End If
-
-    If currentResult = MACRO_CHANGED Then
-        totalResult = MACRO_CHANGED
-    End If
-    
-    Validate_All = totalResult
-    
-End Function
+```vba
+Case "CVD"
+    Call Load_CVD_results_to_forms(formFillMode)
+```
 
+когда соответствующая процедура будет готова.
+
+### `IsKnownStudyCode` тоже не знает CVD и OPOH
+
+Сейчас:
+
+```vba
+Case "OP", "AP", "GC", "SSF", "GOR", "BP", _
+     "REC", "EMV", "CCE", "JOIN"
+```
+
+Замени на:
+
+```vba
+Case "OP", "OPOH", "AP", "GC", "SSF", "GOR", _
+     "BP", "REC", "EMV", "CCE", "JOIN", "CVD"
+```
+
+Иначе передача явного списка с `CVD` или `OPOH` может быть отклонена ещё до запуска Python. 
+
+После добавления `Sleep 25`, защиты от повторного запуска и гарантированного `Unload` окно перестанет вызывать ложные зависания Excel и всегда будет закрываться вместе с завершением операции.
