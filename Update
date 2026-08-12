@@ -1,188 +1,722 @@
-Да. REC теперь надо довести до той же схемы, но здесь есть две особенности:
+Attribute VB_Name = "Rec"
+Option Explicit
 
-* `rowIdRec` хранится в именованных диапазонах `Rec_N_rowIdRec1 ... rowIdRec12`;
-* **сохранение должно проходить все 12 child-компонентов, а не только видимые**, иначе DELETE скрытого очищенного компонента потеряется.
+Private Const COL_RESULT_ID_REC_CHILD_DB As String = "resultIdRec"
+Private Const COL_ROW_ID_REC_CHILD_DB As String = "rowIdRec"
+Private Const COL_MIX_SAMPLE_CODE_CHILD_DB As String = "mixSampleCode"
+Private Const COL_MASS_FRACTION_CHILD_DB As String = "massFraction"
+Private Const COL_P_TRANSFER_CHILD_DB As String = "Ptransfer"
+Private Const COL_T_TRANSFER_CHILD_DB As String = "Ttransfer"
+Private Const COL_DENSITY_CHILD_DB As String = "Density"
+Private Const COL_FIRST_CHILD_DB As String = "first"
+Private Const COL_VOLUME_CHILD_DB As String = "Volume"
+Private Const COL_MASS_CHILD_DB As String = "Mass"
 
-Сейчас `Save_Rec` ещё использует старые `BuildOldChildRowIdMap/GetOldChildRowId`, а цикл идёт только до `GetRecVisibleColumnCount(i)`.  
+Private Const COL_RESULT_ID_REC_DB As String = "resultIdRec"
+Private Const COL_TASK_ID_DB As String = "TaskId"
+Private Const COL_SAMPLE_CODE_DB As String = "sampleCode"
+Private Const COL_OPERATOR_DB As String = "operator"
+Private Const COL_DATE_DB As String = "date"
+Private Const COL_EQUIPMENT_FOR_TRANSFER_DB As String = "equipmentForTransfer"
+Private Const COL_EQUIPMENT_NUMBER_DB As String = "equipmentNumber"
+Private Const COL_TYPE_SAMPLER_DB As String = "typeSampler"
+Private Const COL_NUMBER_SAMPLER_DB As String = "numberSampler"
+'
+Private Const REC_FIRST_FORM_FIRST_COL As Long = 1
+Private Const REC_PAGE_ROW As Long = 5
+Private Const REC_PAGE_FIRST_COL As Long = 11
+Private Const REC_FIRST_CHILD_COL As Long = 8
+Private Const REC_CHILD_COUNT_PER_FORM As Long = 12
+Private Const REC_FIXED_VISIBLE_CHILD_COUNT As Long = 4
+Private Const REC_FIRST_HIDDEN_CHILD_INDEX As Long = 5
 
-### 1. Добавить `rowIdRec` в создание имён новой формы
+Private Enum RecFormState
+    REC_FORM_EMPTY = 0
+    REC_FORM_RESERVED = 1
+    REC_FORM_FILLED = 2
+End Enum
 
-Сейчас `CreateRecChildNamesForNewForm` создаёт имена только пользовательских child-полей. 
 
-Добавь первым:
+Public Sub AddFormREC()
 
-```vb
-childFields = Array( _
-    COL_ROW_ID_REC_CHILD_DB, _
-    COL_MIX_SAMPLE_CODE_CHILD_DB, _
-    COL_MASS_FRACTION_CHILD_DB, _
-    COL_P_TRANSFER_CHILD_DB, _
-    COL_T_TRANSFER_CHILD_DB, _
-    COL_DENSITY_CHILD_DB, _
-    COL_FIRST_CHILD_DB, _
-    COL_VOLUME_CHILD_DB, _
-    COL_MASS_CHILD_DB _
-)
-```
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
 
-Больше ничего менять там не надо: `ResetCopiedCell` автоматически очистит скопированный `rowIdRec`.
+    Dim sheetREC As Worksheet
+    Set sheetREC = wb.Worksheets("Rec")
 
----
+    Dim lastList As Long
+    Dim lastColumn As Long
+    Dim firstColumn As Long
+    Dim lenght As Long
 
-### 2. `CheckRecTask` перенести внутрь `Validate_Rec_Form`
+    lenght = sheetREC.Range("Rec_2_sampleCode").Column - sheetREC.Range("Rec_1_sampleCode").Column
+    lastList = sheetREC.CheckBoxes.count \ REC_CHILD_COUNT_PER_FORM + 1
 
-Это здесь уже **нужно**, а не просто косметика. Иначе `Save_Rec` может пропустить форму из-за `CheckRecTask`, а `CalculateCurrentRecHash` всё равно включит её в хэш.
+    lastColumn = lastList * lenght + REC_FIRST_FORM_FIRST_COL - 1
+    firstColumn = lastColumn - lenght + 1
 
-Сейчас старый вызов находится непосредственно в `Save_Rec`. 
+    sheetREC.Activate
 
-Переделай функцию:
+    Dim oldCopyObjectsWithCells As Boolean
+    oldCopyObjectsWithCells = Application.CopyObjectsWithCells
+    
+    Application.CopyObjectsWithCells = False
+    
+    sheetREC.Activate
+    
+    sheetREC.Range( _
+        sheetREC.columns(firstColumn - lenght), _
+        sheetREC.columns(lastColumn - lenght) _
+    ).EntireColumn.Copy
+    
+    sheetREC.columns(firstColumn).PasteSpecial Paste:=xlPasteAll
+    sheetREC.columns(firstColumn).PasteSpecial Paste:=xlPasteColumnWidths
+    
+    Application.CutCopyMode = False
+    Application.CopyObjectsWithCells = oldCopyObjectsWithCells
+    
+    ' Номер страницы
+    sheetREC.Cells(REC_PAGE_ROW, firstColumn + REC_PAGE_FIRST_COL - 1).value = lastList
 
-```vb
-Private Function CheckRecTask( _
-    ByVal taskId As Long, _
-    ByVal sampleCode As String, _
-    ByVal pageNumber As Long _
-) As String
+    ' Создаём новые имена уровня книги для новой формы
+    CreateRecParentNamesForNewForm wb, sheetREC, lastList - 1, lastList, lenght
+    CreateRecChildNamesForNewForm wb, sheetREC, lastList - 1, lastList, lenght
+    
+    ' Принудительно обновляем формулы плотности
+    Dim childIndex As Long
 
-    Dim tasks As ListObject
-    Set tasks = ActiveWorkbook.Worksheets("Task").ListObjects(1)
+    For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+        UpdateRecDensityFormula wb, lastList, childIndex
+    Next childIndex
+    
+    
+    ' создаем чекбоксы новой формы
+    CreateRecFirstCheckBoxes wb, sheetREC, lastList
 
-    Dim taskCheck As Range
-    Set taskCheck = tasks.ListColumns("Номер задания").DataBodyRange.Find( _
-        What:=taskId, LookAt:=xlWhole, SearchOrder:=xlByColumns)
+    ' Скрываем синие колонки начиная с 5-й
+    HideRecExtraChildColumns wb, sheetREC, lastList, firstColumn, lastColumn, 4
+    
+    'добавляем кнопки скрытия/показа колонок
+    CreateRecExtraColumnButtons lastList
 
-    If taskCheck Is Nothing Then
-        CheckRecTask = "Указан неизвестный номер задания " & taskId & _
-            " на странице " & pageNumber & _
-            ". Попробуйте обновить данные проекта или исправьте значение."
+SafeExit:
+
+End Sub
+
+Public Sub showExtraColumn(ByVal show As Boolean)
+    
+    Dim wb As Workbook
+    Dim ws As Worksheet
+    
+    Set wb = ActiveWorkbook
+    Set ws = wb.Worksheets("Rec")
+    
+    Dim formLenght As Long
+
+    formLenght = ws.Range("Rec_2_sampleCode").Column - ws.Range("Rec_1_sampleCode").Column
+
+    Dim sheetREC As Worksheet
+    Set sheetREC = wb.Worksheets("Rec")
+    
+    Dim lenght As Integer
+    lenght = sheetREC.Range("Rec_2_sampleCode").Column - sheetREC.Range("Rec_1_sampleCode").Column
+    
+    Dim currentForm As Integer
+    currentForm = (activeCell.Column - REC_FIRST_FORM_FIRST_COL) \ lenght + 1
+    
+    Dim lastFormColumn As Long
+    lastFormColumn = currentForm * formLenght + REC_FIRST_FORM_FIRST_COL - 1
+    
+    Dim firstFormColumn As Long
+    firstFormColumn = lastFormColumn - formLenght + 1
+    
+    Dim countVisibleColumns As Integer
+    
+    countVisibleColumns = GetRecVisibleColumnCount(currentForm)
+    
+    If show Then
+        If countVisibleColumns >= 12 Then
+            Exit Sub
+        End If
+        HideRecExtraChildColumns wb, ws, currentForm, firstFormColumn, lastFormColumn, countVisibleColumns + 1
+    Else
+        If countVisibleColumns <= 4 Then Exit Sub
+        
+        If RecChildHasData(wb, currentForm, countVisibleColumns) Then Exit Sub
+        
+        HideRecExtraChildColumns wb, ws, currentForm, firstFormColumn, lastFormColumn, countVisibleColumns - 1
+    End If
+    SyncFormCheckBoxesVisibilityWithColumns ws
+End Sub
+
+
+Private Sub CreateRecParentNamesForNewForm( _
+    ByVal wb As Workbook, _
+    ByVal ws As Worksheet, _
+    ByVal oldFormNumber As Long, _
+    ByVal newFormNumber As Long, _
+    ByVal formLength As Long)
+
+    Dim tableRecResult As ListObject
+    Set tableRecResult = wb.Worksheets("Rec_results").ListObjects("Rec_results")
+
+    Dim headerCell As Range
+    Dim fieldName As String
+
+    Dim oldName As String
+    Dim newName As String
+
+    Dim oldRange As Range
+    Dim newRange As Range
+
+    For Each headerCell In tableRecResult.HeaderRowRange
+
+        fieldName = CStr(headerCell.value)
+
+        If fieldName = vbNullString Then GoTo ContinueLoop
+        If fieldName = "dateTimeSync" Then GoTo ContinueLoop
+
+        oldName = "Rec_" & oldFormNumber & "_" & fieldName
+        newName = "Rec_" & newFormNumber & "_" & fieldName
+
+        Set oldRange = GetNamedRangeStrict(wb, oldName)
+        Set newRange = ws.Cells(oldRange.row, oldRange.Column + formLength)
+
+        SetWorkbookLevelName wb, newName, newRange
+
+        ResetCopiedCell newRange, oldFormNumber, newFormNumber
+
+ContinueLoop:
+    Next headerCell
+
+End Sub
+
+Private Sub CreateRecChildNamesForNewForm( _
+    ByVal wb As Workbook, _
+    ByVal ws As Worksheet, _
+    ByVal oldFormNumber As Long, _
+    ByVal newFormNumber As Long, _
+    ByVal formLength As Long)
+
+    Dim childFields As Variant
+
+    childFields = Array( _
+        COL_ROW_ID_REC_CHILD_DB, _
+        COL_MIX_SAMPLE_CODE_CHILD_DB, _
+        COL_MASS_FRACTION_CHILD_DB, _
+        COL_P_TRANSFER_CHILD_DB, _
+        COL_T_TRANSFER_CHILD_DB, _
+        COL_DENSITY_CHILD_DB, _
+        COL_FIRST_CHILD_DB, _
+        COL_VOLUME_CHILD_DB, _
+        COL_MASS_CHILD_DB _
+    )
+
+    Dim fieldIndex As Long
+    Dim childIndex As Long
+
+    Dim fieldName As String
+    Dim oldName As String
+    Dim newName As String
+
+    Dim oldRange As Range
+    Dim newRange As Range
+
+    For fieldIndex = LBound(childFields) To UBound(childFields)
+
+        fieldName = CStr(childFields(fieldIndex))
+
+        For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+
+            oldName = "Rec_" & oldFormNumber & "_" & fieldName & childIndex
+            newName = "Rec_" & newFormNumber & "_" & fieldName & childIndex
+
+            Set oldRange = GetNamedRangeStrict(wb, oldName)
+            Set newRange = ws.Cells(oldRange.row, oldRange.Column + formLength)
+
+            SetWorkbookLevelName wb, newName, newRange
+
+            If fieldName = COL_FIRST_CHILD_DB Then
+                newRange.value = False
+            ElseIf fieldName <> COL_DENSITY_CHILD_DB Then
+                ResetCopiedCell newRange, oldFormNumber, newFormNumber
+            End If
+
+        Next childIndex
+
+    Next fieldIndex
+
+End Sub
+
+Private Sub UpdateRecDensityFormula( _
+    ByVal wb As Workbook, _
+    ByVal formNumber As Long, _
+    ByVal childIndex As Long)
+
+    Dim densityName As String
+    Dim sampleCodeName As String
+    Dim pTransferName As String
+    Dim tTransferName As String
+
+    densityName = "Rec_" & formNumber & "_" & COL_DENSITY_CHILD_DB & childIndex
+    sampleCodeName = "Rec_" & formNumber & "_" & COL_MIX_SAMPLE_CODE_CHILD_DB & childIndex
+    pTransferName = "Rec_" & formNumber & "_" & COL_P_TRANSFER_CHILD_DB & childIndex
+    tTransferName = "Rec_" & formNumber & "_" & COL_T_TRANSFER_CHILD_DB & childIndex
+
+    Dim densityCell As Range
+    Set densityCell = GetNamedRangeStrict(wb, densityName)
+
+    Dim q As String
+    q = Chr$(34)
+
+    densityCell.FormulaLocal = _
+        "=@ЕСЛИ(" & sampleCodeName & "=" & q & q & _
+        "; " & q & q & _
+        "; getAPUnit2(" & sampleCodeName & _
+        ";" & pTransferName & _
+        ";" & tTransferName & _
+        ";" & q & "psi" & q & _
+        ";ИСТИНА;AP_results!$AA$1))"
+
+End Sub
+
+Public Sub SetWorkbookLevelName( _
+    ByVal wb As Workbook, _
+    ByVal rangeName As String, _
+    ByVal targetRange As Range)
+
+    DeleteNameIfExists wb, rangeName
+
+    wb.Names.Add _
+        name:=rangeName, _
+        RefersTo:="=" & targetRange.Address(External:=True)
+
+End Sub
+
+Private Sub DeleteNameIfExists( _
+    ByVal wb As Workbook, _
+    ByVal rangeName As String)
+
+    Dim ws As Worksheet
+
+    On Error Resume Next
+
+    wb.Names(rangeName).Delete
+
+    For Each ws In wb.Worksheets
+        ws.Names(rangeName).Delete
+    Next ws
+
+    On Error GoTo 0
+
+End Sub
+
+Public Function GetNamedRangeStrict( _
+    ByVal wb As Workbook, _
+    ByVal rangeName As String) As Range
+
+    Dim resultRange As Range
+    Dim ws As Worksheet
+
+    On Error Resume Next
+    Set resultRange = wb.Names(rangeName).RefersToRange
+    On Error GoTo 0
+
+    If Not resultRange Is Nothing Then
+        Set GetNamedRangeStrict = resultRange
         Exit Function
     End If
 
-    Dim taskRowIndex As Long
-    taskRowIndex = taskCheck.Row - tasks.DataBodyRange.Row + 1
+    For Each ws In wb.Worksheets
 
-    If CStr(tasks.ListColumns("Код проекта").DataBodyRange.Cells(taskRowIndex, 1).Value) <> sampleCode Then
-        CheckRecTask = "Указан неверный номер задания " & taskId & _
-            " на странице " & pageNumber & _
-            ". Шифр пробы в задании отличается от шифра пробы в исследовании."
-        Exit Function
-    End If
+        On Error Resume Next
+        Set resultRange = ws.Names(rangeName).RefersToRange
+        On Error GoTo 0
 
-    CheckRecTask = "OK"
-
-End Function
-```
-
-В `Validate_Rec_Form`, после проверки `TaskId` на число/целое, добавь:
-
-```vb
-If fieldName = COL_TASK_ID_DB And valueText <> "" And IsNumeric(fieldValue) Then
-    If CDbl(fieldValue) = Fix(CDbl(fieldValue)) And CDbl(fieldValue) > 0 Then
-
-        Dim taskCheckResult As String
-        taskCheckResult = CheckRecTask( _
-            CLng(fieldValue), _
-            CStr(sheetREC.Range("Rec_" & formIndex & "_sampleCode").Value), _
-            formIndex)
-
-        If taskCheckResult <> "OK" Then
-            AddValidationError errors, errorCount, taskCheckResult, rng
+        If Not resultRange Is Nothing Then
+            Set GetNamedRangeStrict = resultRange
+            Exit Function
         End If
 
+    Next ws
+
+    Err.Raise vbObjectError + 2100, , _
+        "Именованный диапазон не найден: " & rangeName
+
+End Function
+
+Public Sub ResetCopiedCell( _
+    ByVal targetCell As Range, _
+    ByVal oldFormNumber As Long, _
+    ByVal newFormNumber As Long)
+
+    If targetCell.HasFormula Then
+
+        If targetCell.HasArray Then
+            targetCell.FormulaArray = Replace( _
+                targetCell.FormulaArray, _
+                "_ " & oldFormNumber, _
+                "_ " & newFormNumber _
+            )
+        Else
+            targetCell.Formula = Replace( _
+                targetCell.Formula, _
+                "_" & oldFormNumber, _
+                "_" & newFormNumber _
+            )
+        End If
+
+    Else
+        targetCell.value = vbNullString
     End If
-End If
-```
 
-А из `Save_Rec` удалить `tasks`, `curTask` и старый вызов `CheckRecTask`.
+End Sub
 
-И порядок в начале цикла лучше сделать:
+Private Sub CreateRecFirstCheckBoxes( _
+    ByVal wb As Workbook, _
+    ByVal ws As Worksheet, _
+    ByVal formNumber As Long)
 
-```vb
-formState = Get_Rec_FormState(i)
+    Dim i As Long
+    Dim rangeName As String
+    Dim linkedCell As Range
+    Dim area As Range
+    Dim cb As CheckBox
 
-Select Case formState
-    Case REC_FORM_EMPTY, REC_FORM_RESERVED
-        GoTo NextForm
-    Case REC_FORM_FILLED
-End Select
+    Const CB_SIZE As Double = 14
 
-If sheetREC.Range("Rec_" & i & "_TaskId").MergeArea.Interior.ColorIndex = 3 Then
-    GoTo NextForm
-End If
+    For i = 1 To 12
 
-If Not Validate_Rec_Form(i) Then Exit Function
-```
+        rangeName = "Rec_" & formNumber & "_" & COL_FIRST_CHILD_DB & i
 
-То есть отменённую форму вообще не валидируем.
+        Set linkedCell = wb.Names(rangeName).RefersToRange
 
----
+        If linkedCell.MergeCells Then
+            Set area = linkedCell.MergeArea
+        Else
+            Set area = linkedCell
+        End If
 
-### 3. Удалить старую позиционную схему `rowId`
+        Set cb = ws.CheckBoxes.Add( _
+            area.Left, _
+            area.Top, _
+            area.Width, _
+            area.Height _
+        )
+        
+        With cb
+            .name = "CheckBox_Rec_" & formNumber & "_" & i
+            .caption = vbNullString
+            .linkedCell = "'" & ws.name & "'!" & linkedCell.Address(False, False)
+            .value = xlOff
+            .Placement = xlMove
+            .OnAction = "checkbox_disable"
+        End With
 
-Полностью удалить:
+        linkedCell.value = False
 
-```vb
-Dim oldSourceRowIds As Object
-Set oldSourceRowIds = BuildOldChildRowIdMap( _
-    recSourceDataTable, _
-    COL_ROW_ID_REC_CHILD_DB, _
-    COL_RESULT_ID_REC_CHILD_DB _
-)
-```
+    Next i
 
-И:
+End Sub
 
-```vb
-oldRowIdRec = GetOldChildRowId(oldSourceRowIds, parentKey, childIndex)
-```
+Private Function FindCheckBoxOnRange( _
+    ByVal ws As Worksheet, _
+    ByVal targetRange As Range) As CheckBox
 
-Теперь:
+    Dim cb As CheckBox
+    Dim area As Range
 
-```vb
-oldRowIdRec = NormalizeKeyValue( _
-    GetNamedRangeStrict( _
-        wb, _
-        "Rec_" & i & "_" & COL_ROW_ID_REC_CHILD_DB & childIndex _
-    ).Value _
-)
-```
+    If targetRange.MergeCells Then
+        Set area = targetRange.MergeArea.Cells(1, 1)
+    Else
+        Set area = targetRange.Cells(1, 1)
+    End If
 
-Главное — цикл меняем:
+    For Each cb In ws.CheckBoxes
 
-```vb
-For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
-```
+        If cb.TopLeftCell.row = area.row _
+           And cb.TopLeftCell.Column = area.Column Then
 
-а **не**:
+            Set FindCheckBoxOnRange = cb
+            Exit Function
 
-```vb
-For childIndex = 1 To GetRecVisibleColumnCount(i)
-```
+        End If
 
-Это принципиально для DELETE.
+    Next cb
 
-Логика дальше уже правильная:
+    Err.Raise vbObjectError + 2200, , _
+        "Не найден CheckBox для ячейки: " & area.Address(External:=True)
 
-```vb
-If hasChildData Or Len(oldRowIdRec) > 0 Then
-```
+End Function
 
-Получится:
+Private Sub HideRecExtraChildColumns( _
+    ByVal wb As Workbook, _
+    ByVal ws As Worksheet, _
+    ByVal formNumber As Long, _
+    ByVal firstFormCol As Long, _
+    ByVal lastFormCol As Long, _
+    ByVal visibleChildCount As Long)
 
-```text
-rowId есть + данные есть     → UPDATE
-rowId нет + данные есть      → INSERT
-rowId есть + данных нет      → DELETE
-rowId нет + данных нет       → ignore
-```
+    Const MIN_VISIBLE_CHILD_COUNT As Long = 4
 
----
+    If visibleChildCount < MIN_VISIBLE_CHILD_COUNT Or visibleChildCount > REC_CHILD_COUNT_PER_FORM Then
+        Err.Raise vbObjectError + 2400, , _
+            "Количество видимых синих колонок должно быть от " & _
+            MIN_VISIBLE_CHILD_COUNT & " до " & REC_CHILD_COUNT_PER_FORM & _
+            ". Передано: " & visibleChildCount
+    End If
 
-### 4. Добавить хэш REC
+    ' Сначала показываем всю область формы
+    ws.Range( _
+        ws.Cells(1, firstFormCol), _
+        ws.Cells(1, lastFormCol - 1) _
+    ).EntireColumn.Hidden = False
 
-`rowIdRec` и `resultIdRec` в хэш не входят.
+    ' Если нужно показать все 12 — больше ничего не скрываем
+    If visibleChildCount = REC_CHILD_COUNT_PER_FORM Then
+        Exit Sub
+    End If
 
-```vb
+    Dim firstHiddenName As String
+    Dim firstHiddenRange As Range
+
+    ' Первая скрываемая синяя колонка = visibleChildCount + 1
+    firstHiddenName = "Rec_" & formNumber & "_" & _
+                      COL_MIX_SAMPLE_CODE_CHILD_DB & _
+                      (visibleChildCount + 1)
+
+    Set firstHiddenRange = GetNamedRangeStrict(wb, firstHiddenName)
+
+    ' Начиная со следующей после видимой — скрываем
+    ws.Range( _
+        ws.Cells(1, firstHiddenRange.Column), _
+        ws.Cells(1, lastFormCol - 1) _
+    ).EntireColumn.Hidden = True
+    
+    SyncFormCheckBoxesVisibilityWithColumns ws
+    
+End Sub
+
+
+Public Function Save_Rec(Optional ByVal taskStatus As String = "") As macroResult
+    On Error GoTo ErrHandler
+    Save_Rec = MACRO_FAILED
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetREC As Worksheet
+    Set sheetREC = wb.Worksheets("Rec")
+
+    Dim sheetRecResults As Worksheet
+    Set sheetRecResults = wb.Worksheets("Rec_results")
+
+    Dim sheetRecSourceData As Worksheet
+    Set sheetRecSourceData = wb.Worksheets("Rec_sourceData")
+
+    Dim recTable As ListObject
+    Set recTable = sheetRecResults.ListObjects("Rec_results")
+
+    Dim recSourceDataTable As ListObject
+    Set recSourceDataTable = sheetRecSourceData.ListObjects("Rec_sourceData")
+
+    Dim parentRows As Collection
+    Set parentRows = New Collection
+
+    Dim newResultIDs As Collection
+    Set newResultIDs = New Collection
+
+    Dim childRows As Collection
+    Set childRows = New Collection
+
+    Dim sourceFormNumbers As Collection
+    Set sourceFormNumbers = New Collection
+
+    Dim i As Long
+    Dim formState As RecFormState
+    i = 1
+
+    Do While NamedRangeExists(wb, "Rec_" & i & "_sampleCode")
+        
+        formState = Get_Rec_FormState(i)
+
+        Select Case formState
+    
+            Case REC_FORM_EMPTY, REC_FORM_RESERVED
+                GoTo NextForm
+    
+            Case REC_FORM_FILLED
+                ' продолжаем
+    
+        End Select
+
+        If sheetREC.Range("Rec_" & i & "_TaskId").MergeArea.Interior.ColorIndex = 3 Then
+            GoTo NextForm
+        End If
+
+        If Not Validate_Rec_Form(i) Then Exit Function
+
+        Dim resultIdValue As Variant
+        Dim parentKey As String
+
+        resultIdValue = sheetREC.Range("Rec_" & i & "_" & COL_RESULT_ID_REC_DB).Value
+
+        If Len(NormalizeKeyValue(resultIdValue)) = 0 Or NormalizeKeyValue(resultIdValue) = "0" Then
+            parentKey = "temp_" & i
+        Else
+            parentKey = NormalizeKeyValue(resultIdValue)
+        End If
+
+        If IsNumeric(parentKey) Then newResultIDs.Add parentKey
+
+        Dim parentRow() As Variant
+        ReDim parentRow(1 To recTable.ListColumns.count)
+
+        Dim headerCell As Range
+        Dim headerName As String
+        Dim parentColIndex As Long
+
+        For Each headerCell In recTable.HeaderRowRange.Cells
+
+            headerName = CStr(headerCell.value)
+            parentColIndex = recTable.ListColumns(headerName).index
+
+            If headerName = "dateTimeSync" Then
+                parentRow(parentColIndex) = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+
+            ElseIf headerName = COL_RESULT_ID_REC_DB Then
+                parentRow(parentColIndex) = parentKey
+
+            ElseIf NamedRangeExists(wb, "Rec_" & i & "_" & headerName) Then
+                parentRow(parentColIndex) = FormatValueForSyncText( _
+                    headerName, _
+                    sheetREC.Range("Rec_" & i & "_" & headerName).value _
+                )
+
+            Else
+                parentRow(parentColIndex) = vbNullString
+            End If
+
+        Next headerCell
+
+        parentRows.Add parentRow
+        sourceFormNumbers.Add i
+
+        Dim childIndex As Long
+
+        For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+
+            Dim hasChildData As Boolean
+            Dim oldRowIdRec As String
+
+            hasChildData = RecChildHasData(wb, i, childIndex)
+            
+            If hasChildData Then
+                Call ConvertRecDensityFormulaToValue(wb, i, childIndex)
+            End If
+
+            oldRowIdRec = NormalizeKeyValue( _
+                GetNamedRangeStrict( _
+                    wb, _
+                    "Rec_" & i & "_" & COL_ROW_ID_REC_CHILD_DB & childIndex _
+                ).Value _
+            )
+
+            If hasChildData Or Len(oldRowIdRec) > 0 Then
+
+                Dim childRow() As Variant
+                ReDim childRow(1 To recSourceDataTable.ListColumns.count)
+
+                childRow(recSourceDataTable.ListColumns(COL_ROW_ID_REC_CHILD_DB).index) = oldRowIdRec
+                childRow(recSourceDataTable.ListColumns(COL_RESULT_ID_REC_CHILD_DB).index) = parentKey
+
+                If hasChildData Then
+                    FillRecChildField wb, recSourceDataTable, childRow, i, childIndex, COL_MIX_SAMPLE_CODE_CHILD_DB
+                    FillRecChildField wb, recSourceDataTable, childRow, i, childIndex, COL_MASS_FRACTION_CHILD_DB
+                    FillRecChildField wb, recSourceDataTable, childRow, i, childIndex, COL_P_TRANSFER_CHILD_DB
+                    FillRecChildField wb, recSourceDataTable, childRow, i, childIndex, COL_T_TRANSFER_CHILD_DB
+                    FillRecChildField wb, recSourceDataTable, childRow, i, childIndex, COL_DENSITY_CHILD_DB
+                    FillRecChildField wb, recSourceDataTable, childRow, i, childIndex, COL_FIRST_CHILD_DB
+                    FillRecChildField wb, recSourceDataTable, childRow, i, childIndex, COL_VOLUME_CHILD_DB
+                    FillRecChildField wb, recSourceDataTable, childRow, i, childIndex, COL_MASS_CHILD_DB
+                End If
+
+                childRows.Add childRow
+            End If
+
+        Next childIndex
+
+NextForm:
+        i = i + 1
+    Loop
+
+    Dim newHashResult As String
+    Dim oldHashResult As String
+
+    newHashResult = CalculateCurrentRecHash()
+    oldHashResult = GetWorkbookMetadataProperty(wb, PROP_REC_DATA_HASH)
+
+    If newHashResult = oldHashResult Then
+        Save_Rec = MACRO_NO_CHANGES
+        Exit Function
+    End If
+
+    Dim cellID As Range
+    Dim oldResultID As String
+
+    If Not recTable.DataBodyRange Is Nothing Then
+
+        For Each cellID In recTable.ListColumns(COL_RESULT_ID_REC_DB).DataBodyRange.Cells
+
+            If Not IsError(cellID.Value) Then
+                oldResultID = NormalizeKeyValue(cellID.Value)
+
+                If IsNumeric(oldResultID) And oldResultID <> "0" Then
+                    If Not CollectionContains(newResultIDs, oldResultID) Then
+
+                        MsgBox "Удалены данные синхронизированной формы REC. " & _
+                            "Синхронизация невозможна. Вызовите загрузку данных из БД.", vbExclamation
+
+                        Save_Rec = MACRO_FAILED
+                        Exit Function
+                    End If
+                End If
+            End If
+
+        Next cellID
+
+    End If
+
+    WriteCollectionToListObject recTable, parentRows
+    WriteCollectionToListObject recSourceDataTable, childRows
+
+    Dim syncResult As String
+    syncResult = RunStudySync("save", studies:="REC", taskStatus:=taskStatus)
+
+    If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
+
+        Call DeleteEmptyRowsByColumns( _
+            recSourceDataTable, COL_ROW_ID_REC_CHILD_DB, _
+            Array(COL_MIX_SAMPLE_CODE_CHILD_DB, COL_P_TRANSFER_CHILD_DB, _
+                COL_T_TRANSFER_CHILD_DB, COL_MASS_CHILD_DB) _
+        )
+
+        Call Load_Rec_results_to_forms("by_key", Array(COL_RESULT_ID_REC_DB, COL_ROW_ID_REC_CHILD_DB))
+        Call SetWorkbookMetadataProperty(wb, PROP_REC_DATA_HASH, newHashResult, False)
+    Else
+        MsgBox "Python-синхронизация REC не подтвердила успешное сохранение." & _
+            vbCrLf & vbCrLf & syncResult, vbExclamation
+        Exit Function
+    End If
+
+    Save_Rec = MACRO_CHANGED
+    Exit Function
+
+ErrHandler:
+    Debug.Print Err.Number & ": " & Err.Description
+    Save_Rec = MACRO_FAILED
+End Function
+
 Public Function CalculateCurrentRecHash() As String
 
     Dim data As Object
@@ -284,209 +818,1808 @@ NextForm:
     Set Build_Rec_HashData = data
 
 End Function
-```
 
-Здесь я специально использую `childDataIndex`, а не физический `childIndex`: пустой промежуток между компонентами сам по себе хэш не меняет, но порядок реальных компонентов меняет.
-
----
-
-### 5. Добавить `newResultIDs`
-
-В `Save_Rec`:
-
-```vb
-Dim newResultIDs As Collection
-Set newResultIDs = New Collection
-```
-
-`parentKey` лучше сразу привести к нашей новой общей схеме:
-
-```vb
-resultIdValue = sheetREC.Range("Rec_" & i & "_" & COL_RESULT_ID_REC_DB).Value
-
-If Len(NormalizeKeyValue(resultIdValue)) = 0 Or NormalizeKeyValue(resultIdValue) = "0" Then
-    parentKey = "temp_" & i
-Else
-    parentKey = NormalizeKeyValue(resultIdValue)
-End If
-
-If IsNumeric(parentKey) Then newResultIDs.Add parentKey
-```
-
----
-
-### 6. Перед записью staging проверить хэш и удалённые формы
-
-После всех циклов:
-
-```vb
-Dim newHashResult As String
-Dim oldHashResult As String
-
-newHashResult = CalculateCurrentRecHash()
-oldHashResult = GetWorkbookMetadataProperty(wb, PROP_REC_DATA_HASH)
-
-If newHashResult = oldHashResult Then
-    Save_Rec = MACRO_NO_CHANGES
-    Exit Function
-End If
-```
-
-Потом защита от удаления синхронизированной формы:
-
-```vb
-Dim cellID As Range
-Dim oldResultID As String
-
-If Not recTable.DataBodyRange Is Nothing Then
-
-    For Each cellID In recTable.ListColumns(COL_RESULT_ID_REC_DB).DataBodyRange.Cells
-
-        If Not IsError(cellID.Value) Then
-            oldResultID = NormalizeKeyValue(cellID.Value)
-
-            If IsNumeric(oldResultID) And oldResultID <> "0" Then
-                If Not CollectionContains(newResultIDs, oldResultID) Then
-
-                    MsgBox "Удалены данные синхронизированной формы REC. " & _
-                        "Синхронизация невозможна. Вызовите загрузку данных из БД.", vbExclamation
-
-                    Save_Rec = MACRO_FAILED
-                    Exit Function
+Sub checkbox_disable()
+    
+    Dim sheetREC As Worksheet
+    Set sheetREC = ActiveWorkbook.Worksheets("Rec")
+    
+    Dim chbox As CheckBox
+    Set chbox = sheetREC.CheckBoxes(Application.Caller)
+    Dim list As Integer
+    list = Split(chbox.name, "_")(2)
+    Dim ch As CheckBox
+    Dim i As Integer
+    If chbox.value = xlOn Then
+        For i = 1 To 12
+            Set ch = sheetREC.CheckBoxes("CheckBox_Rec_" & list & "_" & i)
+            If ch.name <> chbox.name Then
+                ch.value = xlOff
+            End If
+        Next i
+    Else
+        For i = 1 To 12
+            Set ch = sheetREC.CheckBoxes("CheckBox_Rec_" & list & "_" & i)
+            If ch.name <> chbox.name Then
+                If ch.value = xlOn Then
+                    Exit For
                 End If
             End If
+        Next i
+        chbox.value = xlOn
+    End If
+    
+End Sub
+
+
+Sub equipmentModelsRefreshRec()
+
+    Dim sheetREC As Worksheet
+    Set sheetREC = ActiveWorkbook.Sheets("Rec")
+    
+    Dim eq() As String
+    
+    eq = getEquipmentModels("", "PVTCell")
+    Dim strEqTS As String
+    strEqTS = eq(1)
+    For i = 2 To UBound(eq)
+        strEqTS = strEqTS & "," & eq(i)
+    Next i
+    
+    eq = getEquipmentModels("", "TransferVolume")
+    Dim strEqEq As String
+    strEqEq = eq(1)
+    For i = 2 To UBound(eq)
+        strEqEq = strEqEq & "," & eq(i)
+    Next i
+    
+    Dim CellTS As Range
+    Dim CellEq As Range
+    i = 1
+    
+    On Error Resume Next
+    Do While True
+        Set CellTS = Nothing
+        Set CellTS = sheetREC.Range("Rec_" & i & "_typeSampler")
+        If CellTS Is Nothing Then Exit Do
+        
+        Set CellEq = sheetREC.Range("Rec_" & i & "_equipmentForTransfer")
+        
+        With CellTS.Validation
+            .Delete
+            .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:= _
+            xlBetween, Formula1:=strEqTS
+            .IgnoreBlank = True
+            .InCellDropdown = True
+            .ShowInput = True
+            .ShowError = True
+        End With
+        With CellEq.Validation
+            .Delete
+            .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:= _
+            xlBetween, Formula1:=strEqEq
+            .IgnoreBlank = True
+            .InCellDropdown = True
+            .ShowInput = True
+            .ShowError = True
+        End With
+        i = i + 1
+    Loop
+    On Error GoTo 0
+    
+End Sub
+
+
+Public Function GetRecVisibleColumnCount( _
+    ByVal formNumber As Long, _
+    Optional ByVal wb As Workbook = Nothing _
+) As Long
+
+    If wb Is Nothing Then Set wb = ActiveWorkbook
+
+    Const REC_FIXED_VISIBLE_BLUE_COLS As Long = 4
+    Const REC_FIRST_DYNAMIC_BLUE_COL_INDEX As Long = 5
+    Const REC_MAX_BLUE_COL_INDEX As Long = 12
+
+    Dim visibleCount As Long
+    visibleCount = REC_FIXED_VISIBLE_BLUE_COLS
+
+    Dim sampleIndex As Long
+    Dim rangeName As String
+    Dim namedRange As Range
+
+    For sampleIndex = REC_FIRST_DYNAMIC_BLUE_COL_INDEX To REC_MAX_BLUE_COL_INDEX
+
+        rangeName = "Rec_" & formNumber & "_" & COL_MIX_SAMPLE_CODE_CHILD_DB & sampleIndex
+
+        If Not TryGetNamedRange(wb, rangeName, namedRange) Then
+            Err.Raise vbObjectError + 2000, , _
+                "Именованный диапазон не найден: " & rangeName
         End If
 
-    Next cellID
+        If IsNamedRangeColumnHidden(namedRange) Then
+            Exit For
+        End If
 
-End If
-```
+        visibleCount = visibleCount + 1
 
-И только потом:
+    Next sampleIndex
 
-```vb
-WriteCollectionToListObject recTable, parentRows
-WriteCollectionToListObject recSourceDataTable, childRows
-```
+    GetRecVisibleColumnCount = visibleCount
 
----
+End Function
 
-### 7. Возврат `rowIdRec` после sync
+Private Function IsNamedRangeColumnHidden(ByVal namedRange As Range) As Boolean
 
-Сейчас загрузчик child-данных не знает о `rowIdRec`: его `childFields` содержит только пользовательские поля. 
+    Dim checkCell As Range
 
-Добавь туда первым:
+    If namedRange.MergeCells Then
+        Set checkCell = namedRange.MergeArea.Cells(1, 1)
+    Else
+        Set checkCell = namedRange.Cells(1, 1)
+    End If
 
-```vb
-COL_ROW_ID_REC_CHILD_DB
-```
+    IsNamedRangeColumnHidden = checkCell.EntireColumn.Hidden
 
-То есть:
+End Function
 
-```vb
-childFields = Array( _
-    COL_ROW_ID_REC_CHILD_DB, _
-    COL_MIX_SAMPLE_CODE_CHILD_DB, _
-    COL_MASS_FRACTION_CHILD_DB, _
-    COL_P_TRANSFER_CHILD_DB, _
-    COL_T_TRANSFER_CHILD_DB, _
-    COL_DENSITY_CHILD_DB, _
-    COL_FIRST_CHILD_DB, _
-    COL_VOLUME_CHILD_DB, _
-    COL_MASS_CHILD_DB _
-)
-```
+Private Function getResultsColumns() As Variant
 
-После этого старые `sourceFormNumbers` и `Load_Rec_result_ids_to_forms(...)` больше не нужны. Сейчас они используются только для возврата родительского ID. 
+    getResultsColumns = Array( _
+        COL_RESULT_ID_REC_CHILD_DB, _
+        COL_ROW_ID_REC_CHILD_DB, _
+        COL_MIX_SAMPLE_CODE_CHILD_DB, _
+        COL_MASS_FRACTION_CHILD_DB, _
+        COL_P_TRANSFER_CHILD_DB, _
+        COL_T_TRANSFER_CHILD_DB, _
+        COL_DENSITY_CHILD_DB, _
+        COL_FIRST_CHILD_DB, _
+        COL_VOLUME_CHILD_DB, _
+        COL_MASS_CHILD_DB _
+    )
+    
+End Function
 
-После успешного sync делай:
+Private Function getSourceDataColumns() As Variant
+    
+    getSourceDataColumns = Array( _
+        COL_RESULT_ID_REC_CHILD_DB, _
+        COL_MIX_SAMPLE_CODE_DB, _
+        COL_MASS_FRACTION_DB, _
+        COL_P_TRANSFER_DB, _
+        COL_T_TRANSFER_DB, _
+        COL_DENSITY_DB, _
+        COL_FIRST_DB, _
+        COL_VOLUME_DB, _
+        COL_MASS_DB _
+    )
+    
+    
+End Function
 
-```vb
-Call DeleteEmptyRowsByColumns( _
-    recSourceDataTable, _
-    COL_ROW_ID_REC_CHILD_DB, _
-    Array(COL_MIX_SAMPLE_CODE_CHILD_DB, COL_P_TRANSFER_CHILD_DB, _
-          COL_T_TRANSFER_CHILD_DB, COL_MASS_CHILD_DB) _
-)
+Private Function RecFormHasAnyChildData( _
+    ByVal wb As Workbook, _
+    ByVal formIndex As Long _
+) As Boolean
 
-Call Load_Rec_results_to_forms( _
-    "by_key", _
-    Array(COL_RESULT_ID_REC_DB, COL_ROW_ID_REC_CHILD_DB) _
-)
+    Dim childIndex As Long
 
-Call SetWorkbookMetadataProperty(wb, PROP_REC_DATA_HASH, newHashResult, False)
-```
+    For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+        If RecChildHasData(wb, formIndex, childIndex) Then
+            RecFormHasAnyChildData = True
+            Exit Function
+        End If
+    Next childIndex
 
-Так `Load_Rec_results_to_forms` запишет `resultIdRec` в parent named range и через `LoadRecSourceDataToIndexedNamedRanges` заполнит:
+    RecFormHasAnyChildData = False
 
-```text
-Rec_1_rowIdRec1
-Rec_1_rowIdRec2
-...
-Rec_1_rowIdRec12
-```
+End Function
 
-актуальными ID из `Rec_sourceData`.
 
----
+Private Function RecChildHasData( _
+    ByVal wb As Workbook, _
+    ByVal formIndex As Long, _
+    ByVal childIndex As Long _
+) As Boolean
 
-### 8. Проверить существование всех `rowIdRecN`
+    RecChildHasData = _
+        RecNamedChildValueHasData(wb, formIndex, childIndex, COL_MIX_SAMPLE_CODE_CHILD_DB) _
+        And (RecNamedChildValueHasData(wb, formIndex, childIndex, COL_P_TRANSFER_CHILD_DB) _
+        Or RecNamedChildValueHasData(wb, formIndex, childIndex, COL_T_TRANSFER_CHILD_DB) _
+        Or RecNamedChildValueHasData(wb, formIndex, childIndex, COL_VOLUME_CHILD_DB))
 
-В пользовательский `childFields` валидации **не добавляй `rowIdRec`**, иначе строка с одним ID, предназначенная для DELETE, начнёт считаться заполненным компонентом.
+End Function
 
-Просто отдельно в `Validate_Rec_Form` проверь структуру:
 
-```vb
-Dim checkChildIndex As Long
+Private Function RecNamedChildValueHasData( _
+    ByVal wb As Workbook, _
+    ByVal formIndex As Long, _
+    ByVal childIndex As Long, _
+    ByVal fieldName As String _
+) As Boolean
 
-For checkChildIndex = 1 To REC_CHILD_COUNT_PER_FORM
-    rangeName = "Rec_" & formIndex & "_" & COL_ROW_ID_REC_CHILD_DB & checkChildIndex
+    Dim rangeName As String
+    rangeName = "Rec_" & formIndex & "_" & fieldName & childIndex
 
     If Not NamedRangeExists(wb, rangeName) Then
-        AddValidationError errors, errorCount, _
-            "Не найден именованный диапазон: " & rangeName
+        RecNamedChildValueHasData = False
+        Exit Function
     End If
-Next checkChildIndex
-```
 
----
+    RecNamedChildValueHasData = _
+        Len(Trim$(CStr(wb.Names(rangeName).RefersToRange.value))) > 0
 
-И в `Save_Rec`, как у остальных, добавь:
+End Function
 
-```vb
-On Error GoTo ErrHandler
-```
 
-а финал:
+Private Sub FillRecChildField( _
+    ByVal wb As Workbook, _
+    ByVal targetTable As ListObject, _
+    ByRef childRow() As Variant, _
+    ByVal formIndex As Long, _
+    ByVal childIndex As Long, _
+    ByVal fieldName As String _
+)
 
-```vb
-Dim syncResult As String
-syncResult = RunStudySync("save", studies:="REC", taskStatus:=taskStatus)
+    If Not ListColumnExists(targetTable, fieldName) Then
+        Exit Sub
+    End If
 
-If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
+    Dim rangeName As String
+    rangeName = "Rec_" & formIndex & "_" & fieldName & childIndex
 
-    Call DeleteEmptyRowsByColumns( _
-        recSourceDataTable, COL_ROW_ID_REC_CHILD_DB, _
-        Array(COL_MIX_SAMPLE_CODE_CHILD_DB, COL_P_TRANSFER_CHILD_DB, _
-              COL_T_TRANSFER_CHILD_DB, COL_MASS_CHILD_DB))
+    If Not NamedRangeExists(wb, rangeName) Then
+        Exit Sub
+    End If
 
-    Call Load_Rec_results_to_forms( _
-        "by_key", Array(COL_RESULT_ID_REC_DB, COL_ROW_ID_REC_CHILD_DB))
+    childRow(targetTable.ListColumns(fieldName).index) = FormatValueForSyncText( _
+        fieldName, _
+        wb.Names(rangeName).RefersToRange.value _
+    )
 
-    Call SetWorkbookMetadataProperty(wb, PROP_REC_DATA_HASH, newHashResult, False)
+End Sub
 
-Else
-    MsgBox "Python-синхронизация REC не подтвердила успешное сохранение." & _
-        vbCrLf & vbCrLf & syncResult, vbExclamation
+
+Private Function CheckRecTask( _
+    ByVal taskId As Long, _
+    ByVal sampleCode As String, _
+    ByVal pageNumber As Long _
+) As String
+
+    Dim tasks As ListObject
+    Set tasks = ActiveWorkbook.Worksheets("Task").ListObjects(1)
+
+    Dim taskCheck As Range
+    Set taskCheck = tasks.ListColumns("Номер задания").DataBodyRange.Find( _
+        What:=taskId, LookAt:=xlWhole, SearchOrder:=xlByColumns)
+
+    If taskCheck Is Nothing Then
+        CheckRecTask = "Указан неизвестный номер задания " & taskId & _
+            " на странице " & pageNumber & _
+            ". Попробуйте обновить данные проекта или исправьте значение."
+        Exit Function
+    End If
+
+    Dim taskRowIndex As Long
+    taskRowIndex = taskCheck.Row - tasks.DataBodyRange.Row + 1
+
+    If CStr(tasks.ListColumns("Код проекта").DataBodyRange.Cells(taskRowIndex, 1).Value) <> sampleCode Then
+        CheckRecTask = "Указан неверный номер задания " & taskId & _
+            " на странице " & pageNumber & _
+            ". Шифр пробы в задании отличается от шифра пробы в исследовании."
+        Exit Function
+    End If
+
+    CheckRecTask = "OK"
+
+End Function
+
+Public Function Load_Rec_results_to_forms( _
+    Optional ByVal mode As String = "sequential", _
+    Optional ByVal fields As Variant, _
+    Optional ByVal silence As Boolean = False _
+) As String
+
+    On Error GoTo CleanFail
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetREC As Worksheet
+    Set sheetREC = wb.Worksheets("Rec")
+
+    Dim resultTable As ListObject
+    Set resultTable = _
+        wb.Worksheets("Rec_results").ListObjects("Rec_results")
+
+    Dim sourceTable As ListObject
+    Set sourceTable = _
+        wb.Worksheets("Rec_sourceData").ListObjects("Rec_sourceData")
+
+    Dim fieldFilter As Object
+    Set fieldFilter = BuildFieldFilter(fields)
+
+    Dim text As String
+    Dim warnText As String
+
+    mode = LCase$(Trim$(mode))
+
+    If mode <> "by_key" And mode <> "sequential" Then
+        text = "ERROR|mode должен быть 'by_key' или 'sequential'"
+        Load_Rec_results_to_forms = text
+
+        If Not silence Then
+            MsgBox text, vbExclamation
+        End If
+
+        Exit Function
+    End If
+
+    If resultTable.DataBodyRange Is Nothing Then
+        text = "OK|Таблица Rec_results пустая."
+        Load_Rec_results_to_forms = text
+
+        If Not silence Then
+            MsgBox text, vbInformation
+        End If
+
+        Exit Function
+    End If
+
+    Dim resultRowIndex As Long
+    Dim formIndex As Long
+    Dim notFoundCount As Long
+
+    For resultRowIndex = 1 To resultTable.ListRows.count
+
+        If mode = "sequential" Then
+
+            formIndex = resultRowIndex
+
+            Do While Not NamedRangeExists( _
+                wb, _
+                "Rec_" & formIndex & "_sampleCode" _
+            )
+                Call AddFormREC
+            Loop
+
+        Else
+
+            formIndex = FindFormIndexForResultRow( _
+                wb, _
+                sheetREC, _
+                resultTable, _
+                resultRowIndex, _
+                "Rec", _
+                Array(COL_SAMPLE_CODE_DB, COL_TASK_ID_DB) _
+            )
+
+        End If
+
+        If formIndex = 0 Or _
+           Not NamedRangeExists( _
+               wb, _
+               "Rec_" & formIndex & "_sampleCode" _
+           ) Then
+
+            notFoundCount = notFoundCount + 1
+
+            warnText = warnText & _
+                "Не найдена форма для строки Rec_results #" & _
+                resultRowIndex & vbCrLf & _
+                "sampleCode = " & _
+                GetTableValue( _
+                    resultTable, _
+                    resultRowIndex, _
+                    COL_SAMPLE_CODE_DB _
+                ) & vbCrLf & _
+                "TaskId = " & _
+                GetTableValue( _
+                    resultTable, _
+                    resultRowIndex, _
+                    COL_TASK_ID_DB _
+                ) & vbCrLf & vbCrLf
+
+            GoTo NextResultRow
+        End If
+
+        ' Родительская строка:
+        ' Rec_results -> Rec_x_*
+        Call CopyTableRowToNamedRanges( _
+            wb, _
+            sheetREC, _
+            resultTable, _
+            resultRowIndex, _
+            "Rec", _
+            formIndex, _
+            fieldFilter _
+        )
+
+        ' Дочерние строки:
+        ' Rec_sourceData -> Rec_x_*1..12
+        Call LoadRecSourceDataToIndexedNamedRanges( _
+            wb, _
+            sourceTable, _
+            GetTableValue( _
+                resultTable, _
+                resultRowIndex, _
+                COL_RESULT_ID_REC_DB _
+            ), _
+            formIndex, _
+            fieldFilter _
+        )
+
+NextResultRow:
+    Next resultRowIndex
+
+    If notFoundCount = 0 Then
+
+        text = "OK|Данные REC перенесены в формы."
+        Load_Rec_results_to_forms = text
+
+        If Not silence Then
+            MsgBox text, vbInformation
+        End If
+
+    Else
+
+        text = _
+            "WARN|Данные REC перенесены частично. " & _
+            "Не найдено форм: " & notFoundCount & _
+            vbCrLf & warnText
+
+        Load_Rec_results_to_forms = text
+
+        If Not silence Then
+            MsgBox text, vbExclamation
+        End If
+
+    End If
+
     Exit Function
-End If
 
-Save_Rec = MACRO_CHANGED
-Exit Function
+CleanFail:
+    text = _
+        "ERROR|" & _
+        CStr(Err.Number) & "|" & _
+        Err.Description
 
-ErrHandler:
-    Debug.Print Err.Number & ": " & Err.Description
-    Save_Rec = MACRO_FAILED
-```
+    Load_Rec_results_to_forms = text
 
-Ключевой момент REC — именно **все 12 child-позиций обрабатывать всегда**. `rowIdRecN` теперь отвечает за идентичность записи независимо от того, видна соответствующая синяя колонка пользователю или уже скрыта. 
+    If Not silence Then
+        MsgBox text, vbCritical
+    End If
+
+End Function
+
+Private Sub LoadRecSourceDataToIndexedNamedRanges( _
+    ByVal wb As Workbook, _
+    ByVal sourceTable As ListObject, _
+    ByVal resultId As Variant, _
+    ByVal formIndex As Long, _
+    ByVal fieldFilter As Object _
+)
+    If sourceTable.DataBodyRange Is Nothing Then Exit Sub
+
+    Dim childFields As Variant
+    childFields = Array( _
+        COL_MIX_SAMPLE_CODE_CHILD_DB, _
+        COL_MASS_FRACTION_CHILD_DB, _
+        COL_P_TRANSFER_CHILD_DB, _
+        COL_T_TRANSFER_CHILD_DB, _
+        COL_DENSITY_CHILD_DB, _
+        COL_FIRST_CHILD_DB, _
+        COL_VOLUME_CHILD_DB, _
+        COL_MASS_CHILD_DB _
+    )
+
+    Dim childIndex As Long
+    Dim fieldIndex As Long
+    Dim fieldName As String
+    Dim rangeName As String
+    Dim targetRange As Range
+
+    ' Сначала очищаем все 12 child-ячеек по нужным полям.
+    For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+        For fieldIndex = LBound(childFields) To UBound(childFields)
+
+            fieldName = CStr(childFields(fieldIndex))
+
+            If ShouldTransferField(fieldFilter, fieldName) Then
+                rangeName = "Rec_" & formIndex & "_" & fieldName & childIndex
+
+                If NamedRangeExists(wb, rangeName) Then
+                    Set targetRange = wb.Names(rangeName).RefersToRange
+
+                    Call ClearRecNamedTarget( _
+                        targetRange, _
+                        fieldName = COL_DENSITY_CHILD_DB _
+                    )
+                End If
+            End If
+
+        Next fieldIndex
+    Next childIndex
+
+    ' Потом заполняем сверху строки Rec_sourceData с нужным resultId.
+    Dim srcRow As Long
+    childIndex = 1
+
+    For srcRow = 1 To sourceTable.ListRows.count
+
+        If NormalizeKeyValue(GetTableValue(sourceTable, srcRow, COL_RESULT_ID_REC_CHILD_DB)) = _
+           NormalizeKeyValue(resultId) Then
+
+            If childIndex > REC_CHILD_COUNT_PER_FORM Then Exit For
+
+            For fieldIndex = LBound(childFields) To UBound(childFields)
+
+                fieldName = CStr(childFields(fieldIndex))
+
+                If ShouldTransferField(fieldFilter, fieldName) Then
+
+                    If ListColumnExists(sourceTable, fieldName) Then
+                        rangeName = "Rec_" & formIndex & "_" & fieldName & childIndex
+
+                        If NamedRangeExists(wb, rangeName) Then
+                            Set targetRange = wb.Names(rangeName).RefersToRange
+
+                            Call WriteRecNamedTarget( _
+                                targetRange, _
+                                GetTableValue(sourceTable, srcRow, fieldName), _
+                                fieldName = COL_DENSITY_CHILD_DB _
+                            )
+                        End If
+                    End If
+
+                End If
+
+            Next fieldIndex
+
+            childIndex = childIndex + 1
+        End If
+
+    Next srcRow
+
+End Sub
+
+Private Sub ClearRecNamedTarget( _
+    ByVal targetRange As Range, _
+    ByVal allowFormulaOverwrite As Boolean _
+)
+    Dim writeCell As Range
+    
+    If targetRange.MergeCells Then
+        Set writeCell = targetRange.MergeArea.Cells(1, 1)
+    Else
+        Set writeCell = targetRange.Cells(1, 1)
+    End If
+    
+    If writeCell.HasFormula And Not allowFormulaOverwrite Then
+        Exit Sub
+    End If
+    
+    If targetRange.MergeCells Then
+        targetRange.MergeArea.ClearContents
+    Else
+        targetRange.ClearContents
+    End If
+End Sub
+
+
+Private Sub WriteRecNamedTarget( _
+    ByVal targetRange As Range, _
+    ByVal value As Variant, _
+    ByVal allowFormulaOverwrite As Boolean _
+)
+    Dim writeCell As Range
+    
+    If targetRange.MergeCells Then
+        Set writeCell = targetRange.MergeArea.Cells(1, 1)
+    Else
+        Set writeCell = targetRange.Cells(1, 1)
+    End If
+    
+    If writeCell.HasFormula And Not allowFormulaOverwrite Then
+        Exit Sub
+    End If
+    
+    writeCell.value = value
+End Sub
+
+Private Sub ConvertRecDensityFormulaToValue( _
+    ByVal wb As Workbook, _
+    ByVal formIndex As Long, _
+    ByVal childIndex As Long _
+)
+    Dim rangeName As String
+    rangeName = "Rec_" & formIndex & "_" & COL_DENSITY_CHILD_DB & childIndex
+
+    If Not NamedRangeExists(wb, rangeName) Then Exit Sub
+
+    Dim targetRange As Range
+    Set targetRange = wb.Names(rangeName).RefersToRange
+
+    Dim writeCell As Range
+
+    If targetRange.MergeCells Then
+        Set writeCell = targetRange.MergeArea.Cells(1, 1)
+    Else
+        Set writeCell = targetRange.Cells(1, 1)
+    End If
+
+    If writeCell.HasFormula Then
+        writeCell.Calculate
+        writeCell.value = writeCell.value
+    End If
+End Sub
+
+Public Function Validate_Rec() As macroResult
+    Validate_Rec = Save_Rec("Валидировано")
+End Function
+
+Public Function cancelCurrentTaskRec() As macroResult
+    
+    cancelCurrentTaskRec = MACRO_FAILED
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetREC As Worksheet
+    Set sheetREC = wb.Worksheets("Rec")
+    
+    Dim lenght As Integer
+    lenght = sheetREC.Range("Rec_2_sampleCode").Column - sheetREC.Range("Rec_1_sampleCode").Column
+    
+    Dim curFormIndex As Integer
+    curFormIndex = (activeCell.Column - REC_FIRST_FORM_FIRST_COL) \ lenght + 1
+    
+    Dim taskCell As Range
+    Set taskCell = sheetREC.Range("Rec_" & curFormIndex & "_taskId")
+    
+    Dim answer As Integer
+    
+    answer = MsgBox("Вы действительно хотите удалить задание №" & taskCell.value & "?", vbQuestion + vbYesNo, "Подтверждение")
+    
+    If answer <> vbYes Then
+        cancelCurrentTaskRec = MACRO_NO_CHANGES
+        Exit Function
+    End If
+    
+    Dim comment As String
+    comment = InputBox("Введите причину отмены:", "Окно ввода")
+    
+    Dim syncResult As String
+    syncResult = SetTaskStatusOnly(taskCell.value, "Rec", "Отмена", comment)
+
+    If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
+        With taskCell.MergeArea
+            .Interior.ColorIndex = 3
+            If .Locked = False Then
+                .Locked = True
+            End If
+        End With
+        cancelCurrentTaskRec = MACRO_CHANGED
+        
+    ElseIf syncResult = "NoComment" Or syncResult = "NoTaskId" Then
+        cancelCurrentTaskRec = MACRO_NO_CHANGES
+        
+    End If
+End Function
+
+Public Function EnsureRecFormExists(ByVal wb As Workbook, ByVal formIndex As Long)
+    
+    Do While Not NamedRangeExists(wb, "Rec_" & formIndex & "_sampleCode")
+        Call AddFormREC
+    Loop
+    
+End Function
+
+Public Function findFormWithTaskIdRec(ByVal wb As Workbook, ByVal taskId As Long)
+    Dim formIndex As Long
+    formIndex = 1
+    Dim sheetREC As Worksheet
+    Set sheetREC = wb.Worksheets("Rec")
+    
+    Do While NamedRangeExists(wb, "Rec_" & formIndex & "_sampleCode")
+        If sheetREC.Range("Rec_" & formIndex & "_taskId") = taskId Then
+            findFormWithTaskIdRec = formIndex
+            Exit Function
+        End If
+        formIndex = formIndex + 1
+    Loop
+    findFormWithTaskIdRec = 0
+End Function
+
+Private Function Validate_Rec_Form( _
+    ByVal formIndex As Long _
+) As Boolean
+
+    Validate_Rec_Form = False
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetREC As Worksheet
+    Set sheetREC = wb.Worksheets("Rec")
+
+    Dim recTable As ListObject
+    Set recTable = _
+        wb.Worksheets("Rec_results") _
+          .ListObjects("Rec_results")
+
+    Dim errors As String
+    Dim errorCount As Long
+
+    If formIndex <= 0 Then
+
+        MsgBox _
+            "Некорректный номер формы REC: " & formIndex, _
+            vbExclamation
+
+        Exit Function
+
+    End If
+
+    If Not NamedRangeExists( _
+        wb, _
+        "Rec_" & formIndex & "_" & COL_SAMPLE_CODE_DB _
+    ) Then
+
+        MsgBox _
+            "Форма Rec_" & formIndex & " не найдена.", _
+            vbExclamation
+
+        Exit Function
+
+    End If
+
+    ' =============================================================
+    ' ПРОВЕРКА РОДИТЕЛЬСКИХ ПОЛЕЙ REC_RESULTS
+    ' =============================================================
+
+    Dim headerCell As Range
+    Dim rng As Range
+    Dim valueCell As Range
+
+    Dim fieldName As String
+    Dim fieldCaption As String
+    Dim rangeName As String
+
+    Dim fieldValue As Variant
+    Dim valueText As String
+
+    For Each headerCell In recTable.HeaderRowRange.Cells
+
+        fieldName = Trim$(CStr(headerCell.value))
+
+        If LCase$(fieldName) = "datetimesync" Then
+            GoTo next_parent_field
+        End If
+
+        rangeName = _
+            "Rec_" & formIndex & "_" & fieldName
+
+        If Not NamedRangeExists(wb, rangeName) Then
+
+            AddValidationError _
+                errors, _
+                errorCount, _
+                "Не найден именованный диапазон: " & rangeName
+
+            GoTo next_parent_field
+
+        End If
+
+        Set rng = GetNamedRangeStrict(wb, rangeName)
+        Set valueCell = rng.Cells(1, 1)
+
+        ' Снимаем результат предыдущей валидации.
+        ClearValidationFill rng
+
+        fieldValue = valueCell.value
+        fieldCaption = REC_FieldCaption(fieldName)
+
+        If IsError(fieldValue) Then
+
+            AddValidationError _
+                errors, _
+                errorCount, _
+                rangeName & _
+                " содержит ошибку Excel: " & _
+                valueCell.text & _
+                " (" & valueCell.Worksheet.name & _
+                "!" & valueCell.Address(False, False) & ")", _
+                rng
+
+            GoTo next_parent_field
+
+        End If
+
+        valueText = Trim$(CStr(fieldValue))
+
+        ' =========================================================
+        ' ГРУППА 1. ОБЯЗАТЕЛЬНЫЕ НЕПУСТЫЕ ПОЛЯ
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_SAMPLE_CODE_DB, _
+                 COL_OPERATOR_DB, _
+                 COL_DATE_DB, _
+                 COL_EQUIPMENT_FOR_TRANSFER_DB, _
+                 COL_EQUIPMENT_NUMBER_DB, _
+                 COL_TYPE_SAMPLER_DB, _
+                 COL_NUMBER_SAMPLER_DB
+
+                If valueText = "" Then
+
+                    AddValidationError _
+                        errors, _
+                        errorCount, _
+                        "Не заполнено обязательное поле """ & _
+                        fieldCaption & """: " & rangeName, _
+                        rng
+
+                End If
+
+        End Select
+
+        ' =========================================================
+        ' ГРУППА 2. ЧИСЛОВЫЕ ПОЛЯ
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_RESULT_ID_REC_DB, _
+                 COL_TASK_ID_DB
+
+                If valueText <> "" Then
+
+                    If Not IsNumeric(fieldValue) Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Поле """ & fieldCaption & _
+                            """ должно содержать число: " & _
+                            rangeName, _
+                            rng
+
+                    End If
+
+                    If fieldName = COL_TASK_ID_DB And valueText <> "" And IsNumeric(fieldValue) Then
+                        If CDbl(fieldValue) = Fix(CDbl(fieldValue)) And CDbl(fieldValue) > 0 Then
+
+                            Dim taskCheckResult As String
+                            taskCheckResult = CheckRecTask( _
+                                CLng(fieldValue), _
+                                CStr(sheetREC.Range("Rec_" & formIndex & "_sampleCode").Value), _
+                                formIndex)
+
+                            If taskCheckResult <> "OK" Then
+                                AddValidationError errors, errorCount, taskCheckResult, rng
+                            End If
+
+                        End If
+                    End If
+                End If
+
+        End Select
+
+        ' =========================================================
+        ' ГРУППА 3. ЧИСЛА, КОТОРЫЕ ДОЛЖНЫ БЫТЬ БОЛЬШЕ НУЛЯ
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_RESULT_ID_REC_DB, _
+                 "page"
+
+                If valueText <> "" _
+                   And IsNumeric(fieldValue) Then
+
+                    If CDbl(fieldValue) <= 0 Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Поле """ & fieldCaption & _
+                            """ должно быть больше 0: " & _
+                            rangeName, _
+                            rng
+
+                    End If
+
+                End If
+
+        End Select
+
+        ' =========================================================
+        ' ГРУППА 4. ЧИСЛА, КОТОРЫЕ НЕ МОГУТ БЫТЬ ОТРИЦАТЕЛЬНЫМИ
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_TASK_ID_DB
+
+                If valueText <> "" _
+                   And IsNumeric(fieldValue) Then
+
+                    If CDbl(fieldValue) < 0 Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Поле """ & fieldCaption & _
+                            """ не может быть отрицательным: " & _
+                            rangeName, _
+                            rng
+
+                    End If
+
+                End If
+
+        End Select
+
+        ' =========================================================
+        ' ГРУППА 5. ЦЕЛЫЕ ЧИСЛА
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_RESULT_ID_REC_DB, _
+                 COL_TASK_ID_DB, _
+                 "page"
+
+                If valueText <> "" _
+                   And IsNumeric(fieldValue) Then
+
+                    If CDbl(fieldValue) <> _
+                       Fix(CDbl(fieldValue)) Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Поле """ & fieldCaption & _
+                            """ должно содержать целое число: " & _
+                            rangeName, _
+                            rng
+
+                    End If
+
+                End If
+
+        End Select
+
+        ' =========================================================
+        ' ГРУППА 6. ПОЛЯ С ДАТОЙ
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_DATE_DB
+
+                If valueText <> "" Then
+
+                    If Not IsDate(fieldValue) Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Поле """ & fieldCaption & _
+                            """ должно содержать дату: " & _
+                            rangeName, _
+                            rng
+
+                    End If
+
+                End If
+
+        End Select
+
+        ' =========================================================
+        ' ГРУППА 7. ПОЛЯ ВВОДА ИСПОЛНИТЕЛЯ
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_OPERATOR_DB
+
+                If valueText <> "" Then
+
+                    If Not IsValidExecutor(fieldValue) Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Неверно указан исполнитель: " & _
+                            rangeName, _
+                            rng
+
+                    End If
+
+                End If
+
+        End Select
+
+next_parent_field:
+    Next headerCell
+
+    ' =============================================================
+    ' ДОЧЕРНИЕ КОМПОНЕНТЫ REC_X_*1 ... REC_X_*12
+    ' =============================================================
+
+    Dim childFields As Variant
+
+    childFields = Array( _
+        COL_MIX_SAMPLE_CODE_CHILD_DB, _
+        COL_MASS_FRACTION_CHILD_DB, _
+        COL_P_TRANSFER_CHILD_DB, _
+        COL_T_TRANSFER_CHILD_DB, _
+        COL_DENSITY_CHILD_DB, _
+        COL_FIRST_CHILD_DB, _
+        COL_VOLUME_CHILD_DB, _
+        COL_MASS_CHILD_DB _
+    )
+
+    Dim childStarted() As Boolean
+    Dim childIsFirst() As Boolean
+    Dim childMassFractionIsValid() As Boolean
+
+    ReDim childStarted(1 To REC_CHILD_COUNT_PER_FORM)
+    ReDim childIsFirst(1 To REC_CHILD_COUNT_PER_FORM)
+    ReDim childMassFractionIsValid(1 To REC_CHILD_COUNT_PER_FORM)
+
+    Dim childIndex As Long
+    Dim fieldIndex As Long
+
+    Dim rowHasAnyData As Boolean
+    Dim validChildCount As Long
+    Dim firstComponentCount As Long
+
+    Dim massFractionSum As Double
+    Dim validMassFractionCount As Long
+
+    For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+
+        rowHasAnyData = False
+
+        ' ---------------------------------------------------------
+        ' СНАЧАЛА ОЧИЩАЕМ ПОДСВЕТКУ И ОПРЕДЕЛЯЕМ,
+        ' НАЧАТ ЛИ КОМПОНЕНТ
+        ' ---------------------------------------------------------
+
+        For fieldIndex = LBound(childFields) _
+                         To UBound(childFields)
+
+            fieldName = CStr(childFields(fieldIndex))
+
+            rangeName = _
+                "Rec_" & formIndex & "_" & _
+                fieldName & childIndex
+
+            If Not NamedRangeExists(wb, rangeName) Then
+                GoTo next_field_state_check
+            End If
+
+            Set rng = GetNamedRangeStrict(wb, rangeName)
+            Set valueCell = rng.Cells(1, 1)
+
+            ' Убираем старую жёлтую подсветку
+            ' даже у полностью очищенного компонента.
+            ClearValidationFill rng
+
+            fieldValue = valueCell.value
+
+            If IsError(fieldValue) Then
+
+                rowHasAnyData = True
+                Exit For
+
+            End If
+
+            valueText = Trim$(CStr(fieldValue))
+
+            If fieldName = COL_FIRST_CHILD_DB Then
+
+                Select Case LCase$(valueText)
+
+                    Case "", _
+                         "false", _
+                         "ложь", _
+                         "0", _
+                         "нет", _
+                         "-"
+
+                        ' Значение False само по себе
+                        ' не делает компонент заполненным.
+
+                    Case Else
+
+                        rowHasAnyData = True
+                        Exit For
+
+                End Select
+
+            ElseIf valueText <> "" Then
+
+                rowHasAnyData = True
+                Exit For
+
+            End If
+
+next_field_state_check:
+        Next fieldIndex
+
+        childStarted(childIndex) = rowHasAnyData
+
+        If Not rowHasAnyData Then
+            GoTo next_child
+        End If
+
+        validChildCount = validChildCount + 1
+
+        ' ---------------------------------------------------------
+        ' ПРОВЕРКА ПОЛЕЙ ЗАПОЛНЕННОГО КОМПОНЕНТА
+        ' ---------------------------------------------------------
+
+        For fieldIndex = LBound(childFields) _
+                         To UBound(childFields)
+
+            fieldName = CStr(childFields(fieldIndex))
+
+            rangeName = _
+                "Rec_" & formIndex & "_" & _
+                fieldName & childIndex
+
+            If Not NamedRangeExists(wb, rangeName) Then
+
+                AddValidationError _
+                    errors, _
+                    errorCount, _
+                    "Компонент " & childIndex & _
+                    ": не найден именованный диапазон " & _
+                    rangeName & "."
+
+                GoTo next_child_field
+
+            End If
+
+            Set rng = GetNamedRangeStrict(wb, rangeName)
+            Set valueCell = rng.Cells(1, 1)
+
+            fieldValue = valueCell.value
+            fieldCaption = REC_FieldCaption(fieldName)
+
+            If IsError(fieldValue) Then
+
+                AddValidationError _
+                    errors, _
+                    errorCount, _
+                    "Компонент " & childIndex & _
+                    ": поле """ & fieldCaption & _
+                    """ содержит ошибку Excel: " & _
+                    valueCell.text & _
+                    " (" & rangeName & ").", _
+                    rng
+
+                GoTo next_child_field
+
+            End If
+
+            valueText = Trim$(CStr(fieldValue))
+
+            ' =====================================================
+            ' ГРУППА 1. ОБЯЗАТЕЛЬНЫЕ ПОЛЯ КОМПОНЕНТА
+            ' =====================================================
+
+            Select Case fieldName
+
+                Case COL_MIX_SAMPLE_CODE_CHILD_DB, _
+                     COL_MASS_FRACTION_CHILD_DB, _
+                     COL_P_TRANSFER_CHILD_DB, _
+                     COL_T_TRANSFER_CHILD_DB, _
+                     COL_DENSITY_CHILD_DB, _
+                     COL_VOLUME_CHILD_DB, _
+                     COL_MASS_CHILD_DB
+
+                    If valueText = "" Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Компонент " & childIndex & _
+                            ": не заполнено обязательное поле """ & _
+                            fieldCaption & """ (" & rangeName & ").", _
+                            rng
+
+                    End If
+
+            End Select
+
+            ' =====================================================
+            ' ГРУППА 2. ЧИСЛОВЫЕ ПОЛЯ КОМПОНЕНТА
+            ' =====================================================
+
+            Select Case fieldName
+
+                Case COL_MASS_FRACTION_CHILD_DB, _
+                     COL_P_TRANSFER_CHILD_DB, _
+                     COL_T_TRANSFER_CHILD_DB, _
+                     COL_DENSITY_CHILD_DB, _
+                     COL_VOLUME_CHILD_DB, _
+                     COL_MASS_CHILD_DB
+
+                    If valueText <> "" Then
+
+                        If Not IsNumeric(fieldValue) Then
+
+                            AddValidationError _
+                                errors, _
+                                errorCount, _
+                                "Компонент " & childIndex & _
+                                ": поле """ & fieldCaption & _
+                                """ должно содержать число " & _
+                                "(" & rangeName & ").", _
+                                rng
+
+                        End If
+
+                    End If
+
+            End Select
+
+            ' =====================================================
+            ' ГРУППА 3. ЧИСЛА, КОТОРЫЕ ДОЛЖНЫ БЫТЬ БОЛЬШЕ НУЛЯ
+            ' =====================================================
+
+            Select Case fieldName
+
+                Case COL_MASS_FRACTION_CHILD_DB, _
+                     COL_P_TRANSFER_CHILD_DB, _
+                     COL_DENSITY_CHILD_DB, _
+                     COL_VOLUME_CHILD_DB, _
+                     COL_MASS_CHILD_DB
+
+                    If valueText <> "" _
+                       And IsNumeric(fieldValue) Then
+
+                        If CDbl(fieldValue) <= 0 Then
+
+                            AddValidationError _
+                                errors, _
+                                errorCount, _
+                                "Компонент " & childIndex & _
+                                ": поле """ & fieldCaption & _
+                                """ должно быть больше 0 " & _
+                                "(" & rangeName & ").", _
+                                rng
+
+                        End If
+
+                    End If
+
+            End Select
+
+            ' =====================================================
+            ' ГРУППА 4. МАССОВАЯ ДОЛЯ НЕ МОЖЕТ БЫТЬ БОЛЬШЕ 1
+            ' =====================================================
+
+            Select Case fieldName
+
+                Case COL_MASS_FRACTION_CHILD_DB
+
+                    If valueText <> "" _
+                       And IsNumeric(fieldValue) Then
+
+                        If CDbl(fieldValue) > 1 Then
+
+                            AddValidationError _
+                                errors, _
+                                errorCount, _
+                                "Компонент " & childIndex & _
+                                ": массовая доля не может быть " & _
+                                "больше 1 (" & rangeName & ").", _
+                                rng
+
+                        ElseIf CDbl(fieldValue) > 0 Then
+
+                            massFractionSum = _
+                                massFractionSum + _
+                                CDbl(fieldValue)
+
+                            validMassFractionCount = _
+                                validMassFractionCount + 1
+
+                            childMassFractionIsValid(childIndex) = True
+
+                        End If
+
+                    End If
+
+            End Select
+
+            ' =====================================================
+            ' ГРУППА 5. ЛОГИЧЕСКОЕ ПОЛЕ «ПЕРВЫЙ КОМПОНЕНТ»
+            ' =====================================================
+
+            Select Case fieldName
+
+                Case COL_FIRST_CHILD_DB
+
+                    Select Case LCase$(valueText)
+
+                        Case "true", _
+                             "истина", _
+                             "1", _
+                             "да", _
+                             "+"
+
+                            firstComponentCount = _
+                                firstComponentCount + 1
+
+                            childIsFirst(childIndex) = True
+
+                        Case "false", _
+                             "ложь", _
+                             "0", _
+                             "нет", _
+                             "-", _
+                             ""
+
+                            ' Допустимое значение False.
+
+                        Case Else
+
+                            AddValidationError _
+                                errors, _
+                                errorCount, _
+                                "Компонент " & childIndex & _
+                                ": поле """ & fieldCaption & _
+                                """ должно содержать True/False " & _
+                                "(" & rangeName & ").", _
+                                rng
+
+                    End Select
+
+            End Select
+
+next_child_field:
+        Next fieldIndex
+
+next_child:
+    Next childIndex
+
+    ' =============================================================
+    ' ОБЩИЕ ПРОВЕРКИ КОМПОНЕНТОВ
+    ' =============================================================
+
+    If validChildCount = 0 Then
+
+        AddValidationError _
+            errors, _
+            errorCount, _
+            "Не указано ни одного компонента смеси."
+
+        ' Подсвечиваем поля шифров компонентов.
+        For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+
+            rangeName = _
+                "Rec_" & formIndex & "_" & _
+                COL_MIX_SAMPLE_CODE_CHILD_DB & _
+                childIndex
+
+            If NamedRangeExists(wb, rangeName) Then
+
+                SetValidationErrorFill _
+                    GetNamedRangeStrict(wb, rangeName)
+
+            End If
+
+        Next childIndex
+
+    End If
+
+    ' =============================================================
+    ' ДОЛЖЕН БЫТЬ ВЫБРАН РОВНО ОДИН ПЕРВЫЙ КОМПОНЕНТ
+    ' =============================================================
+
+    If validChildCount > 0 Then
+
+        If firstComponentCount = 0 Then
+
+            AddValidationError _
+                errors, _
+                errorCount, _
+                "Не выбран первый компонент смеси."
+
+            ' Подсвечиваем поле First у всех начатых компонентов.
+            For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+
+                If childStarted(childIndex) Then
+
+                    rangeName = _
+                        "Rec_" & formIndex & "_" & _
+                        COL_FIRST_CHILD_DB & childIndex
+
+                    If NamedRangeExists(wb, rangeName) Then
+
+                        SetValidationErrorFill _
+                            GetNamedRangeStrict(wb, rangeName)
+
+                    End If
+
+                End If
+
+            Next childIndex
+
+        ElseIf firstComponentCount > 1 Then
+
+            AddValidationError _
+                errors, _
+                errorCount, _
+                "Первым отмечено более одного компонента смеси."
+
+            ' Подсвечиваем только компоненты с First = True.
+            For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+
+                If childIsFirst(childIndex) Then
+
+                    rangeName = _
+                        "Rec_" & formIndex & "_" & _
+                        COL_FIRST_CHILD_DB & childIndex
+
+                    If NamedRangeExists(wb, rangeName) Then
+
+                        SetValidationErrorFill _
+                            GetNamedRangeStrict(wb, rangeName)
+
+                    End If
+
+                End If
+
+            Next childIndex
+
+        End If
+
+    End If
+
+    ' =============================================================
+    ' СУММА МАССОВЫХ ДОЛЕЙ ДОЛЖНА БЫТЬ РАВНА 1
+    ' =============================================================
+
+    If validChildCount > 0 _
+       And validMassFractionCount = validChildCount Then
+
+        If Abs(massFractionSum - 1#) > 0.001 Then
+
+            AddValidationError _
+                errors, _
+                errorCount, _
+                "Сумма массовых долей компонентов должна " & _
+                "быть равна 1." & vbCrLf & _
+                "   Текущая сумма: " & _
+                Format$(massFractionSum, "0.000000")
+
+            ' Подсвечиваем массовые доли всех компонентов.
+            For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+
+                If childStarted(childIndex) _
+                   And childMassFractionIsValid(childIndex) Then
+
+                    rangeName = _
+                        "Rec_" & formIndex & "_" & _
+                        COL_MASS_FRACTION_CHILD_DB & _
+                        childIndex
+
+                    If NamedRangeExists(wb, rangeName) Then
+
+                        SetValidationErrorFill _
+                            GetNamedRangeStrict(wb, rangeName)
+
+                    End If
+
+                End If
+
+            Next childIndex
+
+        End If
+
+    End If
+
+    ' =============================================================
+    ' РЕЗУЛЬТАТ ВАЛИДАЦИИ
+    ' =============================================================
+
+    If errorCount > 0 Then
+
+        MsgBox _
+            "REC_" & formIndex & _
+            " не сохранена. Исправьте ошибки:" & _
+            vbCrLf & vbCrLf & errors, _
+            vbExclamation
+
+        Exit Function
+
+    End If
+
+    Validate_Rec_Form = True
+
+End Function
+
+Private Function REC_FieldCaption( _
+    ByVal fieldName As String _
+) As String
+
+    Select Case LCase$(fieldName)
+
+        ' =========================================================
+        ' ПОЛЯ REC_RESULTS
+        ' =========================================================
+
+        Case LCase$(COL_RESULT_ID_REC_DB)
+            REC_FieldCaption = "Номер результата"
+
+        Case LCase$(COL_TASK_ID_DB)
+            REC_FieldCaption = "Номер задания"
+
+        Case LCase$(COL_SAMPLE_CODE_DB)
+            REC_FieldCaption = "Шифр пробы"
+
+        Case LCase$(COL_OPERATOR_DB)
+            REC_FieldCaption = "Исполнитель"
+
+        Case LCase$(COL_DATE_DB)
+            REC_FieldCaption = "Дата выполнения"
+
+        Case LCase$(COL_EQUIPMENT_FOR_TRANSFER_DB)
+            REC_FieldCaption = "Оборудование для перевода"
+
+        Case LCase$(COL_EQUIPMENT_NUMBER_DB)
+            REC_FieldCaption = "Номер оборудования для перевода"
+
+        Case LCase$(COL_TYPE_SAMPLER_DB)
+            REC_FieldCaption = "Тип пробоотборника"
+
+        Case LCase$(COL_NUMBER_SAMPLER_DB)
+            REC_FieldCaption = "Номер пробоотборника"
+
+        ' =========================================================
+        ' ПОЛЯ КОМПОНЕНТОВ
+        ' =========================================================
+
+        Case LCase$(COL_MIX_SAMPLE_CODE_CHILD_DB)
+            REC_FieldCaption = "Шифр смешиваемой пробы"
+
+        Case LCase$(COL_MASS_FRACTION_CHILD_DB)
+            REC_FieldCaption = "Массовая доля"
+
+        Case LCase$(COL_P_TRANSFER_CHILD_DB)
+            REC_FieldCaption = "Давление перевода"
+
+        Case LCase$(COL_T_TRANSFER_CHILD_DB)
+            REC_FieldCaption = "Температура перевода"
+
+        Case LCase$(COL_DENSITY_CHILD_DB)
+            REC_FieldCaption = "Плотность"
+
+        Case LCase$(COL_FIRST_CHILD_DB)
+            REC_FieldCaption = "Первый компонент"
+
+        Case LCase$(COL_VOLUME_CHILD_DB)
+            REC_FieldCaption = "Объём"
+
+        Case LCase$(COL_MASS_CHILD_DB)
+            REC_FieldCaption = "Масса"
+
+        Case Else
+            REC_FieldCaption = fieldName
+
+    End Select
+
+End Function
+
+Private Function Get_Rec_FormState( _
+    ByVal formIndex As Long _
+) As RecFormState
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetREC As Worksheet
+    Set sheetREC = wb.Worksheets("Rec")
+
+    Dim recTable As ListObject
+    Set recTable = wb.Worksheets("Rec_results") _
+                     .ListObjects("Rec_results")
+
+    Dim sampleCode As String
+    sampleCode = Trim$(CStr( _
+        sheetREC.Range( _
+            "Rec_" & formIndex & "_" & COL_SAMPLE_CODE_DB _
+        ).value _
+    ))
+
+    Dim hasSampleCode As Boolean
+    hasSampleCode = (sampleCode <> "")
+
+    Dim hasCoreChildData As Boolean
+    hasCoreChildData = RecFormHasAnyChildData(wb, formIndex)
+
+    Dim hasAnyParentData As Boolean
+    hasAnyParentData = False
+
+    Dim headerCell As Range
+    Dim fieldName As String
+    Dim rangeName As String
+
+    Dim fieldValue As Variant
+    Dim fieldText As String
+
+    For Each headerCell In recTable.HeaderRowRange.Cells
+
+        fieldName = Trim$(CStr(headerCell.value))
+
+        Select Case LCase$(fieldName)
+
+            Case "", _
+                 LCase$(COL_RESULT_ID_REC_DB), _
+                 "datetimesync"
+
+                GoTo NextParentField
+
+        End Select
+
+        rangeName = "Rec_" & formIndex & "_" & fieldName
+
+        If NamedRangeExists(wb, rangeName) Then
+
+            fieldValue = GetNamedRangeStrict(wb, rangeName).value
+
+            If IsError(fieldValue) Then
+
+                hasAnyParentData = True
+                Exit For
+
+            End If
+
+            fieldText = Trim$(CStr(fieldValue))
+
+            If fieldText <> "" Then
+
+                hasAnyParentData = True
+                Exit For
+
+            End If
+
+        End If
+
+NextParentField:
+    Next headerCell
+
+    Dim childFields As Variant
+
+    childFields = Array( _
+        COL_MIX_SAMPLE_CODE_CHILD_DB, _
+        COL_MASS_FRACTION_CHILD_DB, _
+        COL_P_TRANSFER_CHILD_DB, _
+        COL_T_TRANSFER_CHILD_DB, _
+        COL_DENSITY_CHILD_DB, _
+        COL_FIRST_CHILD_DB, _
+        COL_VOLUME_CHILD_DB, _
+        COL_MASS_CHILD_DB _
+    )
+
+    Dim hasAnyChildData As Boolean
+    hasAnyChildData = False
+
+    Dim childIndex As Long
+    Dim fieldIndex As Long
+
+    For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+
+        For fieldIndex = LBound(childFields) To UBound(childFields)
+
+            fieldName = CStr(childFields(fieldIndex))
+
+            rangeName = _
+                "Rec_" & formIndex & "_" & _
+                fieldName & childIndex
+
+            If Not NamedRangeExists(wb, rangeName) Then
+                GoTo NextChildField
+            End If
+
+            fieldValue = GetNamedRangeStrict(wb, rangeName).value
+
+            If IsError(fieldValue) Then
+
+                hasAnyChildData = True
+                Exit For
+
+            End If
+
+            fieldText = Trim$(CStr(fieldValue))
+
+            If fieldName = COL_FIRST_CHILD_DB Then
+
+                Select Case LCase$(fieldText)
+
+                    Case "", "false", "????", "0", "???", "-"
+                        ' ?? ??????? ??????? ???????.
+
+                    Case Else
+                        hasAnyChildData = True
+                        Exit For
+
+                End Select
+
+            ElseIf fieldText <> "" Then
+
+                hasAnyChildData = True
+                Exit For
+
+            End If
+
+NextChildField:
+        Next fieldIndex
+
+        If hasAnyChildData Then
+            Exit For
+        End If
+
+    Next childIndex
+
+    If Not hasAnyParentData _
+       And Not hasAnyChildData Then
+
+        Get_Rec_FormState = REC_FORM_EMPTY
+        Exit Function
+
+    End If
+
+    If hasSampleCode _
+       And hasCoreChildData Then
+
+        Get_Rec_FormState = REC_FORM_FILLED
+        Exit Function
+
+    End If
+
+    Get_Rec_FormState = REC_FORM_RESERVED
+
+End Function
+
+Public Function FindEmptyFormREC() As Long
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetREC As Worksheet
+    Set sheetREC = wb.Worksheets("REC")
+
+    Dim formIndex As Long
+    formIndex = 1
+
+    Do While NamedRangeExists(wb, "REC_" & formIndex & "_sampleCode")
+
+        If Get_Rec_FormState(formIndex) = REC_FORM_EMPTY Then
+            FindEmptyFormREC = formIndex
+            Exit Function
+        End If
+
+        formIndex = formIndex + 1
+
+    Loop
+
+    Call AddFormREC
+
+    FindEmptyFormREC = formIndex
+
+End Function
+
+
+Public Sub Load_Rec()
+    LoadResearchesFromDB "Rec"
+End Sub
+
