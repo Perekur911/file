@@ -1,131 +1,492 @@
-Тут пока нельзя уверенно сказать, где именно пропадает строка: Python действительно нашёл запись и `replace_table_rows()` вернул `1`, но это число означает только количество строк в `db_rows`, а не проверку, что данные потом остались в таблице. Сам Python сначала записывает `GOR_results`, затем `GOR_sourceData`, а уже после завершения Python VBA запускает `Load_GOR_results_to_forms`. 
+Да. REC теперь надо довести до той же схемы, но здесь есть две особенности:
 
-Надо за один запуск определить: **строка уже пустая сразу после Python или её портит VBA при переносе в форму**.
+* `rowIdRec` хранится в именованных диапазонах `Rec_N_rowIdRec1 ... rowIdRec12`;
+* **сохранение должно проходить все 12 child-компонентов, а не только видимые**, иначе DELETE скрытого очищенного компонента потеряется.
 
-## Добавь временную диагностику в `LoadResearchesFromDB`
+Сейчас `Save_Rec` ещё использует старые `BuildOldChildRowIdMap/GetOldChildRowId`, а цикл идёт только до `GetRecVisibleColumnCount(i)`.  
 
-Найди:
+### 1. Добавить `rowIdRec` в создание имён новой формы
 
-```vba
-syncResult = RunStudySync( _
-    mode:="load", _
-    projectNumber:=project, _
-    studies:=studiesText _
+Сейчас `CreateRecChildNamesForNewForm` создаёт имена только пользовательских child-полей. 
+
+Добавь первым:
+
+```vb
+childFields = Array( _
+    COL_ROW_ID_REC_CHILD_DB, _
+    COL_MIX_SAMPLE_CODE_CHILD_DB, _
+    COL_MASS_FRACTION_CHILD_DB, _
+    COL_P_TRANSFER_CHILD_DB, _
+    COL_T_TRANSFER_CHILD_DB, _
+    COL_DENSITY_CHILD_DB, _
+    COL_FIRST_CHILD_DB, _
+    COL_VOLUME_CHILD_DB, _
+    COL_MASS_CHILD_DB _
+)
+```
+
+Больше ничего менять там не надо: `ResetCopiedCell` автоматически очистит скопированный `rowIdRec`.
+
+---
+
+### 2. `CheckRecTask` перенести внутрь `Validate_Rec_Form`
+
+Это здесь уже **нужно**, а не просто косметика. Иначе `Save_Rec` может пропустить форму из-за `CheckRecTask`, а `CalculateCurrentRecHash` всё равно включит её в хэш.
+
+Сейчас старый вызов находится непосредственно в `Save_Rec`. 
+
+Переделай функцию:
+
+```vb
+Private Function CheckRecTask( _
+    ByVal taskId As Long, _
+    ByVal sampleCode As String, _
+    ByVal pageNumber As Long _
+) As String
+
+    Dim tasks As ListObject
+    Set tasks = ActiveWorkbook.Worksheets("Task").ListObjects(1)
+
+    Dim taskCheck As Range
+    Set taskCheck = tasks.ListColumns("Номер задания").DataBodyRange.Find( _
+        What:=taskId, LookAt:=xlWhole, SearchOrder:=xlByColumns)
+
+    If taskCheck Is Nothing Then
+        CheckRecTask = "Указан неизвестный номер задания " & taskId & _
+            " на странице " & pageNumber & _
+            ". Попробуйте обновить данные проекта или исправьте значение."
+        Exit Function
+    End If
+
+    Dim taskRowIndex As Long
+    taskRowIndex = taskCheck.Row - tasks.DataBodyRange.Row + 1
+
+    If CStr(tasks.ListColumns("Код проекта").DataBodyRange.Cells(taskRowIndex, 1).Value) <> sampleCode Then
+        CheckRecTask = "Указан неверный номер задания " & taskId & _
+            " на странице " & pageNumber & _
+            ". Шифр пробы в задании отличается от шифра пробы в исследовании."
+        Exit Function
+    End If
+
+    CheckRecTask = "OK"
+
+End Function
+```
+
+В `Validate_Rec_Form`, после проверки `TaskId` на число/целое, добавь:
+
+```vb
+If fieldName = COL_TASK_ID_DB And valueText <> "" And IsNumeric(fieldValue) Then
+    If CDbl(fieldValue) = Fix(CDbl(fieldValue)) And CDbl(fieldValue) > 0 Then
+
+        Dim taskCheckResult As String
+        taskCheckResult = CheckRecTask( _
+            CLng(fieldValue), _
+            CStr(sheetREC.Range("Rec_" & formIndex & "_sampleCode").Value), _
+            formIndex)
+
+        If taskCheckResult <> "OK" Then
+            AddValidationError errors, errorCount, taskCheckResult, rng
+        End If
+
+    End If
+End If
+```
+
+А из `Save_Rec` удалить `tasks`, `curTask` и старый вызов `CheckRecTask`.
+
+И порядок в начале цикла лучше сделать:
+
+```vb
+formState = Get_Rec_FormState(i)
+
+Select Case formState
+    Case REC_FORM_EMPTY, REC_FORM_RESERVED
+        GoTo NextForm
+    Case REC_FORM_FILLED
+End Select
+
+If sheetREC.Range("Rec_" & i & "_TaskId").MergeArea.Interior.ColorIndex = 3 Then
+    GoTo NextForm
+End If
+
+If Not Validate_Rec_Form(i) Then Exit Function
+```
+
+То есть отменённую форму вообще не валидируем.
+
+---
+
+### 3. Удалить старую позиционную схему `rowId`
+
+Полностью удалить:
+
+```vb
+Dim oldSourceRowIds As Object
+Set oldSourceRowIds = BuildOldChildRowIdMap( _
+    recSourceDataTable, _
+    COL_ROW_ID_REC_CHILD_DB, _
+    COL_RESULT_ID_REC_CHILD_DB _
+)
+```
+
+И:
+
+```vb
+oldRowIdRec = GetOldChildRowId(oldSourceRowIds, parentKey, childIndex)
+```
+
+Теперь:
+
+```vb
+oldRowIdRec = NormalizeKeyValue( _
+    GetNamedRangeStrict( _
+        wb, _
+        "Rec_" & i & "_" & COL_ROW_ID_REC_CHILD_DB & childIndex _
+    ).Value _
+)
+```
+
+Главное — цикл меняем:
+
+```vb
+For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+```
+
+а **не**:
+
+```vb
+For childIndex = 1 To GetRecVisibleColumnCount(i)
+```
+
+Это принципиально для DELETE.
+
+Логика дальше уже правильная:
+
+```vb
+If hasChildData Or Len(oldRowIdRec) > 0 Then
+```
+
+Получится:
+
+```text
+rowId есть + данные есть     → UPDATE
+rowId нет + данные есть      → INSERT
+rowId есть + данных нет      → DELETE
+rowId нет + данных нет       → ignore
+```
+
+---
+
+### 4. Добавить хэш REC
+
+`rowIdRec` и `resultIdRec` в хэш не входят.
+
+```vb
+Public Function CalculateCurrentRecHash() As String
+
+    Dim data As Object
+    Set data = Build_Rec_HashData(ActiveWorkbook)
+
+    CalculateCurrentRecHash = CalculateDataHash(data)
+
+End Function
+
+
+Private Function Build_Rec_HashData(ByVal wb As Workbook) As Object
+
+    Dim data As Object
+    Set data = CreateObject("Scripting.Dictionary")
+
+    Dim sheetREC As Worksheet
+    Set sheetREC = wb.Worksheets("Rec")
+
+    Dim recTable As ListObject
+    Set recTable = wb.Worksheets("Rec_results").ListObjects("Rec_results")
+
+    Dim childFields As Variant
+    childFields = Array( _
+        COL_MIX_SAMPLE_CODE_CHILD_DB, COL_MASS_FRACTION_CHILD_DB, _
+        COL_P_TRANSFER_CHILD_DB, COL_T_TRANSFER_CHILD_DB, _
+        COL_DENSITY_CHILD_DB, COL_FIRST_CHILD_DB, _
+        COL_VOLUME_CHILD_DB, COL_MASS_CHILD_DB)
+
+    Dim formIndex As Long
+    Dim resultIndex As Long
+    formIndex = 1
+
+    Do While NamedRangeExists(wb, "Rec_" & formIndex & "_sampleCode")
+
+        If Get_Rec_FormState(formIndex) <> REC_FORM_FILLED Then GoTo NextForm
+
+        If sheetREC.Range("Rec_" & formIndex & "_TaskId").MergeArea.Interior.ColorIndex = 3 Then
+            GoTo NextForm
+        End If
+
+        resultIndex = resultIndex + 1
+
+        Dim headerCell As Range
+        Dim headerName As String
+        Dim formatValue As Variant
+
+        For Each headerCell In recTable.HeaderRowRange.Cells
+
+            headerName = CStr(headerCell.Value)
+
+            Select Case LCase$(headerName)
+                Case "datetimesync", "resultidrec"
+
+                Case Else
+                    If NamedRangeExists(wb, "Rec_" & formIndex & "_" & headerName) Then
+                        formatValue = FormatValueForSyncText( _
+                            headerName, sheetREC.Range("Rec_" & formIndex & "_" & headerName).Value)
+                    Else
+                        formatValue = vbNullString
+                    End If
+
+                    data.Add resultIndex & "." & headerName, formatValue
+            End Select
+
+        Next headerCell
+
+        Dim childIndex As Long
+        Dim childDataIndex As Long
+        Dim fieldIndex As Long
+        Dim fieldName As String
+        Dim rangeName As String
+
+        For childIndex = 1 To REC_CHILD_COUNT_PER_FORM
+
+            If RecChildHasData(wb, formIndex, childIndex) Then
+
+                childDataIndex = childDataIndex + 1
+
+                For fieldIndex = LBound(childFields) To UBound(childFields)
+
+                    fieldName = CStr(childFields(fieldIndex))
+                    rangeName = "Rec_" & formIndex & "_" & fieldName & childIndex
+
+                    formatValue = FormatValueForSyncText( _
+                        fieldName, GetNamedRangeStrict(wb, rangeName).Value)
+
+                    data.Add resultIndex & "." & childDataIndex & "." & fieldName, formatValue
+
+                Next fieldIndex
+
+            End If
+
+        Next childIndex
+
+NextForm:
+        formIndex = formIndex + 1
+    Loop
+
+    Set Build_Rec_HashData = data
+
+End Function
+```
+
+Здесь я специально использую `childDataIndex`, а не физический `childIndex`: пустой промежуток между компонентами сам по себе хэш не меняет, но порядок реальных компонентов меняет.
+
+---
+
+### 5. Добавить `newResultIDs`
+
+В `Save_Rec`:
+
+```vb
+Dim newResultIDs As Collection
+Set newResultIDs = New Collection
+```
+
+`parentKey` лучше сразу привести к нашей новой общей схеме:
+
+```vb
+resultIdValue = sheetREC.Range("Rec_" & i & "_" & COL_RESULT_ID_REC_DB).Value
+
+If Len(NormalizeKeyValue(resultIdValue)) = 0 Or NormalizeKeyValue(resultIdValue) = "0" Then
+    parentKey = "temp_" & i
+Else
+    parentKey = NormalizeKeyValue(resultIdValue)
+End If
+
+If IsNumeric(parentKey) Then newResultIDs.Add parentKey
+```
+
+---
+
+### 6. Перед записью staging проверить хэш и удалённые формы
+
+После всех циклов:
+
+```vb
+Dim newHashResult As String
+Dim oldHashResult As String
+
+newHashResult = CalculateCurrentRecHash()
+oldHashResult = GetWorkbookMetadataProperty(wb, PROP_REC_DATA_HASH)
+
+If newHashResult = oldHashResult Then
+    Save_Rec = MACRO_NO_CHANGES
+    Exit Function
+End If
+```
+
+Потом защита от удаления синхронизированной формы:
+
+```vb
+Dim cellID As Range
+Dim oldResultID As String
+
+If Not recTable.DataBodyRange Is Nothing Then
+
+    For Each cellID In recTable.ListColumns(COL_RESULT_ID_REC_DB).DataBodyRange.Cells
+
+        If Not IsError(cellID.Value) Then
+            oldResultID = NormalizeKeyValue(cellID.Value)
+
+            If IsNumeric(oldResultID) And oldResultID <> "0" Then
+                If Not CollectionContains(newResultIDs, oldResultID) Then
+
+                    MsgBox "Удалены данные синхронизированной формы REC. " & _
+                        "Синхронизация невозможна. Вызовите загрузку данных из БД.", vbExclamation
+
+                    Save_Rec = MACRO_FAILED
+                    Exit Function
+                End If
+            End If
+        End If
+
+    Next cellID
+
+End If
+```
+
+И только потом:
+
+```vb
+WriteCollectionToListObject recTable, parentRows
+WriteCollectionToListObject recSourceDataTable, childRows
+```
+
+---
+
+### 7. Возврат `rowIdRec` после sync
+
+Сейчас загрузчик child-данных не знает о `rowIdRec`: его `childFields` содержит только пользовательские поля. 
+
+Добавь туда первым:
+
+```vb
+COL_ROW_ID_REC_CHILD_DB
+```
+
+То есть:
+
+```vb
+childFields = Array( _
+    COL_ROW_ID_REC_CHILD_DB, _
+    COL_MIX_SAMPLE_CODE_CHILD_DB, _
+    COL_MASS_FRACTION_CHILD_DB, _
+    COL_P_TRANSFER_CHILD_DB, _
+    COL_T_TRANSFER_CHILD_DB, _
+    COL_DENSITY_CHILD_DB, _
+    COL_FIRST_CHILD_DB, _
+    COL_VOLUME_CHILD_DB, _
+    COL_MASS_CHILD_DB _
+)
+```
+
+После этого старые `sourceFormNumbers` и `Load_Rec_result_ids_to_forms(...)` больше не нужны. Сейчас они используются только для возврата родительского ID. 
+
+После успешного sync делай:
+
+```vb
+Call DeleteEmptyRowsByColumns( _
+    recSourceDataTable, _
+    COL_ROW_ID_REC_CHILD_DB, _
+    Array(COL_MIX_SAMPLE_CODE_CHILD_DB, COL_P_TRANSFER_CHILD_DB, _
+          COL_T_TRANSFER_CHILD_DB, COL_MASS_CHILD_DB) _
 )
 
-If InStr(1, syncResult, """ok"": true", vbTextCompare) = 0 Then
+Call Load_Rec_results_to_forms( _
+    "by_key", _
+    Array(COL_RESULT_ID_REC_DB, COL_ROW_ID_REC_CHILD_DB) _
+)
+
+Call SetWorkbookMetadataProperty(wb, PROP_REC_DATA_HASH, newHashResult, False)
 ```
 
-Между ними временно вставь:
-
-```vba
-Dim gorResultTable As ListObject
-Dim gorSourceTable As ListObject
-
-Set gorResultTable = wb.Worksheets("GOR_results").ListObjects("GOR_results")
-Set gorSourceTable = wb.Worksheets("GOR_sourceData").ListObjects("GOR_sourceData")
-
-Debug.Print "=== СРАЗУ ПОСЛЕ PYTHON ==="
-Debug.Print "GOR_results ListRows:", gorResultTable.ListRows.Count
-Debug.Print "GOR_sourceData ListRows:", gorSourceTable.ListRows.Count
-
-If Not gorResultTable.DataBodyRange Is Nothing Then
-    Debug.Print "GOR resultId:", _
-        gorResultTable.ListColumns("resultIdGOR").DataBodyRange.Cells(1, 1).Value
-
-    Debug.Print "GOR sampleCode:", _
-        gorResultTable.ListColumns("sampleCode").DataBodyRange.Cells(1, 1).Value
-
-    Debug.Print "GOR analyseNumber:", _
-        gorResultTable.ListColumns("analyseNumber").DataBodyRange.Cells(1, 1).Value
-End If
-```
-
-Затем сразу после цикла:
-
-```vba
-For i = LBound(studiesArr) To UBound(studiesArr)
-    studyCode = UCase$(Trim$(CStr(studiesArr(i))))
-    LoadStudyForms wb, studyCode, formFillMode
-Next i
-```
-
-добавь:
-
-```vba
-Debug.Print "=== ПОСЛЕ ЗАГРУЗКИ В ФОРМЫ ==="
-Debug.Print "GOR_results ListRows:", gorResultTable.ListRows.Count
-
-If Not gorResultTable.DataBodyRange Is Nothing Then
-    Debug.Print "GOR resultId:", _
-        gorResultTable.ListColumns("resultIdGOR").DataBodyRange.Cells(1, 1).Value
-
-    Debug.Print "GOR sampleCode:", _
-        gorResultTable.ListColumns("sampleCode").DataBodyRange.Cells(1, 1).Value
-End If
-```
-
-## Как читать результат
-
-### Вариант 1: сразу после Python значения есть
-
-Например:
+Так `Load_Rec_results_to_forms` запишет `resultIdRec` в parent named range и через `LoadRecSourceDataToIndexedNamedRanges` заполнит:
 
 ```text
-GOR_results ListRows: 1
-GOR resultId: 123
-GOR sampleCode: 26-F083-...
+Rec_1_rowIdRec1
+Rec_1_rowIdRec2
+...
+Rec_1_rowIdRec12
 ```
 
-а после `LoadStudyForms` они исчезли.
+актуальными ID из `Rec_sourceData`.
 
-Тогда виноват точно VBA-код переноса в формы или какая-то процедура, которая срабатывает при заполнении именованных диапазонов. Сама `Load_GOR_results_to_forms()` напрямую `GOR_results` не очищает: она читает строку, копирует её в именованные диапазоны и затем заполняет таблицу проб. 
+---
 
-В таком случае наиболее вероятно, что при записи в форму срабатывает `Worksheet_Change` или другая событийная процедура, которая вызывает очистку/пересборку промежуточной таблицы.
+### 8. Проверить существование всех `rowIdRecN`
 
-### Вариант 2: сразу после Python `ListRows = 1`, но поля пустые
+В пользовательский `childFields` валидации **не добавляй `rowIdRec`**, иначе строка с одним ID, предназначенная для DELETE, начнёт считаться заполненным компонентом.
 
-Тогда проблема в Python-записи. `rows_written = 1` сейчас возвращается даже если сформированная Excel-матрица оказалась пустой: метод просто возвращает `row_count` после `body.Value = matrix`. 
+Просто отдельно в `Validate_Rec_Form` проверь структуру:
 
-Но с текущей схемой это маловероятно: `GOR_RESULTS` содержит правильные `resultIdGOR`, `sampleCode`, `analyseNumber` и остальные имена. 
+```vb
+Dim checkChildIndex As Long
 
-### Вариант 3: данные есть, но визуально таблица пустая
+For checkChildIndex = 1 To REC_CHILD_COUNT_PER_FORM
+    rangeName = "Rec_" & formIndex & "_" & COL_ROW_ID_REC_CHILD_DB & checkChildIndex
 
-Проверь фильтр. После загрузки выполни:
-
-```vba
-With wb.Worksheets("GOR_results")
-    If .FilterMode Then
-        .ShowAllData
+    If Not NamedRangeExists(wb, rangeName) Then
+        AddValidationError errors, errorCount, _
+            "Не найден именованный диапазон: " & rangeName
     End If
-End With
+Next checkChildIndex
 ```
 
-И аналогично:
+---
 
-```vba
-gorResultTable.Range.EntireRow.Hidden = False
+И в `Save_Rec`, как у остальных, добавь:
+
+```vb
+On Error GoTo ErrHandler
 ```
 
-Иногда строка реально заполнена, но остался фильтр от предыдущего проекта.
+а финал:
 
-## Ещё одна важная проверка
+```vb
+Dim syncResult As String
+syncResult = RunStudySync("save", studies:="REC", taskStatus:=taskStatus)
 
-Запусти загрузку только GOR:
+If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
 
-```vba
-LoadResearchesFromDB Array("GOR")
+    Call DeleteEmptyRowsByColumns( _
+        recSourceDataTable, COL_ROW_ID_REC_CHILD_DB, _
+        Array(COL_MIX_SAMPLE_CODE_CHILD_DB, COL_P_TRANSFER_CHILD_DB, _
+              COL_T_TRANSFER_CHILD_DB, COL_MASS_CHILD_DB))
+
+    Call Load_Rec_results_to_forms( _
+        "by_key", Array(COL_RESULT_ID_REC_DB, COL_ROW_ID_REC_CHILD_DB))
+
+    Call SetWorkbookMetadataProperty(wb, PROP_REC_DATA_HASH, newHashResult, False)
+
+Else
+    MsgBox "Python-синхронизация REC не подтвердила успешное сохранение." & _
+        vbCrLf & vbCrLf & syncResult, vbExclamation
+    Exit Function
+End If
+
+Save_Rec = MACRO_CHANGED
+Exit Function
+
+ErrHandler:
+    Debug.Print Err.Number & ": " & Err.Description
+    Save_Rec = MACRO_FAILED
 ```
 
-Если при загрузке только GOR всё нормально, а при «загрузить все» строка исчезает, значит её очищает **какой-то следующий `Load_*_results_to_forms`**, либо срабатывает общее событие при заполнении других форм.
-
-Если и при загрузке только GOR `GOR_results` сразу пустая, проблема уже локальна в GOR/Python.
-
-Покажи строки из Immediate Window для двух точек:
-
-```text
-=== СРАЗУ ПОСЛЕ PYTHON ===
-=== ПОСЛЕ ЗАГРУЗКИ В ФОРМЫ ===
-```
-
-По ним место ошибки определится однозначно.
+Ключевой момент REC — именно **все 12 child-позиций обрабатывать всегда**. `rowIdRecN` теперь отвечает за идентичность записи независимо от того, видна соответствующая синяя колонка пользователю или уже скрыта. 
