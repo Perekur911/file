@@ -1,121 +1,455 @@
-Почти. Основная новая схема SSF уже правильная, но я нашёл **2 реальные ошибки** и одну мелкую чистку.
-
-### 1. Ошибка в `AddFormSSF`
-
-Вот здесь:
-
-```vb
-Dim newSourceTable As ListObject
-Set newSourceTable = sheetSSF.ListObjects(new_name)
-```
-
-к этому моменту `new_name` уже **не `"SSF_source_N"`**, а `"SSF_N"` — ты переопределил её выше:
-
-```vb
-prev_name = "SSF_" & (lastList - 1)
-new_name = "SSF_" & lastList
-```
+Attribute VB_Name = "modMetadata"
+Option Explicit
 
 
+' ============================================================
+' ВЕРСИИ КОМПОНЕНТОВ
+' ============================================================
 
-То есть сейчас очищается не та таблица либо вообще будет ошибка, если `SSF_N` не является `ListObject`. 
+Public Const PROP_FORM_VERSION As String = _
+    "PVTFormVersion"
 
-Исправь просто:
+Public Const PROP_ADDIN_VERSION As String = _
+    "PVTAddinVersion"
 
-```vb
-Dim newSourceTable As ListObject
-Set newSourceTable = sheetSSF.ListObjects("SSF_source_" & lastList)
+Public Const PROP_DOWNHOLE_QUALITY_ACT_VERSION As String = _
+    "DownholeSampleQualityActVersion"
 
-If Not newSourceTable.DataBodyRange Is Nothing Then
-    newSourceTable.DataBodyRange.ClearContents
-End If
-```
+Public Const PROP_SURFACE_QUALITY_ACT_VERSION As String = _
+    "SurfaceSampleQualityActVersion"
 
-Это важно.
 
-### 2. `TaskId` сейчас пропускает нечисловое значение
+' ============================================================
+' ХЕШ-СУММЫ ИССЛЕДОВАНИЙ
+' ============================================================
 
-У тебя сейчас:
+Public Const PROP_OP_DATA_HASH As String = _
+    "OPDataHash"
 
-```vb
-Case "taskid"
-    If valueText <> "" And IsNumeric(fieldValue) Then
-        If CDbl(fieldValue) = Fix(CDbl(fieldValue)) And CDbl(fieldValue) > 0 Then
-            ...
-        End If
+Public Const PROP_OPOH_DATA_HASH As String = _
+    "OPOHDataHash"
+
+Public Const PROP_AP_DATA_HASH As String = _
+    "APDataHash"
+
+Public Const PROP_BP_DATA_HASH As String = _
+    "BPDataHash"
+
+Public Const PROP_GC_DATA_HASH As String = _
+    "GCDataHash"
+
+Public Const PROP_EMV_DATA_HASH As String = _
+    "EMVDataHash"
+
+Public Const PROP_GOR_DATA_HASH As String = _
+    "GORDataHash"
+
+Public Const PROP_SSF_DATA_HASH As String = _
+    "SSFDataHash"
+
+Public Const PROP_CCE_DATA_HASH As String = _
+    "CCEDataHash"
+
+Public Const PROP_CVD_DATA_HASH As String = _
+    "CVDDataHash"
+
+Public Const PROP_REC_DATA_HASH As String = _
+    "RECDataHash"
+
+Public Const PROP_JOIN_DATA_HASH As String = _
+    "JOINDataHash"
+
+
+' ============================================================
+' СТАТУСЫ СИНХРОНИЗАЦИИ ИССЛЕДОВАНИЙ
+' ============================================================
+
+Public Const PROP_OP_DATA_STATE As String = _
+    "OPDataState"
+
+Public Const PROP_OPOH_DATA_STATE As String = _
+    "OPOHDataState"
+
+Public Const PROP_AP_DATA_STATE As String = _
+    "APDataState"
+
+Public Const PROP_BP_DATA_STATE As String = _
+    "BPDataState"
+
+Public Const PROP_GC_DATA_STATE As String = _
+    "GCDataState"
+
+Public Const PROP_EMV_DATA_STATE As String = _
+    "EMVDataState"
+
+Public Const PROP_GOR_DATA_STATE As String = _
+    "GORDataState"
+
+Public Const PROP_SSF_DATA_STATE As String = _
+    "SSFDataState"
+
+Public Const PROP_CCE_DATA_STATE As String = _
+    "CCEDataState"
+
+Public Const PROP_CVD_DATA_STATE As String = _
+    "CVDDataState"
+
+Public Const PROP_REC_DATA_STATE As String = _
+    "RECDataState"
+
+Public Const PROP_JOIN_DATA_STATE As String = _
+    "JOINDataState"
+
+
+' ============================================================
+' СТАТУС СИНХРОНИЗАЦИИ
+' ============================================================
+
+Public Enum StudySyncStatus
+
+    ' Статус ещё не определён или свойство отсутствует.
+    SYNC_STATUS_UNKNOWN = 0
+
+    ' В исследовании нет данных, требующих сохранения.
+    SYNC_STATUS_EMPTY = 1
+
+    ' Данные заполнены, но ещё ни разу не сохранялись в БД.
+    SYNC_STATUS_UNSAVED = 2
+
+    ' Данные ранее сохранялись, но текущий хеш отличается.
+    SYNC_STATUS_DIRTY = 3
+
+    ' Текущий хеш совпадает с хешем после сохранения.
+    SYNC_STATUS_SYNCED = 4
+
+    ' При определении состояния произошла ошибка.
+    SYNC_STATUS_ERROR = 5
+
+End Enum
+
+
+' ============================================================
+' ЗАПИСЬ СВОЙСТВА
+' ============================================================
+
+Public Sub SetWorkbookMetadataProperty( _
+    ByVal wb As Workbook, _
+    ByVal propertyName As String, _
+    ByVal propertyValue As String, _
+    Optional ByVal saveWorkbook As Boolean = False _
+)
+
+    Dim documentProperty As Object
+
+    If wb Is Nothing Then
+        Err.Raise _
+            vbObjectError + 2100, _
+            "SetWorkbookMetadataProperty", _
+            "Книга не указана."
     End If
-```
 
-Поэтому если пользователь введёт:
+    propertyName = Trim$(propertyName)
 
-```text
-abc
-```
+    If propertyName = "" Then
+        Err.Raise _
+            vbObjectError + 2101, _
+            "SetWorkbookMetadataProperty", _
+            "Название свойства не указано."
+    End If
 
-никакой ошибки вообще не будет. 
+    On Error Resume Next
 
-Сделай:
+    Set documentProperty = _
+        wb.CustomDocumentProperties(propertyName)
 
-```vb
-Case "taskid"
+    On Error GoTo ErrorHandler
 
-    If valueText <> "" Then
+    If documentProperty Is Nothing Then
 
-        If Not IsNumeric(fieldValue) Then
+        wb.CustomDocumentProperties.Add _
+            name:=propertyName, _
+            LinkToContent:=False, _
+            Type:=msoPropertyTypeString, _
+            value:=propertyValue
 
-            AddValidationError errors, errorCount, _
-                "Поле """ & fieldCaption & """ должно содержать число: " & rangeName, rng
+    Else
 
-        ElseIf CDbl(fieldValue) <> Fix(CDbl(fieldValue)) Then
-
-            AddValidationError errors, errorCount, _
-                "Поле """ & fieldCaption & """ должно содержать целое число: " & rangeName, rng
-
-        ElseIf CDbl(fieldValue) > 0 Then
-
-            Dim taskCheckResult As String
-            taskCheckResult = CheckSSFTask( _
-                CLng(fieldValue), _
-                CStr(sheetSSF.Range("SSF_" & formIndex & "_sampleCode").Value), _
-                formIndex)
-
-            If taskCheckResult <> "OK" Then
-                AddValidationError errors, errorCount, taskCheckResult, rng
-            End If
-
-        End If
+        documentProperty.value = propertyValue
 
     End If
-```
 
-Отрицательное значение у тебя отдельно ловится группой 4, так что это нормально. 
+    If saveWorkbook Then
+        wb.Save
+    End If
 
-При этом `TaskId` в группе целых отдельно добавлять уже не нужно — эта ветка сама проверяет целочисленность. Сейчас группа 6 проверяет только `page`, что после такой правки будет нормально. 
+    Exit Sub
 
-### 3. Мелочь — удалить неиспользуемый `tasks`
+ErrorHandler:
 
-В `Save_SSF` всё ещё осталось:
+    Err.Raise _
+        vbObjectError + 2102, _
+        "SetWorkbookMetadataProperty", _
+        "Не удалось записать свойство '" & _
+        propertyName & "' в книгу '" & _
+        wb.name & "'." & vbCrLf & _
+        Err.Description
 
-```vb
-Dim tasks As ListObject
-Set tasks = wb.Worksheets("Task").ListObjects(1)
-```
+End Sub
+
+
+' ============================================================
+' ЧТЕНИЕ СВОЙСТВА
+' ============================================================
+
+Public Function GetWorkbookMetadataProperty( _
+    ByVal wb As Workbook, _
+    ByVal propertyName As String, _
+    Optional ByVal defaultValue As String = "" _
+) As String
+
+    Dim documentProperty As Object
+
+    If wb Is Nothing Then
+        Err.Raise _
+            vbObjectError + 2110, _
+            "GetWorkbookMetadataProperty", _
+            "Книга не указана."
+    End If
+
+    propertyName = Trim$(propertyName)
+
+    If propertyName = "" Then
+        Err.Raise _
+            vbObjectError + 2111, _
+            "GetWorkbookMetadataProperty", _
+            "Название свойства не указано."
+    End If
+
+    On Error Resume Next
+
+    Set documentProperty = _
+        wb.CustomDocumentProperties(propertyName)
+
+    On Error GoTo ErrorHandler
+
+    If documentProperty Is Nothing Then
+
+        GetWorkbookMetadataProperty = defaultValue
+
+    ElseIf IsNull(documentProperty.value) Then
+
+        GetWorkbookMetadataProperty = defaultValue
+
+    Else
+
+        GetWorkbookMetadataProperty = _
+            CStr(documentProperty.value)
+
+    End If
+
+    Exit Function
+
+ErrorHandler:
+
+    Err.Raise _
+        vbObjectError + 2112, _
+        "GetWorkbookMetadataProperty", _
+        "Не удалось прочитать свойство '" & _
+        propertyName & "' из книги '" & _
+        wb.name & "'." & vbCrLf & _
+        Err.Description
+
+End Function
+
+
+' ============================================================
+' ПРОВЕРКА НАЛИЧИЯ СВОЙСТВА
+' ============================================================
+
+Public Function WorkbookMetadataPropertyExists( _
+    ByVal wb As Workbook, _
+    ByVal propertyName As String _
+) As Boolean
+
+    Dim documentProperty As Object
+
+    If wb Is Nothing Then
+        Exit Function
+    End If
+
+    propertyName = Trim$(propertyName)
+
+    If propertyName = "" Then
+        Exit Function
+    End If
+
+    On Error Resume Next
+
+    Set documentProperty = _
+        wb.CustomDocumentProperties(propertyName)
+
+    On Error GoTo 0
+
+    WorkbookMetadataPropertyExists = _
+        Not documentProperty Is Nothing
+
+End Function
+
+
+' ============================================================
+' ПРЕОБРАЗОВАНИЕ ENUM В СТРОКУ ДЛЯ МЕТАДАННЫХ
+' ============================================================
+
+Public Function StudySyncStatusToString( _
+    ByVal status As StudySyncStatus _
+) As String
+
+    Select Case status
+
+        Case SYNC_STATUS_EMPTY
+            StudySyncStatusToString = "empty"
+
+        Case SYNC_STATUS_UNSAVED
+            StudySyncStatusToString = "unsaved"
+
+        Case SYNC_STATUS_DIRTY
+            StudySyncStatusToString = "dirty"
+
+        Case SYNC_STATUS_SYNCED
+            StudySyncStatusToString = "synced"
+
+        Case SYNC_STATUS_ERROR
+            StudySyncStatusToString = "error"
+
+        Case Else
+            StudySyncStatusToString = "unknown"
+
+    End Select
+
+End Function
+
+
+' ============================================================
+' ПРЕОБРАЗОВАНИЕ СТРОКИ ИЗ МЕТАДАННЫХ В ENUM
+' ============================================================
+
+Public Function StringToStudySyncStatus( _
+    ByVal value As String _
+) As StudySyncStatus
+
+    Select Case LCase$(Trim$(value))
+
+        Case "empty"
+            StringToStudySyncStatus = _
+                SYNC_STATUS_EMPTY
+
+        Case "unsaved"
+            StringToStudySyncStatus = _
+                SYNC_STATUS_UNSAVED
+
+        Case "dirty"
+            StringToStudySyncStatus = _
+                SYNC_STATUS_DIRTY
+
+        Case "synced"
+            StringToStudySyncStatus = _
+                SYNC_STATUS_SYNCED
+
+        Case "error"
+            StringToStudySyncStatus = _
+                SYNC_STATUS_ERROR
+
+        Case Else
+            StringToStudySyncStatus = _
+                SYNC_STATUS_UNKNOWN
+
+    End Select
+
+End Function
+
+
+' ============================================================
+' УДОБНЫЕ ОБЁРТКИ ДЛЯ СТАТУСА
+' ============================================================
+
+Public Sub SetStudySyncStatus( _
+    ByVal wb As Workbook, _
+    ByVal propertyName As String, _
+    ByVal status As StudySyncStatus, _
+    Optional ByVal saveWorkbook As Boolean = False _
+)
+
+    SetWorkbookMetadataProperty _
+        wb:=wb, _
+        propertyName:=propertyName, _
+        propertyValue:=StudySyncStatusToString(status), _
+        saveWorkbook:=saveWorkbook
+
+End Sub
+
+
+Public Function GetStudySyncStatus( _
+    ByVal wb As Workbook, _
+    ByVal propertyName As String _
+) As StudySyncStatus
+
+    Dim storedValue As String
+
+    storedValue = GetWorkbookMetadataProperty( _
+        wb:=wb, _
+        propertyName:=propertyName, _
+        defaultValue:="unknown" _
+    )
+
+    GetStudySyncStatus = _
+        StringToStudySyncStatus(storedValue)
+
+End Function
 
 
 
-После переноса `CheckSSFTask` в валидацию это больше нигде в `Save_SSF` не используется. Просто удалить.
 
-В остальном **всё, что мы переделывали, уже согласовано**:
+'### Проверить AP при закрытии
+'
+'Dim currentHash As String
+'Dim savedHash As String
+'Dim status As StudySyncStatus
+'
+'currentHash = CalculateDataHash(BuildAPSaveData())
+'
+'savedHash = GetWorkbookMetadataProperty( _
+'    wb:=ActiveWorkbook, _
+'    propertyName:=PROP_AP_DATA_HASH _
+')
+'
+'If savedHash = "" Then
+'
+'    status = SYNC_STATUS_UNSAVED
+'
+'ElseIf currentHash = savedHash Then
+'
+'    status = SYNC_STATUS_SYNCED
+'
+'Else
+'
+'    status = SYNC_STATUS_DIRTY
+'
+'End If
+'
+'SetStudySyncStatus _
+'    wb:=ActiveWorkbook, _
+'    propertyName:=PROP_AP_DATA_STATE, _
+'    status:=status
+'
+'SetWorkbookMetadataProperty wb, PROP_AP_DATA_HASH, apHash
+'SetStudySyncStatus wb, PROP_AP_DATA_STATE, apStatus
+'
+'SetWorkbookMetadataProperty wb, PROP_CCE_DATA_HASH, cceHash
+'SetStudySyncStatus wb, PROP_CCE_DATA_STATE, cceStatus
+'
+'SetWorkbookMetadataProperty wb, PROP_JOIN_DATA_HASH, joinHash
+'SetStudySyncStatus wb, PROP_JOIN_DATA_STATE, joinStatus
+'
+'wb.Save
 
-* старая `BuildOldChildRowIdMap/GetOldChildRowId` схема убрана;
-* `rowIdSSF` читается непосредственно из `SSF_source_N`; 
-* `rowId + пустые данные` превращается в DELETE;
-* хэш считается до записи staging;
-* `resultIdSSF` и `rowIdSSF` не входят в хэш;
-* удаление синхронизированной родительской формы блокируется; 
-* после успешного sync возвращаются `resultIdSSF + rowIdSSF`;
-* хэш сохраняется только после успешного sync; 
-* `SSFSourceMappings()` уже правильно включает `rowIdSSF`; 
-* отсутствие корректных шифров теперь останавливает весь Save, как мы и хотели. 
 
-**Исправь эти два места + удали `tasks` — и SSF по этой архитектуре готов.**
