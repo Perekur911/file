@@ -1,219 +1,229 @@
-Да. У тебя уже есть всё необходимое: отдельные свойства хэша и статуса для всех 12 исследований, плюс `StudySyncStatus`.  
+Да, так логичнее. Я бы привязал эту проверку именно к **major-версии формы `23`**: `23.0.0`, `23.1.0`, `23.5.2` будут обрабатываться, а `22.x` и будущая `24.x` — нет. Свойство версии у тебя уже есть как `PVTFormVersion`. 
 
-И сразу важный момент: **при закрытии книги сохранённый `...DataHash` не трогаем вообще**. Он означает «хэш данных после последней успешной синхронизации с БД» и должен меняться только внутри успешного `Save_*`. При закрытии записываем только `...DataState`.
+И при проблемных статусах лучше дать пользователю выбор: **«Всё равно закрыть?»**. Это не запрещает закрытие, но позволяет нажать «Нет», вернуться в книгу и сохранить исследования.
 
-Я бы в `modMetadata` добавил вот это.
+### 1. В `modMetadata` добавь проверку версии
 
 ```vb
-Private Const EMPTY_DATA_HASH As String = "00000000-0-0"
+Public Function IsCurrentHashFormVersion(ByVal wb As Workbook) As Boolean
 
+    Dim formVersion As String
+    formVersion = Trim$(GetWorkbookMetadataProperty(wb, PROP_FORM_VERSION))
 
-Public Sub RefreshAllStudySyncStatuses(ByVal wb As Workbook)
+    If formVersion = "" Then Exit Function
 
-    UpdateStudySyncStatus wb, "OP", PROP_OP_DATA_HASH, PROP_OP_DATA_STATE
-    UpdateStudySyncStatus wb, "OPOH", PROP_OPOH_DATA_HASH, PROP_OPOH_DATA_STATE
-    UpdateStudySyncStatus wb, "AP", PROP_AP_DATA_HASH, PROP_AP_DATA_STATE
-    UpdateStudySyncStatus wb, "BP", PROP_BP_DATA_HASH, PROP_BP_DATA_STATE
-    UpdateStudySyncStatus wb, "GC", PROP_GC_DATA_HASH, PROP_GC_DATA_STATE
-    UpdateStudySyncStatus wb, "EMV", PROP_EMV_DATA_HASH, PROP_EMV_DATA_STATE
-    UpdateStudySyncStatus wb, "GOR", PROP_GOR_DATA_HASH, PROP_GOR_DATA_STATE
-    UpdateStudySyncStatus wb, "SSF", PROP_SSF_DATA_HASH, PROP_SSF_DATA_STATE
-    UpdateStudySyncStatus wb, "CCE", PROP_CCE_DATA_HASH, PROP_CCE_DATA_STATE
-    UpdateStudySyncStatus wb, "CVD", PROP_CVD_DATA_HASH, PROP_CVD_DATA_STATE
-    UpdateStudySyncStatus wb, "REC", PROP_REC_DATA_HASH, PROP_REC_DATA_STATE
-    UpdateStudySyncStatus wb, "JOIN", PROP_JOIN_DATA_HASH, PROP_JOIN_DATA_STATE
+    IsCurrentHashFormVersion = (Split(formVersion, ".")(0) = "23")
 
-End Sub
-
-
-Private Sub UpdateStudySyncStatus( _
-    ByVal wb As Workbook, _
-    ByVal studyCode As String, _
-    ByVal hashProperty As String, _
-    ByVal stateProperty As String _
-)
-
-    On Error GoTo ErrorHandler
-
-    Dim currentHash As String
-    Dim savedHash As String
-    Dim status As StudySyncStatus
-
-    currentHash = GetCurrentStudyHash(studyCode)
-    savedHash = GetWorkbookMetadataProperty(wb, hashProperty)
-
-    status = DetermineStudySyncStatus(currentHash, savedHash)
-
-    SetStudySyncStatus wb, stateProperty, status, False
-    Exit Sub
-
-ErrorHandler:
-
-    Debug.Print "Ошибка определения статуса " & studyCode & ": " & _
-        Err.Number & ": " & Err.Description
-
-    On Error Resume Next
-    SetStudySyncStatus wb, stateProperty, SYNC_STATUS_ERROR, False
-    On Error GoTo 0
-
-End Sub
+End Function
 ```
 
-Дальше функция определения статуса:
+То есть:
+
+```text
+23.0.0 → True
+23.1.4 → True
+23      → True
+22.9.0 → False
+24.0.0 → False
+230.0.0 → False
+```
+
+Когда потом поменяешь алгоритм хэшей в v24 — просто поменяешь здесь `"23"` на `"24"`.
+
+---
+
+### 2. Функция, которая собирает проблемные исследования
+
+Твои `DataState` уже заведены для всех исследований. 
+
+Добавь:
 
 ```vb
-Private Function DetermineStudySyncStatus( _
-    ByVal currentHash As String, _
-    ByVal savedHash As String _
-) As StudySyncStatus
+Public Function GetUnsyncedStudiesText(ByVal wb As Workbook) As String
 
-    If savedHash = "" Then
+    Dim studyNames As Variant
+    Dim stateProperties As Variant
 
-        If currentHash = EMPTY_DATA_HASH Then
-            DetermineStudySyncStatus = SYNC_STATUS_EMPTY
-        Else
-            DetermineStudySyncStatus = SYNC_STATUS_UNSAVED
+    studyNames = Array( _
+        "OP", "OPOH", "AP", "BP", "GC", "EMV", _
+        "GOR", "SSF", "CCE", "CVD", "REC", "JOIN" _
+    )
+
+    stateProperties = Array( _
+        PROP_OP_DATA_STATE, PROP_OPOH_DATA_STATE, _
+        PROP_AP_DATA_STATE, PROP_BP_DATA_STATE, _
+        PROP_GC_DATA_STATE, PROP_EMV_DATA_STATE, _
+        PROP_GOR_DATA_STATE, PROP_SSF_DATA_STATE, _
+        PROP_CCE_DATA_STATE, PROP_CVD_DATA_STATE, _
+        PROP_REC_DATA_STATE, PROP_JOIN_DATA_STATE _
+    )
+
+    Dim i As Long
+    Dim status As StudySyncStatus
+    Dim statusText As String
+    Dim result As String
+
+    For i = LBound(studyNames) To UBound(studyNames)
+
+        status = GetStudySyncStatus(wb, CStr(stateProperties(i)))
+        statusText = ""
+
+        Select Case status
+            Case SYNC_STATUS_UNSAVED
+                statusText = "данные ещё не сохранялись в БД"
+
+            Case SYNC_STATUS_DIRTY
+                statusText = "есть изменения после последнего сохранения в БД"
+
+            Case SYNC_STATUS_ERROR
+                statusText = "не удалось определить состояние данных"
+        End Select
+
+        If statusText <> "" Then
+            result = result & "• " & CStr(studyNames(i)) & _
+                " — " & statusText & vbCrLf
         End If
 
-    ElseIf currentHash = savedHash Then
+    Next i
 
-        If currentHash = EMPTY_DATA_HASH Then
-            DetermineStudySyncStatus = SYNC_STATUS_EMPTY
-        Else
-            DetermineStudySyncStatus = SYNC_STATUS_SYNCED
+    GetUnsyncedStudiesText = result
+
+End Function
+```
+
+`EMPTY` и `SYNCED` нас здесь вообще не интересуют. Твои значения enum как раз различают `unsaved`, `dirty`, `synced`, `empty`, `error`. 
+
+---
+
+### 3. Сам `WorkbookBeforeClose`
+
+В классе `CApplicationEvents`:
+
+```vb
+Option Explicit
+
+Public WithEvents App As Application
+
+
+Private Sub App_WorkbookBeforeClose( _
+    ByVal Wb As Workbook, _
+    Cancel As Boolean _
+)
+
+    On Error GoTo ErrHandler
+
+    Dim eventsWereEnabled As Boolean
+    eventsWereEnabled = Application.EnableEvents
+
+    ' Старые и будущие несовместимые версии не трогаем.
+    If Not IsCurrentHashFormVersion(Wb) Then Exit Sub
+
+    Dim wasSaved As Boolean
+    wasSaved = Wb.Saved
+
+    ' Пока CalculateCurrent...Hash используют ActiveWorkbook.
+    If Not Wb Is Application.ActiveWorkbook Then
+        Wb.Activate
+    End If
+
+    ' Пересчитываем статусы всех исследований.
+    RefreshAllStudySyncStatuses Wb
+
+    Dim unsyncedText As String
+    unsyncedText = GetUnsyncedStudiesText(Wb)
+
+    If unsyncedText <> "" Then
+
+        Dim answer As VbMsgBoxResult
+
+        answer = MsgBox( _
+            "В книге обнаружены исследования с данными, " & _
+            "которые не синхронизированы с БД:" & _
+            vbCrLf & vbCrLf & _
+            unsyncedText & _
+            vbCrLf & _
+            "Настоятельно рекомендуется сохранить эти исследования " & _
+            "перед закрытием книги." & _
+            vbCrLf & vbCrLf & _
+            "Всё равно закрыть книгу?", _
+            vbExclamation + vbYesNo + vbDefaultButton2, _
+            "Есть несохранённые исследования" _
+        )
+
+        If answer <> vbYes Then
+            Cancel = True
+            Exit Sub
         End If
-
-    Else
-
-        DetermineStudySyncStatus = SYNC_STATUS_DIRTY
 
     End If
 
-End Function
+    ' Если до обработчика книга уже была сохранена,
+    ' изменения появились только из-за записи DataState.
+    ' Сохраняем их автоматически.
+    If wasSaved Then
+        Application.EnableEvents = False
+        Wb.Save
+        Application.EnableEvents = eventsWereEnabled
+    End If
+
+    Exit Sub
+
+ErrHandler:
+
+    On Error Resume Next
+    Application.EnableEvents = eventsWereEnabled
+    On Error GoTo 0
+
+    Debug.Print _
+        "WorkbookBeforeClose [" & Wb.Name & "]: " & _
+        Err.Number & ": " & Err.Description
+
+End Sub
 ```
 
-Здесь специально такая логика:
+### Как это будет вести себя
+
+Если книга **22 версии**:
 
 ```text
-данных нет + никогда не сохранялись      → EMPTY
-данные есть + сохранённого hash нет      → UNSAVED
-currentHash = savedHash                  → SYNCED
-currentHash <> savedHash                 → DIRTY
-ошибка расчёта                           → ERROR
+закрытие
+→ ничего не проверяем
+→ обычное закрытие
 ```
 
-Причём важный случай:
-
-```text
-раньше данные были сохранены
-savedHash = ABC
-
-пользователь всё удалил
-currentHash = 00000000-0-0
-
-→ DIRTY
-```
-
-То есть мы **не скажем `EMPTY`**, потому что фактически пользователь удалил ранее синхронизированные данные. Это как раз тот случай, который нельзя пропустить. Твои значения enum уже идеально подходят под эту модель. 
-
-И остаётся диспетчер хэшей:
-
-```vb
-Private Function GetCurrentStudyHash( _
-    ByVal studyCode As String _
-) As String
-
-    Select Case UCase$(studyCode)
-
-        Case "OP"
-            GetCurrentStudyHash = CalculateCurrentOPHash()
-
-        Case "OPOH"
-            GetCurrentStudyHash = CalculateCurrentOPOHHash()
-
-        Case "AP"
-            GetCurrentStudyHash = CalculateCurrentAPHash()
-
-        Case "BP"
-            GetCurrentStudyHash = CalculateCurrentBPHash()
-
-        Case "GC"
-            GetCurrentStudyHash = CalculateCurrentGCHash()
-
-        Case "EMV"
-            GetCurrentStudyHash = CalculateCurrentEMVHash()
-
-        Case "GOR"
-            GetCurrentStudyHash = CalculateCurrentGORHash()
-
-        Case "SSF"
-            GetCurrentStudyHash = CalculateCurrentSSFHash()
-
-        Case "CCE"
-            GetCurrentStudyHash = CalculateCurrentCCEHash()
-
-        Case "CVD"
-            GetCurrentStudyHash = CalculateCurrentCVDHash()
-
-        Case "REC"
-            GetCurrentStudyHash = CalculateCurrentRecHash()
-
-        Case "JOIN"
-            GetCurrentStudyHash = CalculateCurrentJOINHash()
-
-        Case Else
-            Err.Raise vbObjectError + 2200, _
-                "GetCurrentStudyHash", _
-                "Неизвестный тип исследования: " & studyCode
-
-    End Select
-
-End Function
-```
-
-Тогда в твоём обработчике закрытия, где уже есть ссылка `wb` на закрываемую проектную книгу, будет буквально:
-
-```vb
-Call RefreshAllStudySyncStatuses(wb)
-
-wb.Save
-```
-
-И всё.
-
-### Почему мне нравится именно такая схема
-
-Ошибка одного исследования **не останавливает проверку остальных**. Например:
+Если `23.x` и всё нормально:
 
 ```text
 AP      synced
-BP      synced
-GC      ERROR
-EMV     dirty
-GOR     empty
+BP      empty
+GC      synced
 ...
+
+→ никаких сообщений
+→ закрытие
 ```
 
-`GC` получит `error`, но остальные 11 всё равно будут рассчитаны и записаны.
-
-И ещё я бы убрал старые закомментированные наброски внизу `modMetadata`, особенно вот такую идею:
-
-```vb
-SetWorkbookMetadataProperty wb, PROP_AP_DATA_HASH, apHash
-```
-
-при закрытии. 
-
-**Новый текущий hash при закрытии сохранять нельзя.** Иначе `DIRTY` на следующем открытии превратится в `SYNCED`, хотя данные никогда не попадали в БД.
-
-После этого следующим шагом уже можно будет сделать общий итог книги, например:
+Если есть проблемы:
 
 ```text
-Все исследования:
-SYNCED / EMPTY → книга полностью синхронизирована
-
-хотя бы один:
-UNSAVED / DIRTY / ERROR → в книге есть несохранённые данные
+AP   — есть изменения после последнего сохранения в БД
+GOR  — данные ещё не сохранялись в БД
+REC  — не удалось определить состояние данных
 ```
 
-и использовать именно это перед миграцией v22/v23.
+получит:
+
+> В книге обнаружены исследования с данными, которые не синхронизированы с БД:
+>
+> • AP — есть изменения после последнего сохранения в БД
+> • GOR — данные ещё не сохранялись в БД
+> • REC — не удалось определить состояние данных
+>
+> Настоятельно рекомендуется сохранить эти исследования перед закрытием книги.
+>
+> **Всё равно закрыть книгу?**
+
+**Нет** → закрытие отменяется, человек остаётся в книге.
+**Да** → закрываем. Никакого жёсткого запрета нет.
+
+И мне нравится `vbDefaultButton2`: по умолчанию выбрано **«Нет»**, то есть пользователь должен осознанно подтвердить закрытие с несинхронизированными результатами. Это как раз достаточно настойчиво, но не блокирует работу.
