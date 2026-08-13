@@ -1,455 +1,219 @@
-Attribute VB_Name = "modMetadata"
-Option Explicit
+Да. У тебя уже есть всё необходимое: отдельные свойства хэша и статуса для всех 12 исследований, плюс `StudySyncStatus`.  
+
+И сразу важный момент: **при закрытии книги сохранённый `...DataHash` не трогаем вообще**. Он означает «хэш данных после последней успешной синхронизации с БД» и должен меняться только внутри успешного `Save_*`. При закрытии записываем только `...DataState`.
+
+Я бы в `modMetadata` добавил вот это.
+
+```vb
+Private Const EMPTY_DATA_HASH As String = "00000000-0-0"
 
 
-' ============================================================
-' ВЕРСИИ КОМПОНЕНТОВ
-' ============================================================
+Public Sub RefreshAllStudySyncStatuses(ByVal wb As Workbook)
 
-Public Const PROP_FORM_VERSION As String = _
-    "PVTFormVersion"
+    UpdateStudySyncStatus wb, "OP", PROP_OP_DATA_HASH, PROP_OP_DATA_STATE
+    UpdateStudySyncStatus wb, "OPOH", PROP_OPOH_DATA_HASH, PROP_OPOH_DATA_STATE
+    UpdateStudySyncStatus wb, "AP", PROP_AP_DATA_HASH, PROP_AP_DATA_STATE
+    UpdateStudySyncStatus wb, "BP", PROP_BP_DATA_HASH, PROP_BP_DATA_STATE
+    UpdateStudySyncStatus wb, "GC", PROP_GC_DATA_HASH, PROP_GC_DATA_STATE
+    UpdateStudySyncStatus wb, "EMV", PROP_EMV_DATA_HASH, PROP_EMV_DATA_STATE
+    UpdateStudySyncStatus wb, "GOR", PROP_GOR_DATA_HASH, PROP_GOR_DATA_STATE
+    UpdateStudySyncStatus wb, "SSF", PROP_SSF_DATA_HASH, PROP_SSF_DATA_STATE
+    UpdateStudySyncStatus wb, "CCE", PROP_CCE_DATA_HASH, PROP_CCE_DATA_STATE
+    UpdateStudySyncStatus wb, "CVD", PROP_CVD_DATA_HASH, PROP_CVD_DATA_STATE
+    UpdateStudySyncStatus wb, "REC", PROP_REC_DATA_HASH, PROP_REC_DATA_STATE
+    UpdateStudySyncStatus wb, "JOIN", PROP_JOIN_DATA_HASH, PROP_JOIN_DATA_STATE
 
-Public Const PROP_ADDIN_VERSION As String = _
-    "PVTAddinVersion"
-
-Public Const PROP_DOWNHOLE_QUALITY_ACT_VERSION As String = _
-    "DownholeSampleQualityActVersion"
-
-Public Const PROP_SURFACE_QUALITY_ACT_VERSION As String = _
-    "SurfaceSampleQualityActVersion"
-
-
-' ============================================================
-' ХЕШ-СУММЫ ИССЛЕДОВАНИЙ
-' ============================================================
-
-Public Const PROP_OP_DATA_HASH As String = _
-    "OPDataHash"
-
-Public Const PROP_OPOH_DATA_HASH As String = _
-    "OPOHDataHash"
-
-Public Const PROP_AP_DATA_HASH As String = _
-    "APDataHash"
-
-Public Const PROP_BP_DATA_HASH As String = _
-    "BPDataHash"
-
-Public Const PROP_GC_DATA_HASH As String = _
-    "GCDataHash"
-
-Public Const PROP_EMV_DATA_HASH As String = _
-    "EMVDataHash"
-
-Public Const PROP_GOR_DATA_HASH As String = _
-    "GORDataHash"
-
-Public Const PROP_SSF_DATA_HASH As String = _
-    "SSFDataHash"
-
-Public Const PROP_CCE_DATA_HASH As String = _
-    "CCEDataHash"
-
-Public Const PROP_CVD_DATA_HASH As String = _
-    "CVDDataHash"
-
-Public Const PROP_REC_DATA_HASH As String = _
-    "RECDataHash"
-
-Public Const PROP_JOIN_DATA_HASH As String = _
-    "JOINDataHash"
+End Sub
 
 
-' ============================================================
-' СТАТУСЫ СИНХРОНИЗАЦИИ ИССЛЕДОВАНИЙ
-' ============================================================
-
-Public Const PROP_OP_DATA_STATE As String = _
-    "OPDataState"
-
-Public Const PROP_OPOH_DATA_STATE As String = _
-    "OPOHDataState"
-
-Public Const PROP_AP_DATA_STATE As String = _
-    "APDataState"
-
-Public Const PROP_BP_DATA_STATE As String = _
-    "BPDataState"
-
-Public Const PROP_GC_DATA_STATE As String = _
-    "GCDataState"
-
-Public Const PROP_EMV_DATA_STATE As String = _
-    "EMVDataState"
-
-Public Const PROP_GOR_DATA_STATE As String = _
-    "GORDataState"
-
-Public Const PROP_SSF_DATA_STATE As String = _
-    "SSFDataState"
-
-Public Const PROP_CCE_DATA_STATE As String = _
-    "CCEDataState"
-
-Public Const PROP_CVD_DATA_STATE As String = _
-    "CVDDataState"
-
-Public Const PROP_REC_DATA_STATE As String = _
-    "RECDataState"
-
-Public Const PROP_JOIN_DATA_STATE As String = _
-    "JOINDataState"
-
-
-' ============================================================
-' СТАТУС СИНХРОНИЗАЦИИ
-' ============================================================
-
-Public Enum StudySyncStatus
-
-    ' Статус ещё не определён или свойство отсутствует.
-    SYNC_STATUS_UNKNOWN = 0
-
-    ' В исследовании нет данных, требующих сохранения.
-    SYNC_STATUS_EMPTY = 1
-
-    ' Данные заполнены, но ещё ни разу не сохранялись в БД.
-    SYNC_STATUS_UNSAVED = 2
-
-    ' Данные ранее сохранялись, но текущий хеш отличается.
-    SYNC_STATUS_DIRTY = 3
-
-    ' Текущий хеш совпадает с хешем после сохранения.
-    SYNC_STATUS_SYNCED = 4
-
-    ' При определении состояния произошла ошибка.
-    SYNC_STATUS_ERROR = 5
-
-End Enum
-
-
-' ============================================================
-' ЗАПИСЬ СВОЙСТВА
-' ============================================================
-
-Public Sub SetWorkbookMetadataProperty( _
+Private Sub UpdateStudySyncStatus( _
     ByVal wb As Workbook, _
-    ByVal propertyName As String, _
-    ByVal propertyValue As String, _
-    Optional ByVal saveWorkbook As Boolean = False _
+    ByVal studyCode As String, _
+    ByVal hashProperty As String, _
+    ByVal stateProperty As String _
 )
-
-    Dim documentProperty As Object
-
-    If wb Is Nothing Then
-        Err.Raise _
-            vbObjectError + 2100, _
-            "SetWorkbookMetadataProperty", _
-            "Книга не указана."
-    End If
-
-    propertyName = Trim$(propertyName)
-
-    If propertyName = "" Then
-        Err.Raise _
-            vbObjectError + 2101, _
-            "SetWorkbookMetadataProperty", _
-            "Название свойства не указано."
-    End If
-
-    On Error Resume Next
-
-    Set documentProperty = _
-        wb.CustomDocumentProperties(propertyName)
 
     On Error GoTo ErrorHandler
 
-    If documentProperty Is Nothing Then
+    Dim currentHash As String
+    Dim savedHash As String
+    Dim status As StudySyncStatus
 
-        wb.CustomDocumentProperties.Add _
-            name:=propertyName, _
-            LinkToContent:=False, _
-            Type:=msoPropertyTypeString, _
-            value:=propertyValue
+    currentHash = GetCurrentStudyHash(studyCode)
+    savedHash = GetWorkbookMetadataProperty(wb, hashProperty)
 
-    Else
+    status = DetermineStudySyncStatus(currentHash, savedHash)
 
-        documentProperty.value = propertyValue
-
-    End If
-
-    If saveWorkbook Then
-        wb.Save
-    End If
-
+    SetStudySyncStatus wb, stateProperty, status, False
     Exit Sub
 
 ErrorHandler:
 
-    Err.Raise _
-        vbObjectError + 2102, _
-        "SetWorkbookMetadataProperty", _
-        "Не удалось записать свойство '" & _
-        propertyName & "' в книгу '" & _
-        wb.name & "'." & vbCrLf & _
-        Err.Description
-
-End Sub
-
-
-' ============================================================
-' ЧТЕНИЕ СВОЙСТВА
-' ============================================================
-
-Public Function GetWorkbookMetadataProperty( _
-    ByVal wb As Workbook, _
-    ByVal propertyName As String, _
-    Optional ByVal defaultValue As String = "" _
-) As String
-
-    Dim documentProperty As Object
-
-    If wb Is Nothing Then
-        Err.Raise _
-            vbObjectError + 2110, _
-            "GetWorkbookMetadataProperty", _
-            "Книга не указана."
-    End If
-
-    propertyName = Trim$(propertyName)
-
-    If propertyName = "" Then
-        Err.Raise _
-            vbObjectError + 2111, _
-            "GetWorkbookMetadataProperty", _
-            "Название свойства не указано."
-    End If
+    Debug.Print "Ошибка определения статуса " & studyCode & ": " & _
+        Err.Number & ": " & Err.Description
 
     On Error Resume Next
+    SetStudySyncStatus wb, stateProperty, SYNC_STATUS_ERROR, False
+    On Error GoTo 0
 
-    Set documentProperty = _
-        wb.CustomDocumentProperties(propertyName)
+End Sub
+```
 
-    On Error GoTo ErrorHandler
+Дальше функция определения статуса:
 
-    If documentProperty Is Nothing Then
+```vb
+Private Function DetermineStudySyncStatus( _
+    ByVal currentHash As String, _
+    ByVal savedHash As String _
+) As StudySyncStatus
 
-        GetWorkbookMetadataProperty = defaultValue
+    If savedHash = "" Then
 
-    ElseIf IsNull(documentProperty.value) Then
+        If currentHash = EMPTY_DATA_HASH Then
+            DetermineStudySyncStatus = SYNC_STATUS_EMPTY
+        Else
+            DetermineStudySyncStatus = SYNC_STATUS_UNSAVED
+        End If
 
-        GetWorkbookMetadataProperty = defaultValue
+    ElseIf currentHash = savedHash Then
+
+        If currentHash = EMPTY_DATA_HASH Then
+            DetermineStudySyncStatus = SYNC_STATUS_EMPTY
+        Else
+            DetermineStudySyncStatus = SYNC_STATUS_SYNCED
+        End If
 
     Else
 
-        GetWorkbookMetadataProperty = _
-            CStr(documentProperty.value)
+        DetermineStudySyncStatus = SYNC_STATUS_DIRTY
 
     End If
-
-    Exit Function
-
-ErrorHandler:
-
-    Err.Raise _
-        vbObjectError + 2112, _
-        "GetWorkbookMetadataProperty", _
-        "Не удалось прочитать свойство '" & _
-        propertyName & "' из книги '" & _
-        wb.name & "'." & vbCrLf & _
-        Err.Description
 
 End Function
+```
 
+Здесь специально такая логика:
 
-' ============================================================
-' ПРОВЕРКА НАЛИЧИЯ СВОЙСТВА
-' ============================================================
+```text
+данных нет + никогда не сохранялись      → EMPTY
+данные есть + сохранённого hash нет      → UNSAVED
+currentHash = savedHash                  → SYNCED
+currentHash <> savedHash                 → DIRTY
+ошибка расчёта                           → ERROR
+```
 
-Public Function WorkbookMetadataPropertyExists( _
-    ByVal wb As Workbook, _
-    ByVal propertyName As String _
-) As Boolean
+Причём важный случай:
 
-    Dim documentProperty As Object
+```text
+раньше данные были сохранены
+savedHash = ABC
 
-    If wb Is Nothing Then
-        Exit Function
-    End If
+пользователь всё удалил
+currentHash = 00000000-0-0
 
-    propertyName = Trim$(propertyName)
+→ DIRTY
+```
 
-    If propertyName = "" Then
-        Exit Function
-    End If
+То есть мы **не скажем `EMPTY`**, потому что фактически пользователь удалил ранее синхронизированные данные. Это как раз тот случай, который нельзя пропустить. Твои значения enum уже идеально подходят под эту модель. 
 
-    On Error Resume Next
+И остаётся диспетчер хэшей:
 
-    Set documentProperty = _
-        wb.CustomDocumentProperties(propertyName)
-
-    On Error GoTo 0
-
-    WorkbookMetadataPropertyExists = _
-        Not documentProperty Is Nothing
-
-End Function
-
-
-' ============================================================
-' ПРЕОБРАЗОВАНИЕ ENUM В СТРОКУ ДЛЯ МЕТАДАННЫХ
-' ============================================================
-
-Public Function StudySyncStatusToString( _
-    ByVal status As StudySyncStatus _
+```vb
+Private Function GetCurrentStudyHash( _
+    ByVal studyCode As String _
 ) As String
 
-    Select Case status
+    Select Case UCase$(studyCode)
 
-        Case SYNC_STATUS_EMPTY
-            StudySyncStatusToString = "empty"
+        Case "OP"
+            GetCurrentStudyHash = CalculateCurrentOPHash()
 
-        Case SYNC_STATUS_UNSAVED
-            StudySyncStatusToString = "unsaved"
+        Case "OPOH"
+            GetCurrentStudyHash = CalculateCurrentOPOHHash()
 
-        Case SYNC_STATUS_DIRTY
-            StudySyncStatusToString = "dirty"
+        Case "AP"
+            GetCurrentStudyHash = CalculateCurrentAPHash()
 
-        Case SYNC_STATUS_SYNCED
-            StudySyncStatusToString = "synced"
+        Case "BP"
+            GetCurrentStudyHash = CalculateCurrentBPHash()
 
-        Case SYNC_STATUS_ERROR
-            StudySyncStatusToString = "error"
+        Case "GC"
+            GetCurrentStudyHash = CalculateCurrentGCHash()
+
+        Case "EMV"
+            GetCurrentStudyHash = CalculateCurrentEMVHash()
+
+        Case "GOR"
+            GetCurrentStudyHash = CalculateCurrentGORHash()
+
+        Case "SSF"
+            GetCurrentStudyHash = CalculateCurrentSSFHash()
+
+        Case "CCE"
+            GetCurrentStudyHash = CalculateCurrentCCEHash()
+
+        Case "CVD"
+            GetCurrentStudyHash = CalculateCurrentCVDHash()
+
+        Case "REC"
+            GetCurrentStudyHash = CalculateCurrentRecHash()
+
+        Case "JOIN"
+            GetCurrentStudyHash = CalculateCurrentJOINHash()
 
         Case Else
-            StudySyncStatusToString = "unknown"
+            Err.Raise vbObjectError + 2200, _
+                "GetCurrentStudyHash", _
+                "Неизвестный тип исследования: " & studyCode
 
     End Select
 
 End Function
+```
 
+Тогда в твоём обработчике закрытия, где уже есть ссылка `wb` на закрываемую проектную книгу, будет буквально:
 
-' ============================================================
-' ПРЕОБРАЗОВАНИЕ СТРОКИ ИЗ МЕТАДАННЫХ В ENUM
-' ============================================================
+```vb
+Call RefreshAllStudySyncStatuses(wb)
 
-Public Function StringToStudySyncStatus( _
-    ByVal value As String _
-) As StudySyncStatus
+wb.Save
+```
 
-    Select Case LCase$(Trim$(value))
+И всё.
 
-        Case "empty"
-            StringToStudySyncStatus = _
-                SYNC_STATUS_EMPTY
+### Почему мне нравится именно такая схема
 
-        Case "unsaved"
-            StringToStudySyncStatus = _
-                SYNC_STATUS_UNSAVED
+Ошибка одного исследования **не останавливает проверку остальных**. Например:
 
-        Case "dirty"
-            StringToStudySyncStatus = _
-                SYNC_STATUS_DIRTY
+```text
+AP      synced
+BP      synced
+GC      ERROR
+EMV     dirty
+GOR     empty
+...
+```
 
-        Case "synced"
-            StringToStudySyncStatus = _
-                SYNC_STATUS_SYNCED
+`GC` получит `error`, но остальные 11 всё равно будут рассчитаны и записаны.
 
-        Case "error"
-            StringToStudySyncStatus = _
-                SYNC_STATUS_ERROR
+И ещё я бы убрал старые закомментированные наброски внизу `modMetadata`, особенно вот такую идею:
 
-        Case Else
-            StringToStudySyncStatus = _
-                SYNC_STATUS_UNKNOWN
+```vb
+SetWorkbookMetadataProperty wb, PROP_AP_DATA_HASH, apHash
+```
 
-    End Select
+при закрытии. 
 
-End Function
+**Новый текущий hash при закрытии сохранять нельзя.** Иначе `DIRTY` на следующем открытии превратится в `SYNCED`, хотя данные никогда не попадали в БД.
 
+После этого следующим шагом уже можно будет сделать общий итог книги, например:
 
-' ============================================================
-' УДОБНЫЕ ОБЁРТКИ ДЛЯ СТАТУСА
-' ============================================================
+```text
+Все исследования:
+SYNCED / EMPTY → книга полностью синхронизирована
 
-Public Sub SetStudySyncStatus( _
-    ByVal wb As Workbook, _
-    ByVal propertyName As String, _
-    ByVal status As StudySyncStatus, _
-    Optional ByVal saveWorkbook As Boolean = False _
-)
+хотя бы один:
+UNSAVED / DIRTY / ERROR → в книге есть несохранённые данные
+```
 
-    SetWorkbookMetadataProperty _
-        wb:=wb, _
-        propertyName:=propertyName, _
-        propertyValue:=StudySyncStatusToString(status), _
-        saveWorkbook:=saveWorkbook
-
-End Sub
-
-
-Public Function GetStudySyncStatus( _
-    ByVal wb As Workbook, _
-    ByVal propertyName As String _
-) As StudySyncStatus
-
-    Dim storedValue As String
-
-    storedValue = GetWorkbookMetadataProperty( _
-        wb:=wb, _
-        propertyName:=propertyName, _
-        defaultValue:="unknown" _
-    )
-
-    GetStudySyncStatus = _
-        StringToStudySyncStatus(storedValue)
-
-End Function
-
-
-
-
-'### Проверить AP при закрытии
-'
-'Dim currentHash As String
-'Dim savedHash As String
-'Dim status As StudySyncStatus
-'
-'currentHash = CalculateDataHash(BuildAPSaveData())
-'
-'savedHash = GetWorkbookMetadataProperty( _
-'    wb:=ActiveWorkbook, _
-'    propertyName:=PROP_AP_DATA_HASH _
-')
-'
-'If savedHash = "" Then
-'
-'    status = SYNC_STATUS_UNSAVED
-'
-'ElseIf currentHash = savedHash Then
-'
-'    status = SYNC_STATUS_SYNCED
-'
-'Else
-'
-'    status = SYNC_STATUS_DIRTY
-'
-'End If
-'
-'SetStudySyncStatus _
-'    wb:=ActiveWorkbook, _
-'    propertyName:=PROP_AP_DATA_STATE, _
-'    status:=status
-'
-'SetWorkbookMetadataProperty wb, PROP_AP_DATA_HASH, apHash
-'SetStudySyncStatus wb, PROP_AP_DATA_STATE, apStatus
-'
-'SetWorkbookMetadataProperty wb, PROP_CCE_DATA_HASH, cceHash
-'SetStudySyncStatus wb, PROP_CCE_DATA_STATE, cceStatus
-'
-'SetWorkbookMetadataProperty wb, PROP_JOIN_DATA_HASH, joinHash
-'SetStudySyncStatus wb, PROP_JOIN_DATA_STATE, joinStatus
-'
-'wb.Save
-
-
+и использовать именно это перед миграцией v22/v23.
