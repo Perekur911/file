@@ -1,68 +1,330 @@
-Да. Если сейчас пока храним LiqPhaseQualifier текстом, для SQLite я бы сделал миграцию так.
+Да. Я бы сейчас внес ровно три изменения в VBA плюс два столбца в самой книге. Save_OP и хэш не трогаем — они у тебя уже работают динамически по заголовкам OP_results.  
 
-Предполагаю таблица называется OP_results.
+1. В Excel добавь новый столбец
 
-BEGIN TRANSACTION;
+В обе таблицы:
 
-ALTER TABLE OP_results
-ADD COLUMN LiqPhaseQualifier TEXT;
+OP
+OP_results
 
-UPDATE OP_results
-SET
-    LiqPhaseQualifier =
-        CASE
-            WHEN TRIM(CAST(VLiqPhase AS TEXT)) = 'Не выполнялось'
-                THEN 'Не выполнялось'
+рядом с VLiqPhase добавь:
 
-            WHEN TRIM(CAST(VLiqPhase AS TEXT)) = 'Следы'
-                THEN 'Менее 1 мл'
+LiqPhaseQualifier
 
-            WHEN CAST(REPLACE(TRIM(CAST(VLiqPhase AS TEXT)), ',', '.') AS REAL) > 0
-             AND CAST(REPLACE(TRIM(CAST(VLiqPhase AS TEXT)), ',', '.') AS REAL) < 1
-                THEN 'Менее 1 мл'
+В таблице OP для него сделай выпадающий список:
 
-            ELSE NULL
-        END,
+Менее 1 мл
+Не выполнялось
 
-    VLiqPhase =
-        CASE
-            WHEN TRIM(CAST(VLiqPhase AS TEXT)) IN ('Не выполнялось', 'Следы')
-                THEN NULL
-
-            WHEN CAST(REPLACE(TRIM(CAST(VLiqPhase AS TEXT)), ',', '.') AS REAL) > 0
-             AND CAST(REPLACE(TRIM(CAST(VLiqPhase AS TEXT)), ',', '.') AS REAL) < 1
-                THEN NULL
-
-            ELSE VLiqPhase
-        END;
-
-COMMIT;
-
-В результате:
-
-Было VLiqPhase	Новый VLiqPhase	LiqPhaseQualifier
-
-0	0	NULL
-0.2	NULL	Менее 1 мл
-0.999	NULL	Менее 1 мл
-1	1	NULL
-12.5	12.5	NULL
-Следы	NULL	Менее 1 мл
-Не выполнялось	NULL	Не выполнялось
-NULL	NULL	NULL
+Пустое значение тоже должно быть допустимо.
 
 
-Я специально использовал REPLACE(..., ',', '.'), чтобы миграция нормально пережила старые числовые значения, если где-то они вдруг записаны текстом как 0,5.
+---
 
-Но до UPDATE я бы сначала выполнил контрольный запрос, чтобы увидеть все уникальные старые значения:
+2. OPResultToFormMappings
 
-SELECT
-    VLiqPhase,
-    COUNT(*) AS cnt
-FROM OP_results
-GROUP BY VLiqPhase
-ORDER BY VLiqPhase;
+Сейчас там есть:
 
-Это полезно: если вдруг там кроме Следы и Не выполнялось обнаружится какая-нибудь третья текстовая семантика, мы её увидим до миграции.
+Array("VLiqPhase", "VLiqPhase"), _
+Array("natureLiq", "natureLiq"), _
 
-И ещё момент: раз мы уже решили переводить такие вещи на справочники, возможно, лучше сразу не создавать LiqPhaseQualifier TEXT, а создать LiqPhaseQualifierId INTEGER + справочник из двух значений. Тогда не придётся через несколько дней делать вторую миграцию этого же поля.
+
+
+Сделай:
+
+Array("VLiqPhase", "VLiqPhase"), _
+Array("LiqPhaseQualifier", "LiqPhaseQualifier"), _
+Array("natureLiq", "natureLiq"), _
+
+Это нужно именно для Load из OP_results обратно в форму.
+
+
+---
+
+3. OP_FieldCaption
+
+Сейчас:
+
+Case "VLiqPhase"
+    OP_FieldCaption = "Объём жидкой фазы"
+
+Case "natureLiq"
+    OP_FieldCaption = "Природа жидкой фазы"
+
+
+
+Сделай:
+
+Case "VLiqPhase"
+    OP_FieldCaption = "Объём жидкой фазы"
+
+Case "LiqPhaseQualifier"
+    OP_FieldCaption = "Уточнение объёма жидкой фазы"
+
+Case "natureLiq"
+    OP_FieldCaption = "Природа жидкой фазы"
+
+
+---
+
+4. В Validate_OP_Row полностью замени старую ГРУППУ 11
+
+Сейчас группа 11 разрешает в самом VLiqPhase число, "Следы" и "Не выполнялось". 
+
+Весь этот старый блок:
+
+' =========================================================
+' ГРУППА 11. ОБЪЁМ ЖИДКОЙ ФАЗЫ
+...
+Select Case fieldName
+
+    Case "VLiqPhase"
+        ...
+        
+End Select
+
+замени на этот:
+
+' =========================================================
+        ' ГРУППА 11. ОБЪЁМ ЖИДКОЙ ФАЗЫ
+        '
+        ' Для газа:
+        '
+        ' 1. Выполнено с числовым результатом:
+        '       VLiqPhase = 0 или >= 1
+        '       LiqPhaseQualifier = пусто
+        '
+        ' 2. Объём менее 1 мл:
+        '       VLiqPhase = пусто
+        '       LiqPhaseQualifier = "Менее 1 мл"
+        '
+        ' 3. Определение требовалось, но не выполнялось:
+        '       VLiqPhase = пусто
+        '       LiqPhaseQualifier = "Не выполнялось"
+        '
+        ' Для жидкой пробы оба поля должны быть пустыми.
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case "VLiqPhase"
+
+                Dim liqVolumeValue As Variant
+                Dim liqVolumeText As String
+
+                Dim qualifierCell As Range
+                Dim qualifierValue As Variant
+                Dim qualifierText As String
+
+                liqVolumeValue = fieldValue
+                liqVolumeText = valueText
+
+                Set qualifierCell = _
+                    workTable.ListColumns("LiqPhaseQualifier") _
+                             .DataBodyRange.Cells(rowIndex, 1)
+
+                qualifierValue = qualifierCell.value
+
+                If IsError(qualifierValue) Then
+
+                    AddValidationError _
+                        errors, _
+                        errorCount, _
+                        "OP, строка " & rowIndex & _
+                        ": поле ""Уточнение объёма жидкой фазы"" " & _
+                        "содержит ошибку Excel: " & _
+                        qualifierCell.text, _
+                        qualifierCell
+
+                    GoTo next_field
+
+                End If
+
+                qualifierText = Trim$(CStr(qualifierValue))
+
+
+                Select Case fluid
+
+                    ' =================================================
+                    ' ГАЗОВАЯ ПРОБА
+                    ' =================================================
+
+                    Case Gas
+
+                        ' Сначала проверяем допустимое значение qualifier.
+                        If qualifierText <> "" Then
+
+                            Select Case LCase$(qualifierText)
+
+                                Case "менее 1 мл", _
+                                     "не выполнялось"
+
+                                    ' допустимо
+
+                                Case Else
+
+                                    AddValidationError _
+                                        errors, _
+                                        errorCount, _
+                                        "OP, строка " & rowIndex & _
+                                        ": поле ""Уточнение объёма жидкой фазы"" " & _
+                                        "может содержать только ""Менее 1 мл"" " & _
+                                        "или ""Не выполнялось"".", _
+                                        qualifierCell
+
+                            End Select
+
+                        End If
+
+
+                        ' Оба поля пустые — результат не определён.
+                        If liqVolumeText = "" _
+                           And qualifierText = "" Then
+
+                            AddValidationError _
+                                errors, _
+                                errorCount, _
+                                "OP, строка " & rowIndex & _
+                                ": для газовой пробы необходимо указать " & _
+                                "объём жидкой фазы либо выбрать уточнение " & _
+                                """Менее 1 мл"" / ""Не выполнялось"".", _
+                                fieldCell
+
+                        End If
+
+
+                        ' Оба поля одновременно заполнены — противоречие.
+                        If liqVolumeText <> "" _
+                           And qualifierText <> "" Then
+
+                            AddValidationError _
+                                errors, _
+                                errorCount, _
+                                "OP, строка " & rowIndex & _
+                                ": нельзя одновременно указывать числовой " & _
+                                "объём жидкой фазы и его уточнение.", _
+                                qualifierCell
+
+                        End If
+
+
+                        ' Если указан числовой объём.
+                        If liqVolumeText <> "" Then
+
+                            If Not IsNumeric(liqVolumeValue) Then
+
+                                AddValidationError _
+                                    errors, _
+                                    errorCount, _
+                                    "OP, строка " & rowIndex & _
+                                    ": поле ""Объём жидкой фазы"" " & _
+                                    "должно содержать число.", _
+                                    fieldCell
+
+                            ElseIf CDbl(liqVolumeValue) < 0 Then
+
+                                AddValidationError _
+                                    errors, _
+                                    errorCount, _
+                                    "OP, строка " & rowIndex & _
+                                    ": поле ""Объём жидкой фазы"" " & _
+                                    "не может быть отрицательным.", _
+                                    fieldCell
+
+                            ElseIf CDbl(liqVolumeValue) > 0 _
+                               And CDbl(liqVolumeValue) < 1 Then
+
+                                AddValidationError _
+                                    errors, _
+                                    errorCount, _
+                                    "OP, строка " & rowIndex & _
+                                    ": для объёма менее 1 мл оставьте " & _
+                                    "числовое поле пустым и выберите " & _
+                                    """Менее 1 мл"" в поле " & _
+                                    """Уточнение объёма жидкой фазы"".", _
+                                    fieldCell
+
+                            End If
+
+                        End If
+
+
+                    ' =================================================
+                    ' ЖИДКАЯ ПРОБА
+                    ' =================================================
+
+                    Case Liquid
+
+                        If liqVolumeText <> "" Then
+
+                            AddValidationError _
+                                errors, _
+                                errorCount, _
+                                "OP, строка " & rowIndex & _
+                                ": поле ""Объём жидкой фазы"" " & _
+                                "для жидкой пробы должно быть пустым.", _
+                                fieldCell
+
+                        End If
+
+                        If qualifierText <> "" Then
+
+                            AddValidationError _
+                                errors, _
+                                errorCount, _
+                                "OP, строка " & rowIndex & _
+                                ": поле ""Уточнение объёма жидкой фазы"" " & _
+                                "для жидкой пробы должно быть пустым.", _
+                                qualifierCell
+
+                        End If
+
+                End Select
+
+        End Select
+
+Тут специально вся совместная проверка сидит в:
+
+Case "VLiqPhase"
+
+а не выполняется ещё раз при проходе LiqPhaseQualifier. Иначе одни и те же ошибки могли бы добавляться дважды.
+
+Что в итоге будет разрешено
+
+VLiqPhase = 0
+LiqPhaseQualifier = ""
+
+✅
+
+VLiqPhase = 5
+LiqPhaseQualifier = ""
+
+✅
+
+VLiqPhase = ""
+LiqPhaseQualifier = "Менее 1 мл"
+
+✅
+
+VLiqPhase = ""
+LiqPhaseQualifier = "Не выполнялось"
+
+✅
+
+А вот:
+
+0.5 + пусто
+
+❌ — надо выбрать Менее 1 мл.
+
+5 + "Менее 1 мл"
+
+❌ — одновременно два взаимоисключающих результата.
+
+пусто + пусто
+
+❌ для газа, но нормально для жидкой пробы.
+
+И ещё один момент: поскольку Validate_OP_Row идёт именно по столбцам OP_results и требует наличие одноимённого столбца в OP, новый LiqPhaseQualifier действительно должен присутствовать в обеих таблицах, иначе валидатор выдаст «В таблице OP не найдена колонка». 
+
+После этих изменений по VBA всё. Save_OP и Build_OP_HashData автоматически подхватят новый столбец.
