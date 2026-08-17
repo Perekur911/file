@@ -97,19 +97,56 @@ NULL                     -> VLiqPhase=None       Qualifier=None                 
 'Не выполнялось'         -> VLiqPhase=None       Qualifier='Не выполнялось'     count=234
 'Не выполнялось'         -> VLiqPhase=None       Qualifier='Не выполнялось'     count=234
 'Следы'                  -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=14
- 
+PS L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project> & "D:/Program Files/Python 3.11.3/python.exe" l:/LRC/common_data/ФЛЮИДЫ/ГТИ/repository_SQlite_Project/tools/migrate_op_results.py
+======================================================================== 
+Миграция OP_results: VLiqPhase TEXT -> REAL
+Добавление LiqPhaseQualifier TEXT
+========================================================================    
+БД: L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\results_test.db 
+Резервная копия: L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\results_test_backup_before_OP_VLiqPhase_20260817_170609.db 
+
+Строк в OP_results: 1008
+
+Будут восстановлены объекты схемы:
+  index: OP_results_sampleCode_IDX
+
+Старые значения VLiqPhase:
+------------------------------------------------------------------------
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+      count=2                                                                   count=1
+'0,8'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+      count=2                                                                   count=1
+'1'                      -> VLiqPhase=1.0        Qualifier=None                 count=2
+      count=4                                                                   count=2
+'1,4'                    -> VLiqPhase=1.4        Qualifier=None                 count=1
+'1,5'                    -> VLiqPhase=1.5        Qualifier=None                 count=4
+'5'                      -> VLiqPhase=5.0        Qualifier=None                 count=1
+'Не выполнялось'         -> VLiqPhase=None       Qualifier='Не выполнялось'     count=234
+'Следы'                  -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=14
+
 Ожидаемая сводка преобразования:
   NULL / NULL: 598
   число / NULL: 152
   NULL / Менее 1 мл: 24
   NULL / Не выполнялось: 234
 Восстановлен index: OP_results_sampleCode_IDX
-Traceback (most recent call last):
-  File "l:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\migrate_op_results.py", line 664, in <module>
-    main()
-  File "l:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\migrate_op_results.py", line 649, in main
-    migrate(conn)
-  File "l:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\migrate_op_results.py", line 592, in migrate
-    raise RuntimeError(
-RuntimeError: PRAGMA foreign_key_check обнаружил нарушения: [('AP_sourceData', 981, 'AP_results', 0), ('AP_sourceData', 982, 'AP_results', 0), ('AP_sourceData', 983, 'AP_results', 0), ('AP_sourceData', 984, 'AP_results', 0), ('AP_sourceData', 985, 'AP_results', 0), ('AP_sourceData', 986, 'AP_results', 0)]
+
+Распределение после миграции:
+------------------------------------------------------------------------
+VLiqPhase=None       Qualifier=None                 count=598
+VLiqPhase=0.0        Qualifier=None                 count=142
+VLiqPhase=1.0        Qualifier=None                 count=4
+VLiqPhase=1.4        Qualifier=None                 count=1
+VLiqPhase=1.5        Qualifier=None                 count=4
+VLiqPhase=5.0        Qualifier=None                 count=1
+VLiqPhase=None       Qualifier='Менее 1 мл'         count=24
+VLiqPhase=None       Qualifier='Не выполнялось'     count=234
+
+========================================================================
+МИГРАЦИЯ УСПЕШНО ЗАВЕРШЕНА
+========================================================================
+Если выше не было исключений, OP_results заменена атомарно: при любой ошибке до COMMIT исходная таблица откатывается.
 PS L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project>
