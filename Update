@@ -1,152 +1,54 @@
-PS L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project> & "D:/Program Files/Python 3.11.3/python.exe" l:/LRC/common_data/ФЛЮИДЫ/ГТИ/repository_SQlite_Project/tools/migrate_op_results.py
-========================================================================
-Миграция OP_results: VLiqPhase TEXT -> REAL
-PS L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project> & "D:/Program Files/Python 3.11.3/python.exe" l:/LRC/common_data/ФЛЮИДЫ/ГТИ/repository_SQlite_Project/tools/migrate_op_results.py
-======================================================================== 
-Миграция OP_results: VLiqPhase TEXT -> REAL
-Добавление LiqPhaseQualifier TEXT
-========================================================================    
-БД: L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\results_test.db 
-Резервная копия: L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\results_test_backup_before_OP_VLiqPhase_20260817_164957.db 
+Да. Если сам python.exe реально запускается, а VSCodium при Python: Select Interpreter говорит, что интерпретатор «invalid», его можно прописать вручную и фактически заставить проект использовать именно его.
 
-Строк в OP_results: 1008
+У тебя, судя по предыдущему запуску, рабочий Python такой:
 
-Будут восстановлены объекты схемы:
-  index: OP_results_sampleCode_IDX
+D:\Program Files\Python 3.11.3\python.exe
 
-Старые значения VLiqPhase:
-------------------------------------------------------------------------
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,45'                   -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,5'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-'0,6'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,7'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-'0,8'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,45'                   -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,5'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-'0,6'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,45'                   -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,45'                   -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,45'                   -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,5'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-'0,5'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-'0,6'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,7'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-'0,6'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,7'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-'0,7'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-'0,7'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-'0,8'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-'0,8'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-'1'                      -> VLiqPhase=1.0        Qualifier=None                 count=4
-'1'                      -> VLiqPhase=1.0        Qualifier=None                 count=4
-'1,4'                    -> VLiqPhase=1.4        Qualifier=None                 count=1
-'1,4'                    -> VLiqPhase=1.4        Qualifier=None                 count=1
-'1,5'                    -> VLiqPhase=1.5        Qualifier=None                 count=4
-'1,5'                    -> VLiqPhase=1.5        Qualifier=None                 count=4
-'5'                      -> VLiqPhase=5.0        Qualifier=None                 count=1
-'5'                      -> VLiqPhase=5.0        Qualifier=None                 count=1
-'Не выполнялось'         -> VLiqPhase=None       Qualifier='Не выполнялось'     count=234
-'Не выполнялось'         -> VLiqPhase=None       Qualifier='Не выполнялось'     count=234
-'Следы'                  -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=14
-PS L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project> & "D:/Program Files/Python 3.11.3/python.exe" l:/LRC/common_data/ФЛЮИДЫ/ГТИ/repository_SQlite_Project/tools/migrate_op_results.py
-======================================================================== 
-Миграция OP_results: VLiqPhase TEXT -> REAL
-Добавление LiqPhaseQualifier TEXT
-========================================================================    
-БД: L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\results_test.db 
-Резервная копия: L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\results_test_backup_before_OP_VLiqPhase_20260817_170609.db 
+В папке проекта создай/открой:
 
-Строк в OP_results: 1008
+.vscode\settings.json
 
-Будут восстановлены объекты схемы:
-  index: OP_results_sampleCode_IDX
+и пропиши:
 
-Старые значения VLiqPhase:
-------------------------------------------------------------------------
-NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
-'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
-'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
-      count=2                                                                   count=1
-'0,8'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
-      count=2                                                                   count=1
-'1'                      -> VLiqPhase=1.0        Qualifier=None                 count=2
-      count=4                                                                   count=2
-'1,4'                    -> VLiqPhase=1.4        Qualifier=None                 count=1
-'1,5'                    -> VLiqPhase=1.5        Qualifier=None                 count=4
-'5'                      -> VLiqPhase=5.0        Qualifier=None                 count=1
-'Не выполнялось'         -> VLiqPhase=None       Qualifier='Не выполнялось'     count=234
-'Следы'                  -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=14
+{
+    "python.defaultInterpreterPath": "D:\\Program Files\\Python 3.11.3\\python.exe"
+}
 
-Ожидаемая сводка преобразования:
-  NULL / NULL: 598
-  число / NULL: 152
-  NULL / Менее 1 мл: 24
-  NULL / Не выполнялось: 234
-Восстановлен index: OP_results_sampleCode_IDX
+После этого сделай Developer: Reload Window.
 
-Распределение после миграции:
-------------------------------------------------------------------------
-VLiqPhase=None       Qualifier=None                 count=598
-VLiqPhase=0.0        Qualifier=None                 count=142
-VLiqPhase=1.0        Qualifier=None                 count=4
-VLiqPhase=1.4        Qualifier=None                 count=1
-VLiqPhase=1.5        Qualifier=None                 count=4
-VLiqPhase=5.0        Qualifier=None                 count=1
-VLiqPhase=None       Qualifier='Менее 1 мл'         count=24
-VLiqPhase=None       Qualifier='Не выполнялось'     count=234
+Но тут есть одна мерзкая особенность: python.defaultInterpreterPath — это скорее интерпретатор по умолчанию при первоначальном выборе, а не абсолютно жёсткая привязка. Если Python-extension уже запомнил какой-то другой interpreter для workspace, он иногда продолжает держаться за него.
 
-========================================================================
-МИГРАЦИЯ УСПЕШНО ЗАВЕРШЕНА
-========================================================================
-Если выше не было исключений, OP_results заменена атомарно: при любой ошибке до COMMIT исходная таблица откатывается.
-PS L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project>
+Тогда попробуй:
+
+Ctrl+Shift+P → Python: Select Interpreter → Enter interpreter path... → Find...
+
+и руками укажи:
+
+D:\Program Files\Python 3.11.3\python.exe
+
+Если он всё равно говорит Invalid
+
+Вот это уже интересно. Первым делом прямо во встроенном терминале VSCodium выполни:
+
+& "D:\Program Files\Python 3.11.3\python.exe" --version
+
+и:
+
+& "D:\Program Files\Python 3.11.3\python.exe" -c "import sys; print(sys.executable); print(sys.version)"
+
+Если получишь что-то вроде:
+
+D:\Program Files\Python 3.11.3\python.exe
+3.11.3 ...
+
+то сам Python абсолютно валидный, а тупит именно расширение VSCodium/механизм обнаружения окружений.
+
+Причём запуск файла у тебя уже это подтверждает:
+
+& "D:/Program Files/Python 3.11.3/python.exe" l:/LRC/.../migrate_op_results.py
+
+То есть Windows этот интерпретатор прекрасно исполняет.
+
+Есть ещё более жёсткий способ. Если тебе в первую очередь нужны Run/Debug, можно вообще не полагаться на автоматический выбор Python extension и в .vscode/launch.json явно закрепить executable. Но сначала я бы разобрался, почему именно он считает его invalid, потому что тогда нормально заработают также автодополнение, анализ импортов, debugger и выбор venv.
+
+Если скинешь точный текст ошибки VSCodium про invalid interpreter или скрин — по нему, скорее всего, сразу станет понятно, что именно у него не нравится.
