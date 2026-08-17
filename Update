@@ -1,267 +1,115 @@
-Обработка заняла 29s
-
-Да, теперь по фотографии структура понятна полностью. У тебя сейчас VLiqPhase TEXT, а всё остальное сохраняем без изменений; также нужно восстановить уникальный индекс OP_results_sampleCode_IDX.
-
-SQLite не умеет штатно сделать ALTER COLUMN VLiqPhase TYPE REAL, поэтому здесь правильно пересоздать таблицу, скопировать данные с преобразованием, удалить старую и переименовать новую. Это рекомендуемый SQLite способ изменения datatype. 
-
-На копии БД я бы запускал вот этот скрипт:
-
-BEGIN TRANSACTION;
-
-
--- ============================================================
--- 1. Создаём новую OP_results с новой структурой
--- ============================================================
-
-CREATE TABLE OP_results_new (
-    resultIdOp INTEGER PRIMARY KEY AUTOINCREMENT,
-    TaskId INTEGER,
-    sampleCode TEXT,
-    operator TEXT,
-    date TEXT,
-    Popen REAL,
-    Punit TEXT,
-    Pabsolute INTEGER,
-    PopenMPa REAL,
-    Topen REAL,
-    VH2O REAL,
-    Pend REAL,
-    PendMPa REAL,
-
-    -- Был TEXT, теперь только число
-    VLiqPhase REAL,
-
-    -- Новое поле
-    LiqPhaseQualifier TEXT,
-
-    natureLiq TEXT,
-    state INTEGER,
-    comment TEXT,
-    deltaPopenPCT REAL,
-    PopenMPaT REAL,
-    dateTimeSync TEXT
-);
-
-
--- ============================================================
--- 2. Переносим данные
--- ============================================================
-
-INSERT INTO OP_results_new (
-    resultIdOp,
-    TaskId,
-    sampleCode,
-    operator,
-    date,
-    Popen,
-    Punit,
-    Pabsolute,
-    PopenMPa,
-    Topen,
-    VH2O,
-    Pend,
-    PendMPa,
-    VLiqPhase,
-    LiqPhaseQualifier,
-    natureLiq,
-    state,
-    comment,
-    deltaPopenPCT,
-    PopenMPaT,
-    dateTimeSync
-)
-SELECT
-    resultIdOp,
-    TaskId,
-    sampleCode,
-    operator,
-    date,
-    Popen,
-    Punit,
-    Pabsolute,
-    PopenMPa,
-    Topen,
-    VH2O,
-    Pend,
-    PendMPa,
-
-    -- ========================================================
-    -- Новый VLiqPhase
-    -- ========================================================
-    CASE
-
-        -- Для данного типа пробы определение не требуется
-        WHEN VLiqPhase IS NULL
-            THEN NULL
-
-        -- Теперь эти состояния хранятся в qualifier
-        WHEN TRIM(VLiqPhase) = 'Следы'
-            THEN NULL
-
-        WHEN TRIM(VLiqPhase) = 'Не выполнялось'
-            THEN NULL
-
-        -- 0 < значение < 1 теперь обозначаем qualifier
-        WHEN CAST(
-            REPLACE(TRIM(VLiqPhase), ',', '.')
-            AS REAL
-        ) > 0
-        AND CAST(
-            REPLACE(TRIM(VLiqPhase), ',', '.')
-            AS REAL
-        ) < 1
-            THEN NULL
-
-        -- 0 и >= 1 остаются числом
-        ELSE CAST(
-            REPLACE(TRIM(VLiqPhase), ',', '.')
-            AS REAL
-        )
-
-    END AS VLiqPhase,
-
-
-    -- ========================================================
-    -- Новый LiqPhaseQualifier
-    -- ========================================================
-    CASE
-
-        -- Определение для пробы не требуется
-        WHEN VLiqPhase IS NULL
-            THEN NULL
-
-        -- Требовалось, но не выполнялось
-        WHEN TRIM(VLiqPhase) = 'Не выполнялось'
-            THEN 'Не выполнялось'
-
-        -- Старые "Следы"
-        WHEN TRIM(VLiqPhase) = 'Следы'
-            THEN 'Менее 1 мл'
-
-        -- Старые числовые значения 0 < x < 1
-        WHEN CAST(
-            REPLACE(TRIM(VLiqPhase), ',', '.')
-            AS REAL
-        ) > 0
-        AND CAST(
-            REPLACE(TRIM(VLiqPhase), ',', '.')
-            AS REAL
-        ) < 1
-            THEN 'Менее 1 мл'
-
-        -- Для нормального числового результата qualifier не нужен
-        ELSE NULL
-
-    END AS LiqPhaseQualifier,
-
-    natureLiq,
-    state,
-    comment,
-    deltaPopenPCT,
-    PopenMPaT,
-    dateTimeSync
-
-FROM OP_results;
-
-
--- ============================================================
--- 3. Удаляем старую таблицу
--- ============================================================
-
-DROP TABLE OP_results;
-
-
--- ============================================================
--- 4. Новую ставим на её место
--- ============================================================
-
-ALTER TABLE OP_results_new
-RENAME TO OP_results;
-
-
--- ============================================================
--- 5. Восстанавливаем уникальный индекс
--- ============================================================
-
-CREATE UNIQUE INDEX OP_results_sampleCode_IDX
-ON OP_results (sampleCode);
-
-
-COMMIT;
-
-resultIdOp переносится с прежними значениями. Поскольку новая таблица тоже INTEGER PRIMARY KEY AUTOINCREMENT, SQLite ведёт для неё sqlite_sequence; явные вставки ID учитываются при дальнейшем AUTOINCREMENT. 
-
-Сразу после миграции я бы проверил вот это
-
-Сначала общее количество:
-
-SELECT COUNT(*)
-FROM OP_results;
-
-По твоему скриншоту сейчас должно быть 1008 строк.
-
-Потом распределение:
-
-SELECT
-    VLiqPhase,
-    LiqPhaseQualifier,
-    COUNT(*) AS cnt
-FROM OP_results
-GROUP BY
-    VLiqPhase,
-    LiqPhaseQualifier
-ORDER BY
-    LiqPhaseQualifier,
-    VLiqPhase;
-
-По тем исходным значениям, которые ты показал, я ожидаю примерно:
-
-VLiqPhase    LiqPhaseQualifier       cnt
-------------------------------------------------
-NULL         NULL                    598
-NULL         Менее 1 мл               24
-NULL         Не выполнялось          234
-
-0            NULL                    142
-1            NULL                      4
-1.4          NULL                      1
-1.5          NULL                      4
-5            NULL                      1
-
-Итого 1008.
-
-Обрати внимание: в Менее 1 мл должно попасть 24 записи: 14 старых "Следы" плюс 10 записей с числом между 0 и 1.
-
-Дальше три контрольных запроса:
-
--- Не должно быть строк, где заполнены оба взаимоисключающих поля
-SELECT *
-FROM OP_results
-WHERE VLiqPhase IS NOT NULL
-  AND LiqPhaseQualifier IS NOT NULL;
-
-Должно быть 0 строк.
-
--- VLiqPhase теперь действительно объявлен REAL
-PRAGMA table_info(OP_results);
-
-Там должно быть:
-
-VLiqPhase             REAL
-LiqPhaseQualifier     TEXT
-
-И:
-
--- Проверяем индекс
-SELECT
-    name,
-    sql
-FROM sqlite_schema
-WHERE tbl_name = 'OP_results'
-  AND type = 'index';
-
-Должен остаться:
-
-OP_results_sampleCode_IDX
-
-Я бы именно в таком виде сначала прогнал на копии. Если эти четыре проверки сходятся, сама миграция данных OP практически подтверждена.
+PS L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project> & "D:/Program Files/Python 3.11.3/python.exe" l:/LRC/common_data/ФЛЮИДЫ/ГТИ/repository_SQlite_Project/tools/migrate_op_results.py
+========================================================================
+Миграция OP_results: VLiqPhase TEXT -> REAL
+PS L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project> & "D:/Program Files/Python 3.11.3/python.exe" l:/LRC/common_data/ФЛЮИДЫ/ГТИ/repository_SQlite_Project/tools/migrate_op_results.py
+======================================================================== 
+Миграция OP_results: VLiqPhase TEXT -> REAL
+Добавление LiqPhaseQualifier TEXT
+========================================================================    
+БД: L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\results_test.db 
+Резервная копия: L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\results_test_backup_before_OP_VLiqPhase_20260817_164957.db 
+
+Строк в OP_results: 1008
+
+Будут восстановлены объекты схемы:
+  index: OP_results_sampleCode_IDX
+
+Старые значения VLiqPhase:
+------------------------------------------------------------------------
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,45'                   -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,5'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+'0,6'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,7'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+'0,8'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,45'                   -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,5'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+'0,6'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,45'                   -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+NULL                     -> VLiqPhase=None       Qualifier=None                 count=598
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0'                      -> VLiqPhase=0.0        Qualifier=None                 count=142
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,1'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,3'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,45'                   -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,45'                   -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,5'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+'0,5'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+'0,6'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,7'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+'0,6'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=1
+'0,7'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+'0,7'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+'0,7'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+'0,8'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+'0,8'                    -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=2
+'1'                      -> VLiqPhase=1.0        Qualifier=None                 count=4
+'1'                      -> VLiqPhase=1.0        Qualifier=None                 count=4
+'1,4'                    -> VLiqPhase=1.4        Qualifier=None                 count=1
+'1,4'                    -> VLiqPhase=1.4        Qualifier=None                 count=1
+'1,5'                    -> VLiqPhase=1.5        Qualifier=None                 count=4
+'1,5'                    -> VLiqPhase=1.5        Qualifier=None                 count=4
+'5'                      -> VLiqPhase=5.0        Qualifier=None                 count=1
+'5'                      -> VLiqPhase=5.0        Qualifier=None                 count=1
+'Не выполнялось'         -> VLiqPhase=None       Qualifier='Не выполнялось'     count=234
+'Не выполнялось'         -> VLiqPhase=None       Qualifier='Не выполнялось'     count=234
+'Следы'                  -> VLiqPhase=None       Qualifier='Менее 1 мл'         count=14
+ 
+Ожидаемая сводка преобразования:
+  NULL / NULL: 598
+  число / NULL: 152
+  NULL / Менее 1 мл: 24
+  NULL / Не выполнялось: 234
+Восстановлен index: OP_results_sampleCode_IDX
+Traceback (most recent call last):
+  File "l:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\migrate_op_results.py", line 664, in <module>
+    main()
+  File "l:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\migrate_op_results.py", line 649, in main
+    migrate(conn)
+  File "l:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\migrate_op_results.py", line 592, in migrate
+    raise RuntimeError(
+RuntimeError: PRAGMA foreign_key_check обнаружил нарушения: [('AP_sourceData', 981, 'AP_results', 0), ('AP_sourceData', 982, 'AP_results', 0), ('AP_sourceData', 983, 'AP_results', 0), ('AP_sourceData', 984, 'AP_results', 0), ('AP_sourceData', 985, 'AP_results', 0), ('AP_sourceData', 986, 'AP_results', 0)]
+PS L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project>
