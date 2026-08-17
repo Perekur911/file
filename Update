@@ -1,40 +1,107 @@
-Да. Я бы сейчас внес ровно три изменения в VBA плюс два столбца в самой книге. Save_OP и хэш не трогаем — они у тебя уже работают динамически по заголовкам OP_results.  
+Обработка заняла 19s
 
-1. В Excel добавь новый столбец
+Да, но для SQLite это лучше сделать не как два отдельных шага «поменять тип → потом перенести данные». Тип существующего столбца с TEXT на REAL штатным ALTER COLUMN ... TYPE SQLite всё ещё не меняет; для изменения datatype официально рекомендуется пересоздать таблицу и скопировать данные. 
 
-В обе таблицы:
+То есть правильная миграция будет сразу делать три вещи:
 
-OP
-OP_results
+старая OP_results
+        ↓
+создаём новую OP_results_new
+    VLiqPhase REAL
+    LiqPhaseQualifier TEXT
+        ↓
+INSERT ... SELECT с преобразованием старого VLiqPhase
+        ↓
+удаляем старую таблицу
+        ↓
+OP_results_new → OP_results
 
-рядом с VLiqPhase добавь:
+Причём это даже лучше: мы не рискуем сначала потерять "Следы" и "Не выполнялось". При копировании сразу раскладываем старое смешанное поле на два новых.
 
-LiqPhaseQualifier
+Например сама ключевая часть переноса будет такая:
 
-В таблице OP для него сделай выпадающий список:
+INSERT INTO OP_results_new (
+    -- остальные поля,
+    VLiqPhase,
+    LiqPhaseQualifier
+    -- остальные поля
+)
+SELECT
+    -- остальные поля,
 
-Менее 1 мл
-Не выполнялось
+    CASE
+        WHEN VLiqPhase IS NULL THEN NULL
 
-Пустое значение тоже должно быть допустимо.
+        WHEN TRIM(CAST(VLiqPhase AS TEXT)) IN (
+            'Следы',
+            'Не выполнялось'
+        ) THEN NULL
 
+        WHEN CAST(
+            REPLACE(TRIM(CAST(VLiqPhase AS TEXT)), ',', '.')
+            AS REAL
+        ) > 0
+        AND CAST(
+            REPLACE(TRIM(CAST(VLiqPhase AS TEXT)), ',', '.')
+            AS REAL
+        ) < 1 THEN NULL
 
----
+        ELSE CAST(
+            REPLACE(TRIM(CAST(VLiqPhase AS TEXT)), ',', '.')
+            AS REAL
+        )
+    END AS VLiqPhase,
 
-2. OPResultToFormMappings
+    CASE
+        WHEN VLiqPhase IS NULL THEN NULL
 
-Сейчас там есть:
+        WHEN TRIM(CAST(VLiqPhase AS TEXT)) = 'Не выполнялось'
+            THEN 'Не выполнялось'
 
-Array("VLiqPhase", "VLiqPhase"), _
-Array("natureLiq", "natureLiq"), _
+        WHEN TRIM(CAST(VLiqPhase AS TEXT)) = 'Следы'
+            THEN 'Менее 1 мл'
 
+        WHEN CAST(
+            REPLACE(TRIM(CAST(VLiqPhase AS TEXT)), ',', '.')
+            AS REAL
+        ) > 0
+        AND CAST(
+            REPLACE(TRIM(CAST(VLiqPhase AS TEXT)), ',', '.')
+            AS REAL
+        ) < 1
+            THEN 'Менее 1 мл'
 
+        ELSE NULL
+    END AS LiqPhaseQualifier
 
-Сделай:
+    -- остальные поля
+FROM OP_results;
 
-Array("VLiqPhase", "VLiqPhase"), _
-Array("LiqPhaseQualifier", "LiqPhaseQualifier"), _
-Array("natureLiq", "natureLiq"), _
+В новой таблице:
+
+VLiqPhase REAL,
+LiqPhaseQualifier TEXT
+
+REAL даст столбцу соответствующую affinity; числовые значения в нём будут храниться как числовые, а не как прежняя смесь текста и чисел. 
+
+Но чтобы я написал тебе полностью готовый миграционный SQL без -- остальные поля, мне нужна текущая структура OP_results. Выполни на копии БД:
+
+SELECT sql
+FROM sqlite_schema
+WHERE type = 'table'
+  AND name = 'OP_results';
+
+Пришли результат. Я возьму точно существующую структуру таблицы, сохраню все столбцы, PK/FK/ограничения и дам один готовый скрипт:
+
+BEGIN
+→ новая таблица
+→ перенос с преобразованием
+→ проверки
+→ DROP старой
+→ RENAME
+→ COMMIT
+
+Так будет безопаснее, чем угадывать текущий DDL OP_results.Array("natureLiq", "natureLiq"), _
 
 Это нужно именно для Load из OP_results обратно в форму.
 
