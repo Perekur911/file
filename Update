@@ -1,54 +1,211 @@
-Да. Если сам python.exe реально запускается, а VSCodium при Python: Select Interpreter говорит, что интерпретатор «invalid», его можно прописать вручную и фактически заставить проект использовать именно его.
+Да, лучше сделать отдельную функцию, которая:
 
-У тебя, судя по предыдущему запуску, рабочий Python такой:
+* вызывает каждый `Save_*` отдельно;
+* **не останавливается** на первом `MACRO_FAILED`;
+* в конце возвращает:
 
-D:\Program Files\Python 3.11.3\python.exe
+  * `MACRO_CHANGED`, если что-то сохранилось и ошибок не было;
+  * `MACRO_NO_CHANGES`, если изменений не было и ошибок не было;
+  * `MACRO_FAILED`, если **хотя бы одно** исследование упало.
 
-В папке проекта создай/открой:
+Вот готовый вариант.
 
-.vscode\settings.json
+---
 
-и пропиши:
+### 1. Новая функция покомпонентного сохранения
 
-{
-    "python.defaultInterpreterPath": "D:\\Program Files\\Python 3.11.3\\python.exe"
-}
+```vb
+Public Function Save_All_OneByOne( _
+    Optional ByVal silent As Boolean = False _
+) As macroResult
 
-После этого сделай Developer: Reload Window.
+    Dim totalResult As macroResult
+    Dim currentResult As macroResult
 
-Но тут есть одна мерзкая особенность: python.defaultInterpreterPath — это скорее интерпретатор по умолчанию при первоначальном выборе, а не абсолютно жёсткая привязка. Если Python-extension уже запомнил какой-то другой interpreter для workspace, он иногда продолжает держаться за него.
+    Dim hasChanges As Boolean
+    Dim hasFailures As Boolean
+    Dim failedStudies As String
 
-Тогда попробуй:
+    totalResult = MACRO_NO_CHANGES
 
-Ctrl+Shift+P → Python: Select Interpreter → Enter interpreter path... → Find...
+    currentResult = Save_OP(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "OP, "
+    End If
 
-и руками укажи:
+    currentResult = Save_OPOH(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "OPOH, "
+    End If
 
-D:\Program Files\Python 3.11.3\python.exe
+    currentResult = Save_AP(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "AP, "
+    End If
 
-Если он всё равно говорит Invalid
+    currentResult = Save_BP(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "BP, "
+    End If
 
-Вот это уже интересно. Первым делом прямо во встроенном терминале VSCodium выполни:
+    currentResult = Save_GC(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "GC, "
+    End If
 
-& "D:\Program Files\Python 3.11.3\python.exe" --version
+    currentResult = Save_EMV(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "EMV, "
+    End If
 
-и:
+    currentResult = Save_GOR(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "GOR, "
+    End If
 
-& "D:\Program Files\Python 3.11.3\python.exe" -c "import sys; print(sys.executable); print(sys.version)"
+    currentResult = Save_SSF(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "SSF, "
+    End If
 
-Если получишь что-то вроде:
+    currentResult = Save_CCE(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "CCE, "
+    End If
 
-D:\Program Files\Python 3.11.3\python.exe
-3.11.3 ...
+    currentResult = Save_CVD(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "CVD, "
+    End If
 
-то сам Python абсолютно валидный, а тупит именно расширение VSCodium/механизм обнаружения окружений.
+    currentResult = Save_Rec(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "REC, "
+    End If
 
-Причём запуск файла у тебя уже это подтверждает:
+    currentResult = Save_JOIN(silent:=silent)
+    If currentResult = MACRO_CHANGED Then
+        hasChanges = True
+    ElseIf currentResult = MACRO_FAILED Then
+        hasFailures = True
+        failedStudies = failedStudies & "JOIN, "
+    End If
 
-& "D:/Program Files/Python 3.11.3/python.exe" l:/LRC/.../migrate_op_results.py
+    If hasFailures Then
+        If Len(failedStudies) >= 2 Then
+            failedStudies = Left$(failedStudies, Len(failedStudies) - 2)
+        End If
 
-То есть Windows этот интерпретатор прекрасно исполняет.
+        If Not silent Then
+            MsgBox _
+                "Не удалось сохранить исследования: " & failedStudies, _
+                vbExclamation
+        End If
 
-Есть ещё более жёсткий способ. Если тебе в первую очередь нужны Run/Debug, можно вообще не полагаться на автоматический выбор Python extension и в .vscode/launch.json явно закрепить executable. Но сначала я бы разобрался, почему именно он считает его invalid, потому что тогда нормально заработают также автодополнение, анализ импортов, debugger и выбор venv.
+        Save_All_OneByOne = MACRO_FAILED
+        Exit Function
+    End If
 
-Если скинешь точный текст ошибки VSCodium про invalid interpreter или скрин — по нему, скорее всего, сразу станет понятно, что именно у него не нравится.
+    If hasChanges Then
+        Save_All_OneByOne = MACRO_CHANGED
+    Else
+        Save_All_OneByOne = MACRO_NO_CHANGES
+    End If
+
+End Function
+```
+
+---
+
+### 2. Silent-обёртка для мигратора
+
+Если у тебя Python сейчас вызывает `wrappers.Save_All_wrap` или `wrappers.Silent_Save_All_wrap`, сделай новую обёртку:
+
+```vb
+Public Function Silent_Save_All_OneByOne_wrap() As macroResult
+    Silent_Save_All_OneByOne_wrap = Save_All_OneByOne(silent:=True)
+End Function
+```
+
+---
+
+### 3. Что поменять в Python
+
+Вместо вызова:
+
+```python
+wrappers.Silent_Save_All_wrap
+```
+
+вызывай:
+
+```python
+wrappers.Silent_Save_All_OneByOne_wrap
+```
+
+---
+
+### 4. Важное замечание
+
+Этот вариант **продолжит сохранять остальные исследования**, даже если одно из них упало.
+
+То есть сценарий будет такой:
+
+* `OP` — сохранился
+* `OPOH` — сохранился
+* `AP` — ошибка
+* `BP` — сохранился
+* `GC` — сохранился
+
+Итог:
+
+* книга частично сохранена;
+* функция вернёт `MACRO_FAILED`;
+* в `failedStudies` будет, например, `"AP"`.
+
+Это уже намного лучше для мигратора, чем старый `Save_All`, который валился на первом проблемном исследовании.
+
+---
+
+Если хочешь, я следующим сообщением могу сразу написать **ещё более полезную версию**, которая будет возвращать не просто `MACRO_FAILED`, а строку вида:
+
+```text
+OK: OP,OPOH,BP,GC
+FAILED: AP,SSF
+CHANGED: OP,BP,GC
+```
+
+Чтобы Python потом прямо это писал в отчёт миграции.
