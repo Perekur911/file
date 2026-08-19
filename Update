@@ -1,211 +1,218 @@
-Да, лучше сделать отдельную функцию, которая:
+Option Explicit
 
-* вызывает каждый `Save_*` отдельно;
-* **не останавливается** на первом `MACRO_FAILED`;
-* в конце возвращает:
+Private Const REFRESH_TASKS_NONE As Long = 0
+Private Const REFRESH_TASKS_BEFORE As Long = 1
+Private Const REFRESH_TASKS_AFTER As Long = 2
+Private Const REFRESH_TASKS_BEFORE_AND_AFTER As Long = 3
 
-  * `MACRO_CHANGED`, если что-то сохранилось и ошибок не было;
-  * `MACRO_NO_CHANGES`, если изменений не было и ошибок не было;
-  * `MACRO_FAILED`, если **хотя бы одно** исследование упало.
+Public Enum macroResult
+    
+    MACRO_NO_RESULT = 0
+    MACRO_FAILED = 1
+    MACRO_NO_CHANGES = 2
+    MACRO_CHANGED = 3
 
-Вот готовый вариант.
+End Enum
 
----
+Public Sub CallMacro(ByVal macroName As String, ParamArray studies() As Variant)
 
-### 1. Новая функция покомпонентного сохранения
+    Call CallMacroCore(macroName, False, Empty, REFRESH_TASKS_NONE, studies)
 
-```vb
-Public Function Save_All_OneByOne( _
-    Optional ByVal silent As Boolean = False _
+End Sub
+
+
+Public Sub CallMacroWithParam( _
+    ByVal macroName As String, _
+    ByVal macroParam As Variant, _
+    ParamArray studies() As Variant _
+)
+
+    Call CallMacroCore(macroName, True, macroParam, REFRESH_TASKS_NONE, studies)
+
+End Sub
+
+
+Public Sub CallMacroEx( _
+    ByVal macroName As String, _
+    ByVal refreshTasksMode As Long, _
+    ParamArray studies() As Variant _
+)
+
+    Call CallMacroCore(macroName, False, Empty, refreshTasksMode, studies)
+
+End Sub
+
+
+Public Sub CallMacroWithParamEx( _
+    ByVal macroName As String, _
+    ByVal macroParam As Variant, _
+    ByVal refreshTasksMode As Long, _
+    ParamArray studies() As Variant _
+)
+
+    Call CallMacroCore(macroName, True, macroParam, refreshTasksMode, studies)
+
+End Sub
+
+Private Function CallMacroCore( _
+    ByVal macroName As String, _
+    ByVal hasMacroParam As Boolean, _
+    ByVal macroParam As Variant, _
+    ByVal refreshTasksMode As Long, _
+    ByVal studies As Variant _
 ) As macroResult
 
-    Dim totalResult As macroResult
-    Dim currentResult As macroResult
+    CallMacroCore = MACRO_FAILED
 
-    Dim hasChanges As Boolean
-    Dim hasFailures As Boolean
-    Dim failedStudies As String
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+    
+    Dim curSheet As Worksheet
+    Set curSheet = ActiveSheet
+    
+    On Error GoTo CleanFail
 
-    totalResult = MACRO_NO_CHANGES
+    StartMacro wb, studies
 
-    currentResult = Save_OP(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "OP, "
+    If refreshTasksMode = REFRESH_TASKS_BEFORE _
+       Or refreshTasksMode = REFRESH_TASKS_BEFORE_AND_AFTER Then
+
+        RefreshTasks_SelectFile
+
     End If
 
-    currentResult = Save_OPOH(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "OPOH, "
-    End If
+    Dim rawResult As Variant
+    Dim macroResult As macroResult
 
-    currentResult = Save_AP(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "AP, "
-    End If
+    If hasMacroParam Then
 
-    currentResult = Save_BP(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "BP, "
-    End If
+        rawResult = Application.Run( _
+            macroName, _
+            macroParam _
+        )
 
-    currentResult = Save_GC(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "GC, "
-    End If
-
-    currentResult = Save_EMV(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "EMV, "
-    End If
-
-    currentResult = Save_GOR(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "GOR, "
-    End If
-
-    currentResult = Save_SSF(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "SSF, "
-    End If
-
-    currentResult = Save_CCE(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "CCE, "
-    End If
-
-    currentResult = Save_CVD(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "CVD, "
-    End If
-
-    currentResult = Save_Rec(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "REC, "
-    End If
-
-    currentResult = Save_JOIN(silent:=silent)
-    If currentResult = MACRO_CHANGED Then
-        hasChanges = True
-    ElseIf currentResult = MACRO_FAILED Then
-        hasFailures = True
-        failedStudies = failedStudies & "JOIN, "
-    End If
-
-    If hasFailures Then
-        If Len(failedStudies) >= 2 Then
-            failedStudies = Left$(failedStudies, Len(failedStudies) - 2)
-        End If
-
-        If Not silent Then
-            MsgBox _
-                "Не удалось сохранить исследования: " & failedStudies, _
-                vbExclamation
-        End If
-
-        Save_All_OneByOne = MACRO_FAILED
-        Exit Function
-    End If
-
-    If hasChanges Then
-        Save_All_OneByOne = MACRO_CHANGED
     Else
-        Save_All_OneByOne = MACRO_NO_CHANGES
+
+        rawResult = Application.Run(macroName)
+
+    End If
+    
+    If IsEmpty(rawResult) Or rawResult = 0 Then
+        macroResult = MACRO_NO_RESULT
+    ElseIf IsNumeric(rawResult) Then
+        macroResult = CLng(rawResult)
+
+    Else
+        Err.Raise _
+            vbObjectError + 1000, _
+            "CallMacroCore", _
+            "Макрос " & macroName & _
+            " вернул значение неподдерживаемого типа."
+    End If
+    
+    Select Case macroResult
+
+        Case MACRO_NO_RESULT
+    
+            If refreshTasksMode = REFRESH_TASKS_AFTER _
+               Or refreshTasksMode = REFRESH_TASKS_BEFORE_AND_AFTER Then
+                RefreshTasks_SelectFile
+            End If
+            CallMacroCore = MACRO_NO_RESULT
+    
+        Case MACRO_FAILED
+            GoTo CleanExit
+    
+    
+        Case MACRO_NO_CHANGES
+            CallMacroCore = MACRO_NO_CHANGES
+            GoTo CleanExit
+    
+    
+        Case MACRO_CHANGED
+            If refreshTasksMode = REFRESH_TASKS_AFTER _
+               Or refreshTasksMode = REFRESH_TASKS_BEFORE_AND_AFTER Then
+    
+                RefreshTasks_SelectFile
+    
+            End If
+    
+            CallMacroCore = MACRO_CHANGED
+    
+        Case Else
+    
+            Err.Raise _
+                vbObjectError + 1002, _
+                "CallMacroCore", _
+                "?????? " & macroName & _
+                " ?????? ??????????? ?????????: " & CStr(rawResult)
+
+End Select
+
+CleanExit:
+
+    EndMacro wb, studies
+
+    curSheet.Activate
+
+    Exit Function
+
+CleanFail:
+
+    Dim errNumber As Long
+    Dim errSource As String
+    Dim errDescription As String
+
+    errNumber = Err.Number
+    errSource = Err.Source
+    errDescription = Err.Description
+
+    On Error Resume Next
+    EndMacro wb, studies
+    On Error GoTo 0
+    
+    curSheet.Activate
+    Err.Raise errNumber, errSource, errDescription
+
+End Function
+
+
+Private Function HasAnyStudy(ByVal studies As Variant) As Boolean
+
+    On Error GoTo SafeExit
+
+    If IsArray(studies) Then
+        HasAnyStudy = (UBound(studies) >= LBound(studies))
     End If
 
+SafeExit:
+
 End Function
-```
 
----
 
-### 2. Silent-обёртка для мигратора
+Public Sub Load_All_wrap()
+    
+    CallMacro "Load_All", "OP", "OPOH", "GC", "BP", "AP", "GOR", "SSF", "REC", "EMV", "JOIN", "CCE", "CVD"
 
-Если у тебя Python сейчас вызывает `wrappers.Save_All_wrap` или `wrappers.Silent_Save_All_wrap`, сделай новую обёртку:
+End Sub
 
-```vb
-Public Function Silent_Save_All_OneByOne_wrap() As macroResult
-    Silent_Save_All_OneByOne_wrap = Save_All_OneByOne(silent:=True)
+Public Sub Save_All_wrap()
+    
+    CallMacroEx _
+        "Save_all", _
+        REFRESH_TASKS_AFTER, _
+        "OP", "OPOH", "GC", "BP", "AP", "GOR", "SSF", "REC", "EMV", "JOIN", "CCE", "CVD"
+
+End Sub
+
+Public Function Silent_Save_All_wrap() As macroResult
+
+    Silent_Save_All_wrap = CallMacroCore( _
+        "Silent_Save_All_OneByOne_wrap", _
+        True, _
+        True, _
+        REFRESH_TASKS_NONE, _
+        Array("OP", "OPOH", "GC", "BP", "AP", "GOR", "SSF", "REC", "EMV", "JOIN", "CCE", "CVD") _
+    )
+
 End Function
-```
-
----
-
-### 3. Что поменять в Python
-
-Вместо вызова:
-
-```python
-wrappers.Silent_Save_All_wrap
-```
-
-вызывай:
-
-```python
-wrappers.Silent_Save_All_OneByOne_wrap
-```
-
----
-
-### 4. Важное замечание
-
-Этот вариант **продолжит сохранять остальные исследования**, даже если одно из них упало.
-
-То есть сценарий будет такой:
-
-* `OP` — сохранился
-* `OPOH` — сохранился
-* `AP` — ошибка
-* `BP` — сохранился
-* `GC` — сохранился
-
-Итог:
-
-* книга частично сохранена;
-* функция вернёт `MACRO_FAILED`;
-* в `failedStudies` будет, например, `"AP"`.
-
-Это уже намного лучше для мигратора, чем старый `Save_All`, который валился на первом проблемном исследовании.
-
----
-
-Если хочешь, я следующим сообщением могу сразу написать **ещё более полезную версию**, которая будет возвращать не просто `MACRO_FAILED`, а строку вида:
-
-```text
-OK: OP,OPOH,BP,GC
-FAILED: AP,SSF
-CHANGED: OP,BP,GC
-```
-
-Чтобы Python потом прямо это писал в отчёт миграции.
