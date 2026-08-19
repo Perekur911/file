@@ -1,59 +1,28 @@
-Option Explicit
+Да. И тут я бы заодно немного упростил твою схему.
 
-Private Const REFRESH_TASKS_NONE As Long = 0
-Private Const REFRESH_TASKS_BEFORE As Long = 1
-Private Const REFRESH_TASKS_AFTER As Long = 2
-Private Const REFRESH_TASKS_BEFORE_AND_AFTER As Long = 3
+Сейчас есть ещё один потенциальный косяк: ты вызываешь
 
-Public Enum macroResult
-    
-    MACRO_NO_RESULT = 0
-    MACRO_FAILED = 1
-    MACRO_NO_CHANGES = 2
-    MACRO_CHANGED = 3
+```vb
+"Silent_Save_All_OneByOne_wrap", _
+True, _
+True, _
+```
 
-End Enum
+То есть `CallMacroCore` сделает:
 
-Public Sub CallMacro(ByVal macroName As String, ParamArray studies() As Variant)
+```vb
+Application.Run "Silent_Save_All_OneByOne_wrap", True
+```
 
-    Call CallMacroCore(macroName, False, Empty, REFRESH_TASKS_NONE, studies)
+Если `Silent_Save_All_OneByOne_wrap` у тебя **без параметров**, снова получишь `450`.
 
-End Sub
+Лучше вообще вызывать непосредственно `Save_All_OneByOne(silent:=True)` через `Application.Run`.
 
+### 1. Добавь `silent` в `CallMacroCore`
 
-Public Sub CallMacroWithParam( _
-    ByVal macroName As String, _
-    ByVal macroParam As Variant, _
-    ParamArray studies() As Variant _
-)
+Сигнатуру:
 
-    Call CallMacroCore(macroName, True, macroParam, REFRESH_TASKS_NONE, studies)
-
-End Sub
-
-
-Public Sub CallMacroEx( _
-    ByVal macroName As String, _
-    ByVal refreshTasksMode As Long, _
-    ParamArray studies() As Variant _
-)
-
-    Call CallMacroCore(macroName, False, Empty, refreshTasksMode, studies)
-
-End Sub
-
-
-Public Sub CallMacroWithParamEx( _
-    ByVal macroName As String, _
-    ByVal macroParam As Variant, _
-    ByVal refreshTasksMode As Long, _
-    ParamArray studies() As Variant _
-)
-
-    Call CallMacroCore(macroName, True, macroParam, refreshTasksMode, studies)
-
-End Sub
-
+```vb
 Private Function CallMacroCore( _
     ByVal macroName As String, _
     ByVal hasMacroParam As Boolean, _
@@ -61,102 +30,34 @@ Private Function CallMacroCore( _
     ByVal refreshTasksMode As Long, _
     ByVal studies As Variant _
 ) As macroResult
+```
 
-    CallMacroCore = MACRO_FAILED
+замени на:
 
-    Dim wb As Workbook
-    Set wb = ActiveWorkbook
-    
-    Dim curSheet As Worksheet
-    Set curSheet = ActiveSheet
-    
-    On Error GoTo CleanFail
+```vb
+Private Function CallMacroCore( _
+    ByVal macroName As String, _
+    ByVal hasMacroParam As Boolean, _
+    ByVal macroParam As Variant, _
+    ByVal refreshTasksMode As Long, _
+    ByVal studies As Variant, _
+    Optional ByVal silent As Boolean = False _
+) As macroResult
+```
 
-    StartMacro wb, studies
+Все существующие вызовы продолжат работать, потому что по умолчанию:
 
-    If refreshTasksMode = REFRESH_TASKS_BEFORE _
-       Or refreshTasksMode = REFRESH_TASKS_BEFORE_AND_AFTER Then
+```vb
+silent = False
+```
 
-        RefreshTasks_SelectFile
+---
 
-    End If
+### 2. Главное изменение — `CleanFail`
 
-    Dim rawResult As Variant
-    Dim macroResult As macroResult
+Сейчас у тебя:
 
-    If hasMacroParam Then
-
-        rawResult = Application.Run( _
-            macroName, _
-            macroParam _
-        )
-
-    Else
-
-        rawResult = Application.Run(macroName)
-
-    End If
-    
-    If IsEmpty(rawResult) Or rawResult = 0 Then
-        macroResult = MACRO_NO_RESULT
-    ElseIf IsNumeric(rawResult) Then
-        macroResult = CLng(rawResult)
-
-    Else
-        Err.Raise _
-            vbObjectError + 1000, _
-            "CallMacroCore", _
-            "Макрос " & macroName & _
-            " вернул значение неподдерживаемого типа."
-    End If
-    
-    Select Case macroResult
-
-        Case MACRO_NO_RESULT
-    
-            If refreshTasksMode = REFRESH_TASKS_AFTER _
-               Or refreshTasksMode = REFRESH_TASKS_BEFORE_AND_AFTER Then
-                RefreshTasks_SelectFile
-            End If
-            CallMacroCore = MACRO_NO_RESULT
-    
-        Case MACRO_FAILED
-            GoTo CleanExit
-    
-    
-        Case MACRO_NO_CHANGES
-            CallMacroCore = MACRO_NO_CHANGES
-            GoTo CleanExit
-    
-    
-        Case MACRO_CHANGED
-            If refreshTasksMode = REFRESH_TASKS_AFTER _
-               Or refreshTasksMode = REFRESH_TASKS_BEFORE_AND_AFTER Then
-    
-                RefreshTasks_SelectFile
-    
-            End If
-    
-            CallMacroCore = MACRO_CHANGED
-    
-        Case Else
-    
-            Err.Raise _
-                vbObjectError + 1002, _
-                "CallMacroCore", _
-                "?????? " & macroName & _
-                " ?????? ??????????? ?????????: " & CStr(rawResult)
-
-End Select
-
-CleanExit:
-
-    EndMacro wb, studies
-
-    curSheet.Activate
-
-    Exit Function
-
+```vb
 CleanFail:
 
     Dim errNumber As Long
@@ -173,46 +74,159 @@ CleanFail:
     
     curSheet.Activate
     Err.Raise errNumber, errSource, errDescription
+```
 
-End Function
+Сделай:
 
+```vb
+CleanFail:
 
-Private Function HasAnyStudy(ByVal studies As Variant) As Boolean
+    Dim errNumber As Long
+    Dim errSource As String
+    Dim errDescription As String
 
-    On Error GoTo SafeExit
+    errNumber = Err.Number
+    errSource = Err.Source
+    errDescription = Err.Description
 
-    If IsArray(studies) Then
-        HasAnyStudy = (UBound(studies) >= LBound(studies))
+    On Error Resume Next
+    EndMacro wb, studies
+    curSheet.Activate
+    On Error GoTo 0
+
+    If silent Then
+
+        Debug.Print _
+            "CallMacroCore [" & macroName & "] ERROR " & _
+            errNumber & ": " & errDescription
+
+        CallMacroCore = MACRO_FAILED
+        Exit Function
+
     End If
 
-SafeExit:
+    Err.Raise errNumber, errSource, errDescription
+```
 
-End Function
+Вот это принципиально важно.
 
+В обычном режиме:
 
-Public Sub Load_All_wrap()
-    
-    CallMacro "Load_All", "OP", "OPOH", "GC", "BP", "AP", "GOR", "SSF", "REC", "EMV", "JOIN", "CCE", "CVD"
+```text
+ошибка → Err.Raise → пользователь её видит
+```
 
-End Sub
+В миграционном:
 
-Public Sub Save_All_wrap()
-    
-    CallMacroEx _
-        "Save_all", _
-        REFRESH_TASKS_AFTER, _
-        "OP", "OPOH", "GC", "BP", "AP", "GOR", "SSF", "REC", "EMV", "JOIN", "CCE", "CVD"
+```text
+ошибка
+  ↓
+Debug.Print
+  ↓
+MACRO_FAILED
+  ↓
+никакого VBA Error 450 окна
+```
 
-End Sub
+---
 
+### 3. `Silent_Save_All_wrap` я бы сделал так
+
+```vb
 Public Function Silent_Save_All_wrap() As macroResult
 
     Silent_Save_All_wrap = CallMacroCore( _
-        "Silent_Save_All_OneByOne_wrap", _
+        "Save_All_OneByOne", _
         True, _
         True, _
         REFRESH_TASKS_NONE, _
-        Array("OP", "OPOH", "GC", "BP", "AP", "GOR", "SSF", "REC", "EMV", "JOIN", "CCE", "CVD") _
+        Array( _
+            "OP", "OPOH", "GC", "BP", "AP", "GOR", _
+            "SSF", "REC", "EMV", "JOIN", "CCE", "CVD" _
+        ), _
+        True _
     )
 
 End Function
+```
+
+Последний:
+
+```vb
+True
+```
+
+это уже новый параметр:
+
+```vb
+silent:=True
+```
+
+А вот эти:
+
+```vb
+True, _
+True, _
+```
+
+означают:
+
+```text
+hasMacroParam = True
+macroParam    = True
+```
+
+то есть внутри получится:
+
+```vb
+Application.Run "Save_All_OneByOne", True
+```
+
+а поскольку сама функция должна быть:
+
+```vb
+Public Function Save_All_OneByOne( _
+    Optional ByVal silent As Boolean = False _
+) As macroResult
+```
+
+всё совпадает идеально.
+
+### Получается цепочка
+
+```text
+Python
+ ↓
+wrappers.Silent_Save_All_wrap()
+ ↓
+CallMacroCore(... silent=True)
+ ↓
+Application.Run "Save_All_OneByOne", True
+ ↓
+Save_All_OneByOne(silent=True)
+ ↓
+Save_OP(silent=True)
+Save_OPOH(silent=True)
+...
+```
+
+При этом есть **два уровня тишины**:
+
+1. `Save_* (silent=True)` не показывают свои `MsgBox`.
+2. `CallMacroCore(silent=True)` не показывает/не пробрасывает наружу неожиданные VBA runtime errors, а возвращает `MACRO_FAILED`.
+
+Это как раз то, что надо для ночного автоматического прогона.
+
+И я бы ещё исправил у тебя поплывшую строку:
+
+```vb
+Case Else
+
+    Err.Raise _
+        vbObjectError + 1002, _
+        "CallMacroCore", _
+        "Макрос " & macroName & _
+        " вернул неподдерживаемый результат: " & CStr(rawResult)
+```
+
+На работу не влияет, но сейчас там `??????`.
