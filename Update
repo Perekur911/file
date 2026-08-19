@@ -1,288 +1,601 @@
-В последнем варианте — **нет**, Python получит только общий `MACRO_FAILED / MACRO_CHANGED / MACRO_NO_CHANGES`. Для миграции этого мало. Нам как раз нужен **детальный отчёт по каждому исследованию**.
+Да. Сейчас надо внести **4 изменения в Python**. После этого он будет разбирать VBA-ответ по исследованиям, сохранять его в `state.json`, показывать отдельными колонками в Excel-отчёте и не будет считать весь проект проваленным только из-за `OPOH=FAILED`, если `OP=CHANGED` — и наоборот.
 
-Я бы сделал так: `Save_All_OneByOne` не возвращает один `macroResult`, а собирает результат каждого `Save_*` и возвращает строку, которую Python легко разберёт:
+Сейчас `save_one_v22_workbook()` получает VBA-return в `result`, но проверяет его старой `legacy_macro_failed()`, которая строку вида `OP=CHANGED...` не понимает. 
+
+## 1. После `STUDY_STATE_PROPERTIES` добавь константы
+
+У тебя уже есть этот словарь со всеми 12 исследованиями. 
+
+Сразу после него добавь:
+
+```python
+LEGACY_SAVE_STUDIES = tuple(STUDY_STATE_PROPERTIES.keys())
+
+LEGACY_SAVE_RESULT_VALUES = {
+    "NO_RESULT",
+    "FAILED",
+    "NO_CHANGES",
+    "CHANGED",
+}
+```
+
+Получится порядок:
+
+```text
+OP
+OPOH
+AP
+BP
+GC
+EMV
+GOR
+SSF
+CCE
+CVD
+REC
+JOIN
+```
+
+---
+
+## 2. Рядом с `legacy_macro_failed()` добавь две новые функции
+
+Старую `legacy_macro_failed()` можешь пока вообще оставить — просто больше не будем её использовать.
+
+Добавь:
+
+```python
+def parse_legacy_save_report(result: Any) -> dict[str, str]:
+    """
+    Разбирает VBA-ответ вида:
+
+        OP=CHANGED
+        OPOH=FAILED
+        AP=NO_CHANGES
+        ...
+
+    Возвращает:
+        {
+            "OP": "CHANGED",
+            "OPOH": "FAILED",
+            ...
+        }
+    """
+
+    text = normalize_text(result)
+
+    if not text:
+        raise RuntimeError(
+            "Silent_Save_All_wrap не вернул отчёт по исследованиям."
+        )
+
+    if text.upper().startswith("FATAL="):
+        raise RuntimeError(
+            f"VBA завершил покомпонентное сохранение с FATAL: {text}"
+        )
+
+    study_results: dict[str, str] = {}
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        if "=" not in line:
+            raise RuntimeError(
+                f"Неизвестная строка в VBA-отчёте: {line!r}"
+            )
+
+        study, save_result = line.split("=", 1)
+
+        study = study.strip().upper()
+        save_result = save_result.strip().upper()
+
+        if study not in LEGACY_SAVE_STUDIES:
+            raise RuntimeError(
+                f"VBA вернул неизвестное исследование: {study!r}"
+            )
+
+        if save_result not in LEGACY_SAVE_RESULT_VALUES:
+            raise RuntimeError(
+                f"VBA вернул неизвестный результат для {study}: "
+                f"{save_result!r}"
+            )
+
+        if study in study_results:
+            raise RuntimeError(
+                f"VBA дважды вернул результат для исследования {study}."
+            )
+
+        study_results[study] = save_result
+
+    missing = [
+        study
+        for study in LEGACY_SAVE_STUDIES
+        if study not in study_results
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "VBA не вернул результаты для исследований: "
+            + ", ".join(missing)
+        )
+
+    return study_results
+```
+
+И сразу после неё:
+
+```python
+def classify_legacy_save_report(
+    study_results: dict[str, str],
+) -> tuple[str, str]:
+    """
+    Определяет общий статус save-v22.
+
+    Особое правило OP/OPOH:
+    проект начинается либо с OP, либо с OPOH.
+
+    Если OP реально сохранился (CHANGED), ошибку OPOH игнорируем.
+    Если OPOH реально сохранился (CHANGED), ошибку OP игнорируем.
+
+    Ошибка любого другого исследования блокирует create-v23.
+    """
+
+    ignored_failures: list[str] = []
+
+    op_result = study_results["OP"]
+    opoh_result = study_results["OPOH"]
+
+    # OP-проект: OPOH нас не интересует.
+    if op_result == "CHANGED" and opoh_result in {
+        "FAILED",
+        "NO_RESULT",
+    }:
+        ignored_failures.append("OPOH")
+
+    # OPOH-проект: OP нас не интересует.
+    if opoh_result == "CHANGED" and op_result in {
+        "FAILED",
+        "NO_RESULT",
+    }:
+        ignored_failures.append("OP")
+
+    blocking_failures = [
+        study
+        for study, result in study_results.items()
+        if result in {"FAILED", "NO_RESULT"}
+        and study not in ignored_failures
+    ]
+
+    changed = [
+        study
+        for study, result in study_results.items()
+        if result == "CHANGED"
+    ]
+
+    no_changes = [
+        study
+        for study, result in study_results.items()
+        if result == "NO_CHANGES"
+    ]
+
+    message_parts = []
+
+    if changed:
+        message_parts.append(
+            "Сохранено: " + ", ".join(changed)
+        )
+
+    if no_changes:
+        message_parts.append(
+            "Без изменений: " + ", ".join(no_changes)
+        )
+
+    if ignored_failures:
+        message_parts.append(
+            "Игнорируются ошибки неактивной OP/OPOH-ветки: "
+            + ", ".join(
+                f"{study}={study_results[study]}"
+                for study in ignored_failures
+            )
+        )
+
+    if blocking_failures:
+        message_parts.append(
+            "Не удалось обработать: "
+            + ", ".join(
+                f"{study}={study_results[study]}"
+                for study in blocking_failures
+            )
+        )
+
+        return "PARTIAL", "; ".join(message_parts)
+
+    return "OK", "; ".join(message_parts)
+```
+
+### Почему именно так
+
+Твой пример:
 
 ```text
 OP=CHANGED
 OPOH=FAILED
 AP=NO_CHANGES
-BP=CHANGED
-GC=NO_CHANGES
 ...
 ```
 
-Причём твоя логика здесь правильная:
-
-* `CHANGED` — были данные, что-то реально сохранили;
-* `NO_CHANGES` — сохранять нечего / всё уже сохранено;
-* `FAILED` — конкретно это исследование не удалось обработать.
-
-И потом Python сможет записать в отчёт, например:
+станет:
 
 ```text
-26-F123
-Сохранено: OP, BP
-Без изменений: AP, GC, EMV, ...
-Ошибки: OPOH
+status = OK
 ```
 
-А уже миграционную бизнес-логику можем сделать отдельно: **если OP успешно сохранился, а OPOH упал, это не обязательно блокирует проект**, потому что проект у тебя начинается либо с OP, либо с OPOH.
+и сообщение:
 
-Я бы VBA сделал так.
-
-```vb
-Public Function Save_All_OneByOne_Report( _
-    Optional ByVal silent As Boolean = False _
-) As String
-
-    Dim resultText As String
-
-    resultText = resultText & _
-        "OP=" & MacroResultName(TrySaveStudy("OP", silent)) & vbLf
-
-    resultText = resultText & _
-        "OPOH=" & MacroResultName(TrySaveStudy("OPOH", silent)) & vbLf
-
-    resultText = resultText & _
-        "AP=" & MacroResultName(TrySaveStudy("AP", silent)) & vbLf
-
-    resultText = resultText & _
-        "BP=" & MacroResultName(TrySaveStudy("BP", silent)) & vbLf
-
-    resultText = resultText & _
-        "GC=" & MacroResultName(TrySaveStudy("GC", silent)) & vbLf
-
-    resultText = resultText & _
-        "EMV=" & MacroResultName(TrySaveStudy("EMV", silent)) & vbLf
-
-    resultText = resultText & _
-        "GOR=" & MacroResultName(TrySaveStudy("GOR", silent)) & vbLf
-
-    resultText = resultText & _
-        "SSF=" & MacroResultName(TrySaveStudy("SSF", silent)) & vbLf
-
-    resultText = resultText & _
-        "CCE=" & MacroResultName(TrySaveStudy("CCE", silent)) & vbLf
-
-    resultText = resultText & _
-        "CVD=" & MacroResultName(TrySaveStudy("CVD", silent)) & vbLf
-
-    resultText = resultText & _
-        "REC=" & MacroResultName(TrySaveStudy("REC", silent)) & vbLf
-
-    resultText = resultText & _
-        "JOIN=" & MacroResultName(TrySaveStudy("JOIN", silent))
-
-    Save_All_OneByOne_Report = resultText
-
-End Function
+```text
+Сохранено: OP;
+Без изменений: AP, BP, ...;
+Игнорируются ошибки неактивной OP/OPOH-ветки: OPOH=FAILED
 ```
 
-Helper:
+А например:
 
-```vb
-Private Function MacroResultName( _
-    ByVal result As macroResult _
-) As String
-
-    Select Case result
-
-        Case MACRO_NO_RESULT
-            MacroResultName = "NO_RESULT"
-
-        Case MACRO_FAILED
-            MacroResultName = "FAILED"
-
-        Case MACRO_NO_CHANGES
-            MacroResultName = "NO_CHANGES"
-
-        Case MACRO_CHANGED
-            MacroResultName = "CHANGED"
-
-        Case Else
-            MacroResultName = "UNKNOWN"
-
-    End Select
-
-End Function
+```text
+OP=CHANGED
+OPOH=FAILED
+AP=FAILED
+BP=NO_CHANGES
 ```
 
-И `TrySaveStudy` остаётся тем, который ловит runtime error **на каждом исследовании отдельно**:
+даст:
 
-```vb
-Private Function TrySaveStudy( _
-    ByVal studyCode As String, _
-    ByVal silent As Boolean _
-) As macroResult
-
-    On Error GoTo CleanFail
-
-    Select Case UCase$(studyCode)
-
-        Case "OP"
-            TrySaveStudy = Save_OP(silent:=silent)
-
-        Case "OPOH"
-            TrySaveStudy = Save_OPOH(silent:=silent)
-
-        Case "AP"
-            TrySaveStudy = Save_AP(silent:=silent)
-
-        Case "BP"
-            TrySaveStudy = Save_BP(silent:=silent)
-
-        Case "GC"
-            TrySaveStudy = Save_GC(silent:=silent)
-
-        Case "EMV"
-            TrySaveStudy = Save_EMV(silent:=silent)
-
-        Case "GOR"
-            TrySaveStudy = Save_GOR(silent:=silent)
-
-        Case "SSF"
-            TrySaveStudy = Save_SSF(silent:=silent)
-
-        Case "CCE"
-            TrySaveStudy = Save_CCE(silent:=silent)
-
-        Case "CVD"
-            TrySaveStudy = Save_CVD(silent:=silent)
-
-        Case "REC"
-            TrySaveStudy = Save_Rec(silent:=silent)
-
-        Case "JOIN"
-            TrySaveStudy = Save_JOIN(silent:=silent)
-
-        Case Else
-            TrySaveStudy = MACRO_FAILED
-
-    End Select
-
-    Exit Function
-
-CleanFail:
-
-    Debug.Print _
-        "TrySaveStudy [" & studyCode & "]: " & _
-        Err.Number & ": " & Err.Description
-
-    Err.Clear
-    TrySaveStudy = MACRO_FAILED
-
-End Function
+```text
+PARTIAL
 ```
 
-А обёртку с разблокировкой листов тогда меняем на **String**:
+потому что `OPOH=FAILED` игнорируем, **но `AP=FAILED` уже реально требует разбирательства**.
 
-```vb
-Public Function Silent_Save_All_wrap() As String
+При этом я специально **не игнорирую** пока такой случай:
 
-    Dim wb As Workbook
-    Set wb = ActiveWorkbook
+```text
+OP=NO_CHANGES
+OPOH=FAILED
+```
 
-    Dim curSheet As Worksheet
-    Set curSheet = ActiveSheet
+Потому что из одного этого результата нельзя точно понять: это уже сохранённый OP-проект или OPOH-проект, у которого как раз не удалось сохранить нужные данные. Лучше такой редкий случай увидеть в отчёте, чем потерять данные.
 
-    Dim studies As Variant
-    studies = Array( _
-        "OP", "OPOH", "GC", "BP", "AP", "GOR", _
-        "SSF", "REC", "EMV", "JOIN", "CCE", "CVD" _
+---
+
+## 3. Замени кусок в `save_one_v22_workbook()`
+
+Сейчас у тебя после watchdog стоит:
+
+```python
+if legacy_macro_failed(result):
+    return (
+        "FAILED",
+        f"{LEGACY_SAVE_ALL_MACRO} вернул признак ошибки: {result!r}",
     )
 
-    Dim macroStarted As Boolean
+# Save_* могут записать resultId обратно в формы, поэтому сохраняем
+# саму v22-книгу после успешного Save_All.
+disable_excel_prompts(app)
+workbook.save()
 
-    On Error GoTo CleanFail
-
-    StartMacro wb, studies
-    macroStarted = True
-
-    Silent_Save_All_wrap = _
-        Save_All_OneByOne_Report(silent:=True)
-
-CleanExit:
-
-    On Error Resume Next
-
-    If macroStarted Then
-        EndMacro wb, studies
-    End If
-
-    If Not curSheet Is Nothing Then
-        curSheet.Activate
-    End If
-
-    On Error GoTo 0
-
-    Exit Function
-
-
-CleanFail:
-
-    Dim errNumber As Long
-    Dim errDescription As String
-
-    errNumber = Err.Number
-    errDescription = Err.Description
-
-    On Error Resume Next
-
-    If macroStarted Then
-        EndMacro wb, studies
-    End If
-
-    If Not curSheet Is Nothing Then
-        curSheet.Activate
-    End If
-
-    On Error GoTo 0
-
-    Silent_Save_All_wrap = _
-        "FATAL=" & CStr(errNumber) & "|" & errDescription
-
-End Function
+return (
+    "OK",
+    f"{LEGACY_SAVE_ALL_MACRO} завершён; return={result!r}",
+)
 ```
 
-Тогда Python получает не просто:
+
+
+**Весь этот кусок удалить** и поставить:
+
+```python
+study_results = parse_legacy_save_report(result)
+
+status, message = classify_legacy_save_report(
+    study_results
+)
+
+# Очень важно сохранять книгу даже при PARTIAL.
+#
+# До проблемного исследования предыдущие Save_* могли уже успешно
+# сохранить данные в БД и записать новые resultId обратно в форму.
+# Эти resultId обязательно надо сохранить в самом v22-файле.
+disable_excel_prompts(app)
+workbook.save()
+
+return status, message, study_results
+```
+
+Но из-за этого функция теперь должна возвращать три значения.
+
+Сигнатуру:
+
+```python
+def save_one_v22_workbook(
+    *,
+    app: xw.App,
+    addin_name: str,
+    workbook_path: Path,
+) -> tuple[str, str]:
+```
+
+замени на:
+
+```python
+def save_one_v22_workbook(
+    *,
+    app: xw.App,
+    addin_name: str,
+    workbook_path: Path,
+) -> tuple[str, str, dict[str, str]]:
+```
+
+И остальные `return` внутри неё тоже поменяй.
+
+Где watchdog:
+
+```python
+return (
+    "MANUAL_REVIEW",
+    "Во время Save_All появилось интерактивное окно Excel/VBA: "
+    + "; ".join(watchdog.detected),
+    {},
+)
+```
+
+А `except`:
+
+```python
+except Exception as exc:
+    logger.exception(
+        "Ошибка save-v22 для %s",
+        workbook_path,
+    )
+    return (
+        "FAILED",
+        f"{type(exc).__name__}: {exc}",
+        {},
+    )
+```
+
+---
+
+## 4. В `run_save_v22()` принимай третий результат
+
+Сейчас:
+
+```python
+status, message = save_one_v22_workbook(
+    app=app,
+    addin_name=addin_name,
+    workbook_path=workbook_path,
+)
+```
+
+
+
+Замени на:
+
+```python
+status, message, study_results = save_one_v22_workbook(
+    app=app,
+    addin_name=addin_name,
+    workbook_path=workbook_path,
+)
+```
+
+И сейчас состояние записывается так:
+
+```python
+entry["save_v22"] = {
+    "at": now_text(),
+    "status": status,
+    "message": message,
+}
+```
+
+Замени на:
+
+```python
+entry["save_v22"] = {
+    "at": now_text(),
+    "status": status,
+    "message": message,
+    "studies": study_results,
+}
+```
+
+Получишь в JSON:
+
+```json
+"save_v22": {
+    "at": "2026...",
+    "status": "OK",
+    "message": "Сохранено: OP; ...",
+    "studies": {
+        "OP": "CHANGED",
+        "OPOH": "FAILED",
+        "AP": "NO_CHANGES",
+        "BP": "NO_CHANGES",
+        "GC": "CHANGED",
+        "EMV": "NO_CHANGES",
+        "GOR": "NO_CHANGES",
+        "SSF": "NO_CHANGES",
+        "CCE": "NO_CHANGES",
+        "CVD": "NO_CHANGES",
+        "REC": "NO_CHANGES",
+        "JOIN": "NO_CHANGES"
+    }
+}
+```
+
+---
+
+## 5. Добавь отдельные колонки в Excel-отчёт
+
+Сейчас `write_status_report()` создаёт:
+
+```python
+columns = (
+    "Project",
+    "Folder",
+    "V22Workbook",
+    "ScanStatus",
+    "ScanMessage",
+    "SaveV22Status",
+    "SaveV22Message",
+    "CreateV23Status",
+    "CreateV23Message",
+    "V23Workbook",
+    "V22Backup",
+)
+```
+
+
+
+Замени на:
+
+```python
+columns = (
+    "Project",
+    "Folder",
+    "V22Workbook",
+    "ScanStatus",
+    "ScanMessage",
+    "SaveV22Status",
+    "SaveV22Message",
+
+    "Save_OP",
+    "Save_OPOH",
+    "Save_AP",
+    "Save_BP",
+    "Save_GC",
+    "Save_EMV",
+    "Save_GOR",
+    "Save_SSF",
+    "Save_CCE",
+    "Save_CVD",
+    "Save_REC",
+    "Save_JOIN",
+
+    "CreateV23Status",
+    "CreateV23Message",
+    "V23Workbook",
+    "V22Backup",
+)
+```
+
+Дальше перед `ws.append(...)` у тебя есть:
+
+```python
+scan = entry.get("scan", {})
+save_info = entry.get("save_v22", {})
+create_info = entry.get("create_v23", {})
+```
+
+Добавь:
+
+```python
+study_results = save_info.get("studies", {})
+```
+
+И текущий:
+
+```python
+ws.append(
+    (
+        entry.get("project", ""),
+        entry.get("folder", ""),
+        entry.get("v22_workbook", ""),
+        scan.get("status", ""),
+        scan.get("message", ""),
+        save_info.get("status", ""),
+        save_info.get("message", ""),
+        create_info.get("status", ""),
+        create_info.get("message", ""),
+        create_info.get("v23_workbook", ""),
+        create_info.get("v22_backup", ""),
+    )
+)
+```
+
+
+
+замени на:
+
+```python
+ws.append(
+    (
+        entry.get("project", ""),
+        entry.get("folder", ""),
+        entry.get("v22_workbook", ""),
+        scan.get("status", ""),
+        scan.get("message", ""),
+        save_info.get("status", ""),
+        save_info.get("message", ""),
+
+        study_results.get("OP", ""),
+        study_results.get("OPOH", ""),
+        study_results.get("AP", ""),
+        study_results.get("BP", ""),
+        study_results.get("GC", ""),
+        study_results.get("EMV", ""),
+        study_results.get("GOR", ""),
+        study_results.get("SSF", ""),
+        study_results.get("CCE", ""),
+        study_results.get("CVD", ""),
+        study_results.get("REC", ""),
+        study_results.get("JOIN", ""),
+
+        create_info.get("status", ""),
+        create_info.get("message", ""),
+        create_info.get("v23_workbook", ""),
+        create_info.get("v22_backup", ""),
+    )
+)
+```
+
+Тогда отчёт будет очень удобный:
+
+| Project | SaveV22Status | OP         | OPOH    | AP         | BP         | GC         | ... |
+| ------- | ------------- | ---------- | ------- | ---------- | ---------- | ---------- | --- |
+| 26-F001 | OK            | CHANGED    | FAILED  | NO_CHANGES | CHANGED    | NO_CHANGES | ... |
+| 26-F002 | PARTIAL       | CHANGED    | FAILED  | FAILED     | NO_CHANGES | ...        | ... |
+| 26-F003 | OK            | NO_CHANGES | CHANGED | NO_CHANGES | ...        | ...        | ... |
+
+### `create-v23` менять пока не надо
+
+Там уже стоит правильный предохранитель:
+
+```python
+if entry.get("save_v22", {}).get("status") != "OK":
+    continue
+```
+
+
+
+То есть:
 
 ```text
-1
+OK      → можно создавать v23
+PARTIAL → нельзя
+FAILED  → нельзя
 ```
 
-а:
+А твой:
 
 ```text
 OP=CHANGED
 OPOH=FAILED
-AP=NO_CHANGES
-BP=NO_CHANGES
-GC=CHANGED
-...
 ```
 
-И вот **это уже нормально для мигратора**.
+по нашему специальному правилу будет **`OK`**, но в отчёте при этом всё равно останется видно, что OPOH упал.
 
-Причём я бы не делал правило `любой FAILED => книга целиком FAILED`. Python должен сохранить результаты по каждому исследованию, а потом отдельно определить, можно ли переходить к созданию v23.
-
-Например:
-
-```text
-OP=CHANGED
-OPOH=FAILED
-остальные=NO_CHANGES
-```
-
-для твоего случая вполне может считаться **успешно сохранённым проектом**, если фактически рабочая ветка проекта — OP.
-
-А вот:
-
-```text
-OP=FAILED
-OPOH=NO_CHANGES
-AP=CHANGED
-```
-
-уже подозрительно, потому что основное начальное исследование OP не сохранилось.
-
-Сначала я бы именно этот детальный возврат сделал в VBA. Потом мы под него совсем небольшим изменением поправим Python, чтобы он сохранял в scan/report **`CHANGED / NO_CHANGES / FAILED` для каждого из 12 исследований**, и тогда вообще не придётся гадать, что реально прошло.
+И ещё важный плюс: при `PARTIAL` v22-книга **всё равно сохраняется на диск**, чтобы не потерять `resultId`, которые успешно отработавшие исследования уже получили. Это здесь обязательно.
