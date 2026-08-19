@@ -1,601 +1,334 @@
-Да. Сейчас надо внести **4 изменения в Python**. После этого он будет разбирать VBA-ответ по исследованиям, сохранять его в `state.json`, показывать отдельными колонками в Excel-отчёте и не будет считать весь проект проваленным только из-за `OPOH=FAILED`, если `OP=CHANGED` — и наоборот.
-
-Сейчас `save_one_v22_workbook()` получает VBA-return в `result`, но проверяет его старой `legacy_macro_failed()`, которая строку вида `OP=CHANGED...` не понимает. 
-
-## 1. После `STUDY_STATE_PROPERTIES` добавь константы
-
-У тебя уже есть этот словарь со всеми 12 исследованиями. 
-
-Сразу после него добавь:
+Да. Тут нашлась конкретная проблема в самом Python-скрипте. **Текущая функция вообще не гарантирует, что надстройка подключена через `L:\`.** Она только ищет AddIn **по имени файла**, а потом переустанавливает именно найденную запись:
 
 ```python
-LEGACY_SAVE_STUDIES = tuple(STUDY_STATE_PROPERTIES.keys())
+if str(addin.Name).casefold() != expected_name:
+    continue
 
-LEGACY_SAVE_RESULT_VALUES = {
-    "NO_RESULT",
-    "FAILED",
-    "NO_CHANGES",
-    "CHANGED",
-}
+...
+
+if addin.Installed:
+    addin.Installed = False
+
+addin.Installed = True
 ```
 
-Получится порядок:
+
+
+То есть если Excel в `Application.AddIns` хранит:
 
 ```text
-OP
-OPOH
-AP
-BP
-GC
-EMV
-GOR
-SSF
-CCE
-CVD
-REC
-JOIN
+Name     = надстройка новая ribbon.xlam
+FullName = \\server\...\надстройка новая ribbon.xlam
 ```
 
----
-
-## 2. Рядом с `legacy_macro_failed()` добавь две новые функции
-
-Старую `legacy_macro_failed()` можешь пока вообще оставить — просто больше не будем её использовать.
-
-Добавь:
+наш код радостно говорит: «имя совпало» и **снова загружает UNC-вариант**. Хотя в настройках у нас явно записано:
 
 ```python
-def parse_legacy_save_report(result: Any) -> dict[str, str]:
+INSTALLED_ADDIN_PATH = Path(
+    r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam"
+)
+```
+
+
+
+Поэтому надо исправить именно `load_installed_addin_by_registered_name()`.
+
+Microsoft как раз предусматривает `Application.AddIns.Add(Filename=...)`: ему можно передать конкретный путь к `.xlam`, после чего `Installed=True` загружает эту надстройку. ([Microsoft Learn][1])
+
+### Замени функцию целиком на эту
+
+```python
+def _normalize_literal_excel_path(value: Any) -> str:
     """
-    Разбирает VBA-ответ вида:
+    Нормализация ТЕКСТОВОГО пути без resolve().
 
-        OP=CHANGED
-        OPOH=FAILED
-        AP=NO_CHANGES
-        ...
+    ВАЖНО:
+    L:\\... и \\\\server\\... намеренно считаются разными путями.
+    """
+    text = str(value).strip().replace("/", "\\")
 
-    Возвращает:
-        {
-            "OP": "CHANGED",
-            "OPOH": "FAILED",
-            ...
-        }
+    while text.endswith("\\"):
+        text = text[:-1]
+
+    return text.casefold()
+
+
+def _get_loaded_addin_workbook_fullname(
+    app: xw.App,
+    addin_name: str,
+) -> str:
+    """
+    Возвращает FullName реально загруженной xlam-книги.
+    """
+    try:
+        wb = app.api.Workbooks.Item(addin_name)
+        return str(wb.FullName)
+    except Exception:
+        return ""
+
+
+def load_installed_addin_by_registered_name(
+    app: xw.App,
+    configured_path: Path,
+) -> Any:
+    """
+    Загружает AddIn строго через configured_path.
+
+    Для нашей legacy/v23 надстройки это должен быть именно mapped path:
+        L:\\...
+
+    UNC-вариант той же надстройки не принимается.
     """
 
-    text = normalize_text(result)
+    expected_path = str(configured_path)
+    expected_path_norm = _normalize_literal_excel_path(expected_path)
+    expected_name = configured_path.name.casefold()
 
-    if not text:
-        raise RuntimeError(
-            "Silent_Save_All_wrap не вернул отчёт по исследованиям."
+    if not configured_path.exists():
+        raise FileNotFoundError(
+            f"Файл надстройки не найден: {configured_path}"
         )
 
-    if text.upper().startswith("FATAL="):
-        raise RuntimeError(
-            f"VBA завершил покомпонентное сохранение с FATAL: {text}"
-        )
+    progress(f"Требуемый AddIn path: {expected_path}")
 
-    study_results: dict[str, str] = {}
+    same_name_addins: list[Any] = []
+    exact_addin = None
 
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
+    # ---------------------------------------------------------
+    # 1. Смотрим, что Excel уже знает об этой надстройке
+    # ---------------------------------------------------------
 
-        if not line:
+    for index in range(1, app.api.AddIns.Count + 1):
+
+        addin = app.api.AddIns.Item(index)
+
+        if str(addin.Name).casefold() != expected_name:
             continue
 
-        if "=" not in line:
-            raise RuntimeError(
-                f"Неизвестная строка в VBA-отчёте: {line!r}"
+        same_name_addins.append(addin)
+
+        actual_fullname = str(addin.FullName)
+
+        progress(
+            f"Найден AddIn: "
+            f"Name={addin.Name}; "
+            f"FullName={actual_fullname}; "
+            f"Installed={addin.Installed}"
+        )
+
+        if (
+            _normalize_literal_excel_path(actual_fullname)
+            == expected_path_norm
+        ):
+            exact_addin = addin
+
+
+    # ---------------------------------------------------------
+    # 2. Если уже зарегистрирован именно L:\\... — используем его
+    # ---------------------------------------------------------
+
+    if exact_addin is not None:
+
+        progress(
+            "Найдена зарегистрированная надстройка "
+            "с правильным mapped path."
+        )
+
+        if exact_addin.Installed:
+            exact_addin.Installed = False
+
+        exact_addin.Installed = True
+
+        target_addin = exact_addin
+
+
+    # ---------------------------------------------------------
+    # 3. Если Excel знает только UNC-вариант — отключаем его
+    #    и добавляем надстройку заново именно через L:\\...
+    # ---------------------------------------------------------
+
+    else:
+
+        if same_name_addins:
+
+            progress(
+                "Надстройка с таким именем найдена, "
+                "но её FullName не совпадает с L:\\ path."
             )
 
-        study, save_result = line.split("=", 1)
+            for addin in same_name_addins:
 
-        study = study.strip().upper()
-        save_result = save_result.strip().upper()
+                progress(
+                    f"Отключаю неправильную регистрацию: "
+                    f"{addin.FullName}"
+                )
 
-        if study not in LEGACY_SAVE_STUDIES:
-            raise RuntimeError(
-                f"VBA вернул неизвестное исследование: {study!r}"
-            )
+                try:
+                    if addin.Installed:
+                        addin.Installed = False
+                except Exception:
+                    logger.exception(
+                        "Не удалось отключить AddIn: %s",
+                        addin.FullName,
+                    )
 
-        if save_result not in LEGACY_SAVE_RESULT_VALUES:
-            raise RuntimeError(
-                f"VBA вернул неизвестный результат для {study}: "
-                f"{save_result!r}"
-            )
+        progress(
+            "Регистрирую AddIn заново строго через mapped path: "
+            f"{expected_path}"
+        )
 
-        if study in study_results:
-            raise RuntimeError(
-                f"VBA дважды вернул результат для исследования {study}."
-            )
+        # ВАЖНО:
+        # НЕ Workbooks.Open().
+        #
+        # AddIns.Add добавляет именно Excel AddIn.
+        target_addin = app.api.AddIns.Add(
+            expected_path,
+            False,
+        )
 
-        study_results[study] = save_result
+        target_addin.Installed = True
 
-    missing = [
-        study
-        for study in LEGACY_SAVE_STUDIES
-        if study not in study_results
-    ]
 
-    if missing:
+    # ---------------------------------------------------------
+    # 4. ЖЁСТКАЯ ПРОВЕРКА регистрации
+    # ---------------------------------------------------------
+
+    registered_fullname = str(target_addin.FullName)
+
+    progress(
+        f"AddIn FullName после подключения: "
+        f"{registered_fullname}"
+    )
+
+    if (
+        _normalize_literal_excel_path(registered_fullname)
+        != expected_path_norm
+    ):
         raise RuntimeError(
-            "VBA не вернул результаты для исследований: "
-            + ", ".join(missing)
+            "Excel зарегистрировал надстройку не через требуемый "
+            "mapped path.\n"
+            f"Ожидалось: {expected_path}\n"
+            f"Получено:  {registered_fullname}"
         )
 
-    return study_results
-```
 
-И сразу после неё:
+    # ---------------------------------------------------------
+    # 5. Проверяем путь РЕАЛЬНО загруженной xlam-книги
+    # ---------------------------------------------------------
 
-```python
-def classify_legacy_save_report(
-    study_results: dict[str, str],
-) -> tuple[str, str]:
-    """
-    Определяет общий статус save-v22.
+    loaded_fullname = _get_loaded_addin_workbook_fullname(
+        app,
+        str(target_addin.Name),
+    )
 
-    Особое правило OP/OPOH:
-    проект начинается либо с OP, либо с OPOH.
+    progress(
+        "Реально загруженная xlam: "
+        + (loaded_fullname or "<не удалось определить>")
+    )
 
-    Если OP реально сохранился (CHANGED), ошибку OPOH игнорируем.
-    Если OPOH реально сохранился (CHANGED), ошибку OP игнорируем.
-
-    Ошибка любого другого исследования блокирует create-v23.
-    """
-
-    ignored_failures: list[str] = []
-
-    op_result = study_results["OP"]
-    opoh_result = study_results["OPOH"]
-
-    # OP-проект: OPOH нас не интересует.
-    if op_result == "CHANGED" and opoh_result in {
-        "FAILED",
-        "NO_RESULT",
-    }:
-        ignored_failures.append("OPOH")
-
-    # OPOH-проект: OP нас не интересует.
-    if opoh_result == "CHANGED" and op_result in {
-        "FAILED",
-        "NO_RESULT",
-    }:
-        ignored_failures.append("OP")
-
-    blocking_failures = [
-        study
-        for study, result in study_results.items()
-        if result in {"FAILED", "NO_RESULT"}
-        and study not in ignored_failures
-    ]
-
-    changed = [
-        study
-        for study, result in study_results.items()
-        if result == "CHANGED"
-    ]
-
-    no_changes = [
-        study
-        for study, result in study_results.items()
-        if result == "NO_CHANGES"
-    ]
-
-    message_parts = []
-
-    if changed:
-        message_parts.append(
-            "Сохранено: " + ", ".join(changed)
+    if not loaded_fullname:
+        raise RuntimeError(
+            "Надстройка имеет Installed=True, "
+            "но её книга не найдена среди загруженных Workbooks."
         )
 
-    if no_changes:
-        message_parts.append(
-            "Без изменений: " + ", ".join(no_changes)
+    if (
+        _normalize_literal_excel_path(loaded_fullname)
+        != expected_path_norm
+    ):
+        raise RuntimeError(
+            "Фактически загруженная xlam открыта не через L:\\ path.\n"
+            f"Ожидалось: {expected_path}\n"
+            f"Загружено: {loaded_fullname}"
         )
 
-    if ignored_failures:
-        message_parts.append(
-            "Игнорируются ошибки неактивной OP/OPOH-ветки: "
-            + ", ".join(
-                f"{study}={study_results[study]}"
-                for study in ignored_failures
-            )
-        )
-
-    if blocking_failures:
-        message_parts.append(
-            "Не удалось обработать: "
-            + ", ".join(
-                f"{study}={study_results[study]}"
-                for study in blocking_failures
-            )
-        )
-
-        return "PARTIAL", "; ".join(message_parts)
-
-    return "OK", "; ".join(message_parts)
-```
-
-### Почему именно так
-
-Твой пример:
-
-```text
-OP=CHANGED
-OPOH=FAILED
-AP=NO_CHANGES
-...
-```
-
-станет:
-
-```text
-status = OK
-```
-
-и сообщение:
-
-```text
-Сохранено: OP;
-Без изменений: AP, BP, ...;
-Игнорируются ошибки неактивной OP/OPOH-ветки: OPOH=FAILED
-```
-
-А например:
-
-```text
-OP=CHANGED
-OPOH=FAILED
-AP=FAILED
-BP=NO_CHANGES
-```
-
-даст:
-
-```text
-PARTIAL
-```
-
-потому что `OPOH=FAILED` игнорируем, **но `AP=FAILED` уже реально требует разбирательства**.
-
-При этом я специально **не игнорирую** пока такой случай:
-
-```text
-OP=NO_CHANGES
-OPOH=FAILED
-```
-
-Потому что из одного этого результата нельзя точно понять: это уже сохранённый OP-проект или OPOH-проект, у которого как раз не удалось сохранить нужные данные. Лучше такой редкий случай увидеть в отчёте, чем потерять данные.
-
----
-
-## 3. Замени кусок в `save_one_v22_workbook()`
-
-Сейчас у тебя после watchdog стоит:
-
-```python
-if legacy_macro_failed(result):
-    return (
-        "FAILED",
-        f"{LEGACY_SAVE_ALL_MACRO} вернул признак ошибки: {result!r}",
+    progress(
+        "OK: надстройка реально загружена через mapped path "
+        f"{expected_path}"
     )
 
-# Save_* могут записать resultId обратно в формы, поэтому сохраняем
-# саму v22-книгу после успешного Save_All.
-disable_excel_prompts(app)
-workbook.save()
-
-return (
-    "OK",
-    f"{LEGACY_SAVE_ALL_MACRO} завершён; return={result!r}",
-)
+    return target_addin
 ```
 
-
-
-**Весь этот кусок удалить** и поставить:
+Здесь есть **принципиально важная вещь**:
 
 ```python
-study_results = parse_legacy_save_report(result)
-
-status, message = classify_legacy_save_report(
-    study_results
-)
-
-# Очень важно сохранять книгу даже при PARTIAL.
-#
-# До проблемного исследования предыдущие Save_* могли уже успешно
-# сохранить данные в БД и записать новые resultId обратно в форму.
-# Эти resultId обязательно надо сохранить в самом v22-файле.
-disable_excel_prompts(app)
-workbook.save()
-
-return status, message, study_results
+Path.resolve()
 ```
 
-Но из-за этого функция теперь должна возвращать три значения.
+**нигде не используем.**
 
-Сигнатуру:
+Нам не нужно выяснять, что `L:` и `\\server\share` физически ведут в одно место. Для Excel они в твоём случае должны оставаться **разными текстовыми путями**, потому что именно смешивание mapped/UNC ломает ссылки.
 
-```python
-def save_one_v22_workbook(
-    *,
-    app: xw.App,
-    addin_name: str,
-    workbook_path: Path,
-) -> tuple[str, str]:
-```
+### Что теперь произойдёт перед `save-v22`
 
-замени на:
-
-```python
-def save_one_v22_workbook(
-    *,
-    app: xw.App,
-    addin_name: str,
-    workbook_path: Path,
-) -> tuple[str, str, dict[str, str]]:
-```
-
-И остальные `return` внутри неё тоже поменяй.
-
-Где watchdog:
-
-```python
-return (
-    "MANUAL_REVIEW",
-    "Во время Save_All появилось интерактивное окно Excel/VBA: "
-    + "; ".join(watchdog.detected),
-    {},
-)
-```
-
-А `except`:
-
-```python
-except Exception as exc:
-    logger.exception(
-        "Ошибка save-v22 для %s",
-        workbook_path,
-    )
-    return (
-        "FAILED",
-        f"{type(exc).__name__}: {exc}",
-        {},
-    )
-```
-
----
-
-## 4. В `run_save_v22()` принимай третий результат
-
-Сейчас:
-
-```python
-status, message = save_one_v22_workbook(
-    app=app,
-    addin_name=addin_name,
-    workbook_path=workbook_path,
-)
-```
-
-
-
-Замени на:
-
-```python
-status, message, study_results = save_one_v22_workbook(
-    app=app,
-    addin_name=addin_name,
-    workbook_path=workbook_path,
-)
-```
-
-И сейчас состояние записывается так:
-
-```python
-entry["save_v22"] = {
-    "at": now_text(),
-    "status": status,
-    "message": message,
-}
-```
-
-Замени на:
-
-```python
-entry["save_v22"] = {
-    "at": now_text(),
-    "status": status,
-    "message": message,
-    "studies": study_results,
-}
-```
-
-Получишь в JSON:
-
-```json
-"save_v22": {
-    "at": "2026...",
-    "status": "OK",
-    "message": "Сохранено: OP; ...",
-    "studies": {
-        "OP": "CHANGED",
-        "OPOH": "FAILED",
-        "AP": "NO_CHANGES",
-        "BP": "NO_CHANGES",
-        "GC": "CHANGED",
-        "EMV": "NO_CHANGES",
-        "GOR": "NO_CHANGES",
-        "SSF": "NO_CHANGES",
-        "CCE": "NO_CHANGES",
-        "CVD": "NO_CHANGES",
-        "REC": "NO_CHANGES",
-        "JOIN": "NO_CHANGES"
-    }
-}
-```
-
----
-
-## 5. Добавь отдельные колонки в Excel-отчёт
-
-Сейчас `write_status_report()` создаёт:
-
-```python
-columns = (
-    "Project",
-    "Folder",
-    "V22Workbook",
-    "ScanStatus",
-    "ScanMessage",
-    "SaveV22Status",
-    "SaveV22Message",
-    "CreateV23Status",
-    "CreateV23Message",
-    "V23Workbook",
-    "V22Backup",
-)
-```
-
-
-
-Замени на:
-
-```python
-columns = (
-    "Project",
-    "Folder",
-    "V22Workbook",
-    "ScanStatus",
-    "ScanMessage",
-    "SaveV22Status",
-    "SaveV22Message",
-
-    "Save_OP",
-    "Save_OPOH",
-    "Save_AP",
-    "Save_BP",
-    "Save_GC",
-    "Save_EMV",
-    "Save_GOR",
-    "Save_SSF",
-    "Save_CCE",
-    "Save_CVD",
-    "Save_REC",
-    "Save_JOIN",
-
-    "CreateV23Status",
-    "CreateV23Message",
-    "V23Workbook",
-    "V22Backup",
-)
-```
-
-Дальше перед `ws.append(...)` у тебя есть:
-
-```python
-scan = entry.get("scan", {})
-save_info = entry.get("save_v22", {})
-create_info = entry.get("create_v23", {})
-```
-
-Добавь:
-
-```python
-study_results = save_info.get("studies", {})
-```
-
-И текущий:
-
-```python
-ws.append(
-    (
-        entry.get("project", ""),
-        entry.get("folder", ""),
-        entry.get("v22_workbook", ""),
-        scan.get("status", ""),
-        scan.get("message", ""),
-        save_info.get("status", ""),
-        save_info.get("message", ""),
-        create_info.get("status", ""),
-        create_info.get("message", ""),
-        create_info.get("v23_workbook", ""),
-        create_info.get("v22_backup", ""),
-    )
-)
-```
-
-
-
-замени на:
-
-```python
-ws.append(
-    (
-        entry.get("project", ""),
-        entry.get("folder", ""),
-        entry.get("v22_workbook", ""),
-        scan.get("status", ""),
-        scan.get("message", ""),
-        save_info.get("status", ""),
-        save_info.get("message", ""),
-
-        study_results.get("OP", ""),
-        study_results.get("OPOH", ""),
-        study_results.get("AP", ""),
-        study_results.get("BP", ""),
-        study_results.get("GC", ""),
-        study_results.get("EMV", ""),
-        study_results.get("GOR", ""),
-        study_results.get("SSF", ""),
-        study_results.get("CCE", ""),
-        study_results.get("CVD", ""),
-        study_results.get("REC", ""),
-        study_results.get("JOIN", ""),
-
-        create_info.get("status", ""),
-        create_info.get("message", ""),
-        create_info.get("v23_workbook", ""),
-        create_info.get("v22_backup", ""),
-    )
-)
-```
-
-Тогда отчёт будет очень удобный:
-
-| Project | SaveV22Status | OP         | OPOH    | AP         | BP         | GC         | ... |
-| ------- | ------------- | ---------- | ------- | ---------- | ---------- | ---------- | --- |
-| 26-F001 | OK            | CHANGED    | FAILED  | NO_CHANGES | CHANGED    | NO_CHANGES | ... |
-| 26-F002 | PARTIAL       | CHANGED    | FAILED  | FAILED     | NO_CHANGES | ...        | ... |
-| 26-F003 | OK            | NO_CHANGES | CHANGED | NO_CHANGES | ...        | ...        | ... |
-
-### `create-v23` менять пока не надо
-
-Там уже стоит правильный предохранитель:
-
-```python
-if entry.get("save_v22", {}).get("status") != "OK":
-    continue
-```
-
-
-
-То есть:
+Скрипт сначала увидит, например:
 
 ```text
-OK      → можно создавать v23
-PARTIAL → нельзя
-FAILED  → нельзя
+Требуемый AddIn path:
+L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam
+
+Найден AddIn:
+FullName=\\server\...\надстройка новая ribbon.xlam
+Installed=True
 ```
 
-А твой:
+Он **не примет его**.
+
+Отключит:
 
 ```text
-OP=CHANGED
-OPOH=FAILED
+\\server\...\надстройка новая ribbon.xlam
 ```
 
-по нашему специальному правилу будет **`OK`**, но в отчёте при этом всё равно останется видно, что OPOH упал.
+и выполнит фактически:
 
-И ещё важный плюс: при `PARTIAL` v22-книга **всё равно сохраняется на диск**, чтобы не потерять `resultId`, которые успешно отработавшие исследования уже получили. Это здесь обязательно.
+```python
+app.api.AddIns.Add(
+    r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam",
+    False,
+)
+```
+
+после чего:
+
+```python
+target_addin.Installed = True
+```
+
+`AddIns.Add` именно добавляет файл надстройки в список Excel Add-ins, а `Installed=True` устанавливает/загружает его; это не `Workbooks.Open`. ([Microsoft Learn][1])
+
+И затем мы делаем **две проверки**:
+
+```text
+AddIn.FullName
+```
+
+и, что даже важнее:
+
+```text
+Workbooks.Item(addin.Name).FullName
+```
+
+Microsoft отдельно указывает, что загруженную книгу AddIn можно получить через `Workbooks(addin.Name)`. ([Microsoft Learn][2])
+
+Обе должны показать:
+
+```text
+L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam
+```
+
+Если хоть одна покажет:
+
+```text
+\\...
+```
+
+скрипт **немедленно упадёт до первого проекта**, а не станет портить 300 книг.
+
+И это нужно оставить не только для `save-v22`, но и для `create-v23`: там после подмены старого файла новым мы тоже вызываем эту же функцию, так что новая v23 будет гарантированно подниматься именно как `L:\...`, а не UNC. В текущем `run_save_v22()` загрузка AddIn действительно происходит один раз перед циклом проектов. 
+
+Так что да — **проблема была в нашей функции загрузки AddIn: комментарий обещал защиту от mapped/UNC, а код на самом деле проверял только имя файла.** 
+
+[1]: https://learn.microsoft.com/en-us/office/vba/api/excel.addins.add?utm_source=chatgpt.com "AddIns.Add method (Excel) | Microsoft Learn"
+[2]: https://learn.microsoft.com/en-us/office/vba/api/excel.addin?utm_source=chatgpt.com "AddIn object (Excel) | Microsoft Learn"
