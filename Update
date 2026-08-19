@@ -1,102 +1,30 @@
-Да. Тут нашлась конкретная проблема в самом Python-скрипте. **Текущая функция вообще не гарантирует, что надстройка подключена через `L:\`.** Она только ищет AddIn **по имени файла**, а потом переустанавливает именно найденную запись:
+Да, теперь понятно, что мы сами полезли не туда. **Последний вариант с `AddIns.Add(...)` надо убрать целиком.** Он начал вмешиваться в регистрацию надстройки Excel, и в результате Excel подхватил локальную запись на `C:`. `AddIns.Add` вообще добавляет новую запись в список надстроек; это нам здесь не нужно. ([Microsoft Learn][1])
 
-```python
-if str(addin.Name).casefold() != expected_name:
-    continue
+Наша исходная задача гораздо проще: **не регистрировать, не открывать и не перезагружать надстройку вообще. Взять только ту, которую Excel уже сам подключил, причём только если её реальный `FullName` именно `L:\...`.**
 
-...
-
-if addin.Installed:
-    addin.Installed = False
-
-addin.Installed = True
-```
-
-
-
-То есть если Excel в `Application.AddIns` хранит:
-
-```text
-Name     = надстройка новая ribbon.xlam
-FullName = \\server\...\надстройка новая ribbon.xlam
-```
-
-наш код радостно говорит: «имя совпало» и **снова загружает UNC-вариант**. Хотя в настройках у нас явно записано:
-
-```python
-INSTALLED_ADDIN_PATH = Path(
-    r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam"
-)
-```
-
-
-
-Поэтому надо исправить именно `load_installed_addin_by_registered_name()`.
-
-Microsoft как раз предусматривает `Application.AddIns.Add(Filename=...)`: ему можно передать конкретный путь к `.xlam`, после чего `Installed=True` загружает эту надстройку. ([Microsoft Learn][1])
-
-### Замени функцию целиком на эту
+Замени `load_installed_addin_by_registered_name()` на это:
 
 ```python
 def _normalize_literal_excel_path(value: Any) -> str:
-    """
-    Нормализация ТЕКСТОВОГО пути без resolve().
-
-    ВАЖНО:
-    L:\\... и \\\\server\\... намеренно считаются разными путями.
-    """
-    text = str(value).strip().replace("/", "\\")
-
-    while text.endswith("\\"):
-        text = text[:-1]
-
-    return text.casefold()
-
-
-def _get_loaded_addin_workbook_fullname(
-    app: xw.App,
-    addin_name: str,
-) -> str:
-    """
-    Возвращает FullName реально загруженной xlam-книги.
-    """
-    try:
-        wb = app.api.Workbooks.Item(addin_name)
-        return str(wb.FullName)
-    except Exception:
-        return ""
+    return (
+        str(value)
+        .strip()
+        .replace("/", "\\")
+        .rstrip("\\")
+        .casefold()
+    )
 
 
 def load_installed_addin_by_registered_name(
     app: xw.App,
     configured_path: Path,
 ) -> Any:
-    """
-    Загружает AddIn строго через configured_path.
-
-    Для нашей legacy/v23 надстройки это должен быть именно mapped path:
-        L:\\...
-
-    UNC-вариант той же надстройки не принимается.
-    """
 
     expected_path = str(configured_path)
-    expected_path_norm = _normalize_literal_excel_path(expected_path)
+    expected_norm = _normalize_literal_excel_path(expected_path)
     expected_name = configured_path.name.casefold()
 
-    if not configured_path.exists():
-        raise FileNotFoundError(
-            f"Файл надстройки не найден: {configured_path}"
-        )
-
-    progress(f"Требуемый AddIn path: {expected_path}")
-
-    same_name_addins: list[Any] = []
-    exact_addin = None
-
-    # ---------------------------------------------------------
-    # 1. Смотрим, что Excel уже знает об этой надстройке
-    # ---------------------------------------------------------
+    found: list[str] = []
 
     for index in range(1, app.api.AddIns.Count + 1):
 
@@ -105,230 +33,130 @@ def load_installed_addin_by_registered_name(
         if str(addin.Name).casefold() != expected_name:
             continue
 
-        same_name_addins.append(addin)
+        actual_path = str(addin.FullName)
 
-        actual_fullname = str(addin.FullName)
+        found.append(
+            f"{actual_path} | Installed={addin.Installed}"
+        )
 
         progress(
-            f"Найден AddIn: "
+            f"AddIn candidate: "
             f"Name={addin.Name}; "
-            f"FullName={actual_fullname}; "
+            f"FullName={actual_path}; "
             f"Installed={addin.Installed}"
         )
 
-        if (
-            _normalize_literal_excel_path(actual_fullname)
-            == expected_path_norm
-        ):
-            exact_addin = addin
+        # Нас интересует ТОЛЬКО буквально L:\...
+        if _normalize_literal_excel_path(actual_path) != expected_norm:
+            continue
 
+        # Если Excel уже загрузил правильную надстройку —
+        # ВООБЩЕ ЕЁ НЕ ТРОГАЕМ.
+        if not addin.Installed:
+            addin.Installed = True
 
-    # ---------------------------------------------------------
-    # 2. Если уже зарегистрирован именно L:\\... — используем его
-    # ---------------------------------------------------------
-
-    if exact_addin is not None:
+        # Проверяем реально загруженную xlam.
+        try:
+            loaded_book = app.api.Workbooks.Item(str(addin.Name))
+            loaded_path = str(loaded_book.FullName)
+        except Exception as exc:
+            raise RuntimeError(
+                "Надстройка зарегистрирована через правильный L:\\ путь, "
+                "но её книга фактически не загружена."
+            ) from exc
 
         progress(
-            "Найдена зарегистрированная надстройка "
-            "с правильным mapped path."
+            f"Loaded AddIn workbook: {loaded_path}"
         )
 
-        if exact_addin.Installed:
-            exact_addin.Installed = False
-
-        exact_addin.Installed = True
-
-        target_addin = exact_addin
-
-
-    # ---------------------------------------------------------
-    # 3. Если Excel знает только UNC-вариант — отключаем его
-    #    и добавляем надстройку заново именно через L:\\...
-    # ---------------------------------------------------------
-
-    else:
-
-        if same_name_addins:
-
-            progress(
-                "Надстройка с таким именем найдена, "
-                "но её FullName не совпадает с L:\\ path."
+        if _normalize_literal_excel_path(loaded_path) != expected_norm:
+            raise RuntimeError(
+                "Excel фактически загрузил надстройку НЕ через L:\\.\n"
+                f"Ожидалось: {expected_path}\n"
+                f"Получено:  {loaded_path}"
             )
 
-            for addin in same_name_addins:
-
-                progress(
-                    f"Отключаю неправильную регистрацию: "
-                    f"{addin.FullName}"
-                )
-
-                try:
-                    if addin.Installed:
-                        addin.Installed = False
-                except Exception:
-                    logger.exception(
-                        "Не удалось отключить AddIn: %s",
-                        addin.FullName,
-                    )
-
         progress(
-            "Регистрирую AddIn заново строго через mapped path: "
-            f"{expected_path}"
+            f"OK: используем уже подключённую надстройку: {loaded_path}"
         )
 
-        # ВАЖНО:
-        # НЕ Workbooks.Open().
-        #
-        # AddIns.Add добавляет именно Excel AddIn.
-        target_addin = app.api.AddIns.Add(
-            expected_path,
-            False,
-        )
+        return addin
 
-        target_addin.Installed = True
+    details = "\n".join(found) if found else "<не найдено вообще>"
 
-
-    # ---------------------------------------------------------
-    # 4. ЖЁСТКАЯ ПРОВЕРКА регистрации
-    # ---------------------------------------------------------
-
-    registered_fullname = str(target_addin.FullName)
-
-    progress(
-        f"AddIn FullName после подключения: "
-        f"{registered_fullname}"
+    raise RuntimeError(
+        "Excel не имеет подключённой надстройки с требуемым L:\\ путём.\n\n"
+        f"Требуется:\n{expected_path}\n\n"
+        f"Найдены записи с таким именем:\n{details}\n\n"
+        "Скрипт специально остановлен и ничего не будет "
+        "перерегистрировать через UNC или C:\\."
     )
-
-    if (
-        _normalize_literal_excel_path(registered_fullname)
-        != expected_path_norm
-    ):
-        raise RuntimeError(
-            "Excel зарегистрировал надстройку не через требуемый "
-            "mapped path.\n"
-            f"Ожидалось: {expected_path}\n"
-            f"Получено:  {registered_fullname}"
-        )
-
-
-    # ---------------------------------------------------------
-    # 5. Проверяем путь РЕАЛЬНО загруженной xlam-книги
-    # ---------------------------------------------------------
-
-    loaded_fullname = _get_loaded_addin_workbook_fullname(
-        app,
-        str(target_addin.Name),
-    )
-
-    progress(
-        "Реально загруженная xlam: "
-        + (loaded_fullname or "<не удалось определить>")
-    )
-
-    if not loaded_fullname:
-        raise RuntimeError(
-            "Надстройка имеет Installed=True, "
-            "но её книга не найдена среди загруженных Workbooks."
-        )
-
-    if (
-        _normalize_literal_excel_path(loaded_fullname)
-        != expected_path_norm
-    ):
-        raise RuntimeError(
-            "Фактически загруженная xlam открыта не через L:\\ path.\n"
-            f"Ожидалось: {expected_path}\n"
-            f"Загружено: {loaded_fullname}"
-        )
-
-    progress(
-        "OK: надстройка реально загружена через mapped path "
-        f"{expected_path}"
-    )
-
-    return target_addin
 ```
 
-Здесь есть **принципиально важная вещь**:
+### И вот это больше нигде не должно существовать
+
+Удаляй наш последний код:
 
 ```python
-Path.resolve()
+app.api.AddIns.Add(...)
 ```
 
-**нигде не используем.**
+и также **не делаем**:
 
-Нам не нужно выяснять, что `L:` и `\\server\share` физически ведут в одно место. Для Excel они в твоём случае должны оставаться **разными текстовыми путями**, потому что именно смешивание mapped/UNC ломает ссылки.
-
-### Что теперь произойдёт перед `save-v22`
-
-Скрипт сначала увидит, например:
-
-```text
-Требуемый AddIn path:
-L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam
-
-Найден AddIn:
-FullName=\\server\...\надстройка новая ribbon.xlam
-Installed=True
+```python
+addin.Installed = False
+addin.Installed = True
 ```
 
-Он **не примет его**.
+если она уже подключена.
 
-Отключит:
+Это тоже был плохой момент в старом коде: мы находили надстройку, а потом зачем-то сами её выгружали и загружали заново:
+
+```python
+if addin.Installed:
+    addin.Installed = False
+
+addin.Installed = True
+```
+
+
+
+Нам этого вообще не надо. `Installed=False` выгружает add-in, `Installed=True` снова устанавливает/загружает его. ([Microsoft Learn][2]) А именно при этих повторных загрузках Excel и начинает творить свою магию с путями.
+
+Теперь принцип такой:
 
 ```text
+Запустили Excel
+        ↓
+Excel сам загрузил свои подключённые AddIns
+        ↓
+ищем нашу надстройку
+        ↓
+FullName == L:\...\надстройка новая ribbon.xlam ?
+        ↓
+ДА → не трогаем вообще, просто используем
+НЕТ → STOP
+```
+
+**Никаких попыток автоматически «починить» UNC/C больше.** Это слишком опасно для твоих формул.
+
+Но после нашего последнего запуска у Excel теперь, возможно, уже появилась лишняя регистрация на `C:`. Новый код её просто увидит и напишет примерно:
+
+```text
+Найдены:
+C:\Users\...\Microsoft\AddIns\надстройка новая ribbon.xlam
 \\server\...\надстройка новая ribbon.xlam
+
+Требуется:
+L:\LRC\...\надстройка новая ribbon.xlam
 ```
 
-и выполнит фактически:
+и остановится.
 
-```python
-app.api.AddIns.Add(
-    r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam",
-    False,
-)
-```
+Если так произойдёт, **тогда один раз восстановим регистрацию Excel именно на `L:\`**, после чего мигратор вообще больше никогда не будет её менять. Это значительно правильнее, чем продолжать заставлять Python перерегистрировать xlam на каждом запуске.
 
-после чего:
+И да: `Workbooks.Item(addin.Name)` здесь **ничего не открывает** — это только получение ссылки на уже загруженную книгу надстройки. Microsoft именно так рекомендует получать Workbook загруженного AddIn. ([Microsoft Learn][3])
 
-```python
-target_addin.Installed = True
-```
-
-`AddIns.Add` именно добавляет файл надстройки в список Excel Add-ins, а `Installed=True` устанавливает/загружает его; это не `Workbooks.Open`. ([Microsoft Learn][1])
-
-И затем мы делаем **две проверки**:
-
-```text
-AddIn.FullName
-```
-
-и, что даже важнее:
-
-```text
-Workbooks.Item(addin.Name).FullName
-```
-
-Microsoft отдельно указывает, что загруженную книгу AddIn можно получить через `Workbooks(addin.Name)`. ([Microsoft Learn][2])
-
-Обе должны показать:
-
-```text
-L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam
-```
-
-Если хоть одна покажет:
-
-```text
-\\...
-```
-
-скрипт **немедленно упадёт до первого проекта**, а не станет портить 300 книг.
-
-И это нужно оставить не только для `save-v22`, но и для `create-v23`: там после подмены старого файла новым мы тоже вызываем эту же функцию, так что новая v23 будет гарантированно подниматься именно как `L:\...`, а не UNC. В текущем `run_save_v22()` загрузка AddIn действительно происходит один раз перед циклом проектов. 
-
-Так что да — **проблема была в нашей функции загрузки AddIn: комментарий обещал защиту от mapped/UNC, а код на самом деле проверял только имя файла.** 
-
-[1]: https://learn.microsoft.com/en-us/office/vba/api/excel.addins.add?utm_source=chatgpt.com "AddIns.Add method (Excel) | Microsoft Learn"
-[2]: https://learn.microsoft.com/en-us/office/vba/api/excel.addin?utm_source=chatgpt.com "AddIn object (Excel) | Microsoft Learn"
+[1]: https://learn.microsoft.com/ru-ru/office/vba/api/excel.addins.add?utm_source=chatgpt.com "Метод AddIns.Add (Excel) | Microsoft Learn"
+[2]: https://learn.microsoft.com/en-us/office/vba/api/excel.addin.installed?utm_source=chatgpt.com "AddIn.Installed property (Excel) | Microsoft Learn"
+[3]: https://learn.microsoft.com/en-us/office/vba/api/excel.addin?utm_source=chatgpt.com "AddIn object (Excel) | Microsoft Learn"
