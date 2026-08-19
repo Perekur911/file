@@ -1,93 +1,41 @@
-Ага, теперь по логу видно, что произошло. И важный момент: **он не открыл надстройку через `C:`**.
+Да. Теперь на фото причина **точно видна**.
 
-Вот это:
-
-```text
-C:\Users\DMITRI~1.KAY\AppData\Local\Temp\gen_py\...
-```
-
-из traceback — **не путь к надстройке**. Это временный Python/pywin32 COM-wrapper для Excel Object Model. Сама надстройка у тебя по-прежнему задана через:
-
-```python
-INSTALLED_ADDIN_PATH = Path(
-    r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam"
-)
-```
-
-
-
-И более того, текущий код дошёл до:
-
-```python
-loaded_book = app.api.Workbooks.Item(str(addin.Name))
-```
-
-**только после того, как `addin.FullName` уже совпал с требуемым `L:\...`**. То есть проверку mapped-path он успешно прошёл. 
-
-### Где реально ошибка
-
-Вот эта проверка оказалась лишней:
-
-```python
-loaded_book = app.api.Workbooks.Item(str(addin.Name))
-loaded_path = str(loaded_book.FullName)
-```
-
-И именно она упала:
+У тебя Excel говорит одновременно:
 
 ```text
-pywintypes.com_error
-...
-RuntimeError:
-Надстройка зарегистрирована через правильный L:\ путь,
-но её книга фактически не загружена.
+AddIn FullName = L:\...\надстройка новая ribbon.xlam
+Installed=True
+AddIn IsOpen=False
 ```
 
-
-
-У Excel с AddIn тут есть неприятная особенность: состояние `Application.AddIns` и доступность соответствующей книги через `Workbooks(...)` — не одно и то же. Microsoft отдельно описывает `AddIn.IsOpen` именно как свойство, показывающее, открыт ли add-in. ([Microsoft Learn][1])
-
-А главное: **нам вообще не требуется получать Workbook надстройки**. Нам надо лишь:
+А потом `Application.Run("'надстройка новая ribbon.xlam'!...")` пытается найти её уже здесь:
 
 ```text
-Excel знает AddIn
-↓
-его FullName буквально L:\...
-↓
-он Installed
-↓
-Application.Run("'имя.xlam'!макрос")
+C:\Users\Dmitriy.Kayurin\Documents\Надстройка новая ribbon.xlam
 ```
 
-### Поэтому функцию сейчас упрощаем
+То есть проблема в **`IsOpen=False`**. Мы нашли правильную регистрацию на `L:\`, но фактически надстройку не загрузили. Текущий код именно так и делает: если `Installed=True`, он вообще ничего не предпринимает. 
 
-Удали вообще:
+Надо сделать нормально: **не `AddIns.Add`, не `Workbooks.Open`, а если правильная L:-надстройка зарегистрирована, но `IsOpen=False` — перещёлкнуть именно её `Installed=False → True` и убедиться, что она реально открылась.**
 
-```python
-def _get_loaded_addin_workbook_fullname(...):
-    ...
-```
-
-И `load_installed_addin_by_registered_name()` сделай такой:
+Замени функцию целиком:
 
 ```python
-def _normalize_literal_excel_path(value: Any) -> str:
-    return (
-        str(value)
-        .strip()
-        .replace("/", "\\")
-        .rstrip("\\")
-        .casefold()
-    )
-
-
 def load_installed_addin_by_registered_name(
     app: xw.App,
     configured_path: Path,
 ) -> Any:
 
     expected_path = str(configured_path)
-    expected_norm = _normalize_literal_excel_path(expected_path)
+
+    expected_norm = (
+        expected_path
+        .strip()
+        .replace("/", "\\")
+        .rstrip("\\")
+        .casefold()
+    )
+
     expected_name = configured_path.name.casefold()
 
     found: list[str] = []
@@ -102,39 +50,98 @@ def load_installed_addin_by_registered_name(
         actual_path = str(addin.FullName)
 
         found.append(
-            f"{actual_path} | Installed={addin.Installed}"
+            f"{actual_path} | "
+            f"Installed={addin.Installed} | "
+            f"IsOpen={addin.IsOpen}"
         )
 
         progress(
             f"AddIn candidate: "
             f"Name={addin.Name}; "
             f"FullName={actual_path}; "
-            f"Installed={addin.Installed}"
+            f"Installed={addin.Installed}; "
+            f"IsOpen={addin.IsOpen}"
         )
 
-        # Принимаем ТОЛЬКО буквально зарегистрированный L:\ путь.
-        if _normalize_literal_excel_path(actual_path) != expected_norm:
+        actual_norm = (
+            actual_path
+            .strip()
+            .replace("/", "\\")
+            .rstrip("\\")
+            .casefold()
+        )
+
+        # Это не наша именно L:\ регистрация.
+        if actual_norm != expected_norm:
             continue
 
-        # Если Excel считает AddIn выключенным — включаем.
-        # Если уже включён — вообще не трогаем.
-        if not addin.Installed:
+        # -----------------------------------------------------
+        # Главное:
+        # Installed=True ещё НЕ означает, что xlam реально открыт.
+        #
+        # Если IsOpen=False — перезагружаем ИМЕННО уже
+        # зарегистрированный L:\ AddIn.
+        #
+        # Никаких AddIns.Add и никаких Workbooks.Open.
+        # -----------------------------------------------------
+
+        if not bool(addin.IsOpen):
+
+            progress(
+                "AddIn зарегистрирован через правильный L:\\, "
+                "но IsOpen=False. Перезагружаю через Installed."
+            )
+
+            if bool(addin.Installed):
+                addin.Installed = False
+
+            time.sleep(0.2)
+
             addin.Installed = True
 
-        # IsOpen выводим только для диагностики.
-        # На этом этапе книги проекта ещё даже не открыты,
-        # поэтому не используем это как причину остановки.
-        try:
-            progress(f"AddIn IsOpen: {bool(addin.IsOpen)}")
-        except Exception as exc:
-            progress(
-                f"Не удалось прочитать AddIn.IsOpen: "
-                f"{type(exc).__name__}: {exc}"
+            # Даём Excel время реально загрузить xlam.
+            for _ in range(30):
+
+                if bool(addin.IsOpen):
+                    break
+
+                time.sleep(0.1)
+
+        # -----------------------------------------------------
+        # Контроль после загрузки
+        # -----------------------------------------------------
+
+        if not bool(addin.IsOpen):
+            raise RuntimeError(
+                "Excel знает правильную L:\\ надстройку, "
+                "но после Installed=False -> True она так и "
+                "не перешла в IsOpen=True.\n"
+                f"Файл: {actual_path}"
+            )
+
+        # Проверяем, что Excel не подменил регистрацию.
+        actual_path_after = str(addin.FullName)
+
+        actual_norm_after = (
+            actual_path_after
+            .strip()
+            .replace("/", "\\")
+            .rstrip("\\")
+            .casefold()
+        )
+
+        if actual_norm_after != expected_norm:
+            raise RuntimeError(
+                "После загрузки Excel изменил путь AddIn.\n"
+                f"Ожидалось: {expected_path}\n"
+                f"Получено:  {actual_path_after}"
             )
 
         progress(
-            "OK: используем зарегистрированную надстройку "
-            f"строго через {actual_path}"
+            f"OK: AddIn реально открыт через L:\\ "
+            f"FullName={actual_path_after}; "
+            f"Installed={addin.Installed}; "
+            f"IsOpen={addin.IsOpen}"
         )
 
         return addin
@@ -142,56 +149,68 @@ def load_installed_addin_by_registered_name(
     details = "\n".join(found) if found else "<не найдено вообще>"
 
     raise RuntimeError(
-        "Excel не имеет зарегистрированной надстройки "
-        "с требуемым L:\\ путём.\n\n"
+        "Не найдена зарегистрированная надстройка "
+        "именно с требуемым L:\\ путём.\n\n"
         f"Требуется:\n{expected_path}\n\n"
-        f"Найдены записи с таким именем:\n{details}"
+        f"Найдены записи:\n{details}"
     )
 ```
 
-### Почему этого достаточно
+И **удали полностью** вот эту ненужную функцию:
 
-Дальше у тебя уже есть:
+```python
+def _get_loaded_addin_workbook_fullname(...):
+```
+
+и вообще все:
+
+```python
+app.api.Workbooks.Item(addin.Name)
+```
+
+Они здесь не нужны и уже один раз нам всё сломали. В твоём логе ошибка как раз шла из `Workbooks.Item(...)`. 
+
+После исправления перед первым проектом в консоли должно быть именно:
+
+```text
+AddIn candidate:
+FullName=L:\LRC\...\надстройка новая ribbon.xlam
+Installed=True
+IsOpen=False
+
+AddIn зарегистрирован через правильный L:\,
+но IsOpen=False. Перезагружаю через Installed.
+
+OK: AddIn реально открыт через L:\
+FullName=L:\LRC\...\надстройка новая ribbon.xlam
+Installed=True
+IsOpen=True
+```
+
+**Если последняя строка не появилась — скрипт вообще не должен начинать обрабатывать проекты.**
+
+А вот это:
+
+```text
+C:\Users\Dmitriy.Kayurin\Documents\Надстройка новая ribbon.xlam
+```
+
+после `IsOpen=True` уже появляться не должно: сейчас Excel ищет её на `C:` именно потому, что `Application.Run` получает имя незагруженной книги и пытается сам её найти.
+
+И текущий `run_addin_macro` пока оставляем как есть:
 
 ```python
 macro_ref = f"'{addin_name}'!{macro_name}"
-
 result = app.api.Run(macro_ref)
 ```
 
 
 
-Вот **сам `Application.Run` и является нормальной практической проверкой**, что VBA надстройки действительно доступен. Если add-in реально не загрузился, макрос просто не запустится и мы получим ошибку уже в правильном месте.
+Сначала добиваемся железно:
 
-При этом мы больше:
-
-```python
-Workbooks.Item(addin.Name)
+```text
+FullName = L:\
+IsOpen = True
 ```
 
-не вызываем,
-
-```python
-Workbooks.Open(addin.FullName)
-```
-
-не вызываем,
-
-```python
-AddIns.Add(...)
-```
-
-не вызываем,
-
-и если `Installed=True`, даже не делаем:
-
-```python
-Installed=False
-Installed=True
-```
-
-То есть **вообще не заставляем Excel переоткрывать/перерегистрировать надстройку**.
-
-И по текущему traceback уже можно утверждать полезную вещь: запись `AddIns` с правильным `L:\...` у нового Excel-процесса **нашлась**. Иначе код не дошёл бы до строки `Workbooks.Item`. Поэтому сейчас надо просто убрать эту избыточную проверку Workbook, а не снова ковырять регистрацию надстройки.
-
-[1]: https://learn.microsoft.com/en-us/office/vba/api/excel.addin.isopen?utm_source=chatgpt.com "AddIn.IsOpen property (Excel) | Microsoft Learn"
+**до первого `SAVE v22: 1/...`**. Это как раз тот вариант, который нам изначально и нужен был: Excel AddIn через зарегистрированную надстройку, а не открытие `.xlam` отдельной книгой.
