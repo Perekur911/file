@@ -1,85 +1,113 @@
-Да, тогда дело не в `silent` и не в настройке VBE. В нормальной цепочке прямых вызовов внешний `On Error GoTo CleanFail` действительно должен поймать необработанную ошибку из вложенной процедуры: VBA поднимается вверх по стеку вызывающих процедур, пока не найдёт включённый обработчик. ([Microsoft Learn][1])
+В последнем варианте — **нет**, Python получит только общий `MACRO_FAILED / MACRO_CHANGED / MACRO_NO_CHANGES`. Для миграции этого мало. Нам как раз нужен **детальный отчёт по каждому исследованию**.
 
-У тебя слабое место вот здесь:
+Я бы сделал так: `Save_All_OneByOne` не возвращает один `macroResult`, а собирает результат каждого `Save_*` и возвращает строку, которую Python легко разберёт:
 
-```vb
-rawResult = Application.Run( _
-    macroName, _
-    macroParam _
-)
+```text
+OP=CHANGED
+OPOH=FAILED
+AP=NO_CHANGES
+BP=CHANGED
+GC=NO_CHANGES
+...
 ```
 
-`Application.Run` — это вызов макроса через объект `Application` по имени, а не обычный прямой VBA-вызов `Save_All_OneByOne(...)`. ([Microsoft Learn][2]) Для нашего миграционного пути он вообще не нужен и только добавляет лишнюю границу между обработчиками.
+Причём твоя логика здесь правильная:
 
-Я бы **для silent-сохранения полностью выкинул `Application.Run` из цепочки**.
+* `CHANGED` — были данные, что-то реально сохранили;
+* `NO_CHANGES` — сохранять нечего / всё уже сохранено;
+* `FAILED` — конкретно это исследование не удалось обработать.
 
-Сделай обёртку так:
+И потом Python сможет записать в отчёт, например:
+
+```text
+26-F123
+Сохранено: OP, BP
+Без изменений: AP, GC, EMV, ...
+Ошибки: OPOH
+```
+
+А уже миграционную бизнес-логику можем сделать отдельно: **если OP успешно сохранился, а OPOH упал, это не обязательно блокирует проект**, потому что проект у тебя начинается либо с OP, либо с OPOH.
+
+Я бы VBA сделал так.
 
 ```vb
-Public Function Silent_Save_All_wrap() As macroResult
+Public Function Save_All_OneByOne_Report( _
+    Optional ByVal silent As Boolean = False _
+) As String
 
-    On Error GoTo CleanFail
+    Dim resultText As String
 
-    Silent_Save_All_wrap = _
-        Save_All_OneByOne(silent:=True)
+    resultText = resultText & _
+        "OP=" & MacroResultName(TrySaveStudy("OP", silent)) & vbLf
 
-    Exit Function
+    resultText = resultText & _
+        "OPOH=" & MacroResultName(TrySaveStudy("OPOH", silent)) & vbLf
 
-CleanFail:
+    resultText = resultText & _
+        "AP=" & MacroResultName(TrySaveStudy("AP", silent)) & vbLf
 
-    Debug.Print _
-        "Silent_Save_All_wrap: " & _
-        Err.Number & ": " & Err.Description
+    resultText = resultText & _
+        "BP=" & MacroResultName(TrySaveStudy("BP", silent)) & vbLf
 
-    Err.Clear
+    resultText = resultText & _
+        "GC=" & MacroResultName(TrySaveStudy("GC", silent)) & vbLf
 
-    Silent_Save_All_wrap = MACRO_FAILED
+    resultText = resultText & _
+        "EMV=" & MacroResultName(TrySaveStudy("EMV", silent)) & vbLf
+
+    resultText = resultText & _
+        "GOR=" & MacroResultName(TrySaveStudy("GOR", silent)) & vbLf
+
+    resultText = resultText & _
+        "SSF=" & MacroResultName(TrySaveStudy("SSF", silent)) & vbLf
+
+    resultText = resultText & _
+        "CCE=" & MacroResultName(TrySaveStudy("CCE", silent)) & vbLf
+
+    resultText = resultText & _
+        "CVD=" & MacroResultName(TrySaveStudy("CVD", silent)) & vbLf
+
+    resultText = resultText & _
+        "REC=" & MacroResultName(TrySaveStudy("REC", silent)) & vbLf
+
+    resultText = resultText & _
+        "JOIN=" & MacroResultName(TrySaveStudy("JOIN", silent))
+
+    Save_All_OneByOne_Report = resultText
 
 End Function
 ```
 
-И всё.
-
-То есть Python вызывает:
-
-```text
-wrappers.Silent_Save_All_wrap
-```
-
-а дальше:
-
-```text
-Silent_Save_All_wrap
-        ↓ прямой VBA call
-Save_All_OneByOne
-        ↓
-Save_OP
-Save_OPOH
-Save_AP
-...
-```
-
-Без:
-
-```text
-CallMacroCore
-↓
-Application.Run
-↓
-Save_All_OneByOne
-```
-
-Для **обычных кнопок Ribbon** твой универсальный `CallMacroCore` оставляем как есть. Он там нужен для `StartMacro / EndMacro`, динамических имён и прочего.
-
-А миграционному сохранению это всё нахер не требуется.
-
-Но есть ещё один важный уровень. Чтобы падение `Save_OPOH` **не убило весь `Save_All_OneByOne`**, в самом `Save_All_OneByOne` нужен локальный перехват вокруг каждого исследования. То есть лучше не:
+Helper:
 
 ```vb
-currentResult = Save_OPOH(silent:=silent)
+Private Function MacroResultName( _
+    ByVal result As macroResult _
+) As String
+
+    Select Case result
+
+        Case MACRO_NO_RESULT
+            MacroResultName = "NO_RESULT"
+
+        Case MACRO_FAILED
+            MacroResultName = "FAILED"
+
+        Case MACRO_NO_CHANGES
+            MacroResultName = "NO_CHANGES"
+
+        Case MACRO_CHANGED
+            MacroResultName = "CHANGED"
+
+        Case Else
+            MacroResultName = "UNKNOWN"
+
+    End Select
+
+End Function
 ```
 
-а через helper:
+И `TrySaveStudy` остаётся тем, который ловит runtime error **на каждом исследовании отдельно**:
 
 ```vb
 Private Function TrySaveStudy( _
@@ -141,35 +169,120 @@ CleanFail:
         Err.Number & ": " & Err.Description
 
     Err.Clear
-
     TrySaveStudy = MACRO_FAILED
 
 End Function
 ```
 
-А внутри `Save_All_OneByOne`:
+А обёртку с разблокировкой листов тогда меняем на **String**:
 
 ```vb
-currentResult = TrySaveStudy("OP", silent)
-...
-currentResult = TrySaveStudy("OPOH", silent)
-...
-currentResult = TrySaveStudy("AP", silent)
+Public Function Silent_Save_All_wrap() As String
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim curSheet As Worksheet
+    Set curSheet = ActiveSheet
+
+    Dim studies As Variant
+    studies = Array( _
+        "OP", "OPOH", "GC", "BP", "AP", "GOR", _
+        "SSF", "REC", "EMV", "JOIN", "CCE", "CVD" _
+    )
+
+    Dim macroStarted As Boolean
+
+    On Error GoTo CleanFail
+
+    StartMacro wb, studies
+    macroStarted = True
+
+    Silent_Save_All_wrap = _
+        Save_All_OneByOne_Report(silent:=True)
+
+CleanExit:
+
+    On Error Resume Next
+
+    If macroStarted Then
+        EndMacro wb, studies
+    End If
+
+    If Not curSheet Is Nothing Then
+        curSheet.Activate
+    End If
+
+    On Error GoTo 0
+
+    Exit Function
+
+
+CleanFail:
+
+    Dim errNumber As Long
+    Dim errDescription As String
+
+    errNumber = Err.Number
+    errDescription = Err.Description
+
+    On Error Resume Next
+
+    If macroStarted Then
+        EndMacro wb, studies
+    End If
+
+    If Not curSheet Is Nothing Then
+        curSheet.Activate
+    End If
+
+    On Error GoTo 0
+
+    Silent_Save_All_wrap = _
+        "FATAL=" & CStr(errNumber) & "|" & errDescription
+
+End Function
 ```
 
-Вот это уже будет именно то, чего мы хотим:
+Тогда Python получает не просто:
 
 ```text
-OP    → OK
-OPOH  → runtime error → TrySaveStudy ловит → FAILED
-AP    → продолжает выполняться
-BP    → продолжает выполняться
+1
+```
+
+а:
+
+```text
+OP=CHANGED
+OPOH=FAILED
+AP=NO_CHANGES
+BP=NO_CHANGES
+GC=CHANGED
 ...
 ```
 
-И самое главное: **ошибка OPOH вообще не должна доходить ни до `CallMacroCore`, ни до Python, ни до окна Excel**. Она будет поймана непосредственно на один уровень выше `Save_OPOH`.
+И вот **это уже нормально для мигратора**.
 
-Так что я бы сейчас не пытался заставить `CallMacroCore` быть глобальной сеткой для этого режима. Для миграции правильнее ловить ошибку непосредственно вокруг каждого `Save_*`.
+Причём я бы не делал правило `любой FAILED => книга целиком FAILED`. Python должен сохранить результаты по каждому исследованию, а потом отдельно определить, можно ли переходить к созданию v23.
 
-[1]: https://learn.microsoft.com/ru-ru/office/vba/language/reference/user-interface-help/on-error-statement?utm_source=chatgpt.com "Инструкция On Error (VBA) | Microsoft Learn"
-[2]: https://learn.microsoft.com/en-us/office/vba/api/excel.application.run?utm_source=chatgpt.com "Application.Run method (Excel) | Microsoft Learn"
+Например:
+
+```text
+OP=CHANGED
+OPOH=FAILED
+остальные=NO_CHANGES
+```
+
+для твоего случая вполне может считаться **успешно сохранённым проектом**, если фактически рабочая ветка проекта — OP.
+
+А вот:
+
+```text
+OP=FAILED
+OPOH=NO_CHANGES
+AP=CHANGED
+```
+
+уже подозрительно, потому что основное начальное исследование OP не сохранилось.
+
+Сначала я бы именно этот детальный возврат сделал в VBA. Потом мы под него совсем небольшим изменением поправим Python, чтобы он сохранял в scan/report **`CHANGED / NO_CHANGES / FAILED` для каждого из 12 исследований**, и тогда вообще не придётся гадать, что реально прошло.
