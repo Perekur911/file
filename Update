@@ -1,231 +1,131 @@
-Да. Вот теперь видно, **почему этот старый скрипт работает нормально**, и нам надо просто перестать изобретать велосипед и **дословно перенести из него способ подключения надстройки в мигратор**.
+Да. Тогда вывод уже другой: **дело не в `L:\` в `AddIn.FullName` и не в нашей функции загрузки надстройки.** Мы это уже практически доказали.
 
-Ключевой рабочий кусок здесь:
+На фото формула становится именно **внешней ссылкой на книгу XLAM**:
 
-```python
-def load_installed_addin(app: xw.App, addin_path: str):
-    addin_name = Path(addin_path).name.lower()
-
-    for i in range(1, app.api.AddIns.Count + 1):
-        addin = app.api.AddIns.Item(i)
-
-        if addin.Name.lower() == addin_name:
-            progress(f"AddIn Name: {addin.Name}")
-            progress(f"AddIn FullName: {addin.FullName}")
-            progress(f"AddIn Installed до: {addin.Installed}")
-
-            if addin.Installed:
-                addin.Installed = False
-
-            addin.Installed = True
-
-            progress(f"AddIn Installed после: {addin.Installed}")
-
-            return addin
+```text
+'\\tm.novatek.int\tm.dfs$\LRC\...\[надстройка новая ribbon.xlam]'!getEQParameter(...)
 ```
 
+Excel хранит такие ссылки отдельно от самого объекта `AddIn`, и Microsoft прямо пишет, что путь workbook-link зависит от того, **как Excel видит/открывает источник ссылки**, а после сохранения изменённый путь фиксируется в книге. Для сетевых путей mapped-drive и UNC для Excel принципиально различаются. ([Поддержка Microsoft][1])
 
-
-И перед этим новый экземпляр Excel специально запускается так:
+И главное отличие автоматизации от твоего обычного ручного Excel теперь видно в коде:
 
 ```python
 app = xw.App(visible=True, add_book=False)
-
-app.display_alerts = False
-app.api.DisplayAlerts = False
-app.api.AskToUpdateLinks = False
-app.api.AlertBeforeOverwriting = False
-
-app.api.EnableEvents = True
-
-app.screen_updating = False
-
-progress("Подключаю установленную надстройку")
-addin_book = load_installed_addin(app, ADDIN_PATH)
-
-# После загрузки надстройки можно снова отключить события
-disable_excel_prompts(app)
 ```
 
-
-
-Вот это и есть проверенная рабочая последовательность.
-
-### Что мы сделали не так в миграторе
-
-Мы начали добавлять туда всякую лишнюю логику:
-
-```text
-сравнивать FullName
-проверять Workbooks.Item(...)
-проверять IsOpen
-AddIns.Add(...)
-пытаться понять фактически загруженный Workbook
-```
-
-А старый скрипт **ничего этого не делает**.
-
-Он просто говорит Excel:
-
-```text
-вот уже зарегистрированная надстройка
-        ↓
-Installed = False
-        ↓
-Installed = True
-```
-
-причём делает это в **новом Excel instance при EnableEvents=True**.
-
-И всё.
-
-После этого макросы вызываются точно так же по **имени надстройки**:
+То есть мы каждый раз создаём **новый отдельный COM-экземпляр Excel**, а потом искусственно дёргаем:
 
 ```python
-addin_name = Path(ADDIN_PATH).name
+addin.Installed = False
+addin.Installed = True
+```
 
-app.api.Run(
-    f"'{addin_name}'!{AFTER_REFRESH_MACRO}"
+
+
+Это **не то же самое**, что твой уже запущенный обычным способом Excel, в котором надстройка загрузилась штатно при старте. Старый скрипт, который мы считали «рабочим», тоже на самом деле создаёт новый экземпляр через `xw.App(...)`.  Макросы в нём работали — но это ещё не доказывает, что при сохранении книг с UDF Excel не переписывал ссылки.
+
+### Я бы сделал последний нормальный тест
+
+**Вообще не создавать Excel из Python.**
+
+Ты сам запускаешь Excel обычным способом. Надстройка уже загружена так, как она работает у тебя при ручной работе. Скрипт только **цепляется к этому существующему Excel** и использует его.
+
+В `run_save_v22()` вместо:
+
+```python
+app = xw.App(
+    visible=True,
+    add_book=False,
 )
 ```
 
-
-
-То есть схема:
-
-```text
-Application.AddIns
-      ↓
-находим "надстройка новая ribbon.xlam"
-      ↓
-Installed False
-      ↓
-Installed True
-      ↓
-Application.Run("'надстройка новая ribbon.xlam'!...")
-```
-
-И она у тебя уже доказанно работает.
-
-## Поэтому в миграторе делаем ровно то же самое
-
-Выкидываем нахрен:
+делаем:
 
 ```python
-_normalize_literal_excel_path
-_get_loaded_addin_workbook_fullname
-проверки IsOpen
-Workbooks.Item(...)
-AddIns.Add(...)
-```
-
-И функцию `load_installed_addin_by_registered_name()` заменяем целиком на:
-
-```python
-def load_installed_addin_by_registered_name(
-    app: xw.App,
-    configured_path: Path,
-) -> Any:
-
-    addin_name = configured_path.name.lower()
-
-    for i in range(1, app.api.AddIns.Count + 1):
-
-        addin = app.api.AddIns.Item(i)
-
-        if str(addin.Name).lower() != addin_name:
-            continue
-
-        progress(f"AddIn Name: {addin.Name}")
-        progress(f"AddIn FullName: {addin.FullName}")
-        progress(f"AddIn Installed до: {addin.Installed}")
-
-        if addin.Installed:
-            addin.Installed = False
-
-        addin.Installed = True
-
-        progress(f"AddIn Installed после: {addin.Installed}")
-
-        return addin
-
+if len(xw.apps) == 0:
     raise RuntimeError(
-        f"Установленная надстройка "
-        f"'{configured_path.name}' не найдена"
+        "Excel не запущен. "
+        "Сначала открой Excel обычным способом "
+        "и дождись загрузки надстройки."
     )
+
+app = xw.apps.active
 ```
 
-**И всё. Никаких дополнительных проверок.**
-
-Причём `run_save_v22()` у тебя уже почти идеально повторяет старый рабочий скрипт:
+И **удаляем вообще весь вызов**:
 
 ```python
-app = xw.App(visible=True, add_book=False)
-
-app.display_alerts = False
-app.api.DisplayAlerts = False
-app.api.AskToUpdateLinks = False
-app.api.AlertBeforeOverwriting = False
-app.api.EnableEvents = True
-app.screen_updating = False
-
-addin = load_installed_addin_by_registered_name(
-    app,
-    INSTALLED_ADDIN_PATH,
-)
-
-addin_name = str(addin.Name)
-
-disable_excel_prompts(app)
+load_installed_addin_by_registered_name(...)
 ```
 
-То есть после замены функции последовательность будет **та же самая**, что в старом рабочем `create_project_forms.py`.
+Ничего:
 
-И путь в обоих скриптах буквально одинаковый:
-
-```python
-r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\надстройка новая ribbon.xlam"
+```text
+Installed=False
+Installed=True
+AddIns.Add
+Workbooks.Open(xlam)
+IsOpen
 ```
 
-В старом это `ADDIN_PATH`. 
-В миграторе это `INSTALLED_ADDIN_PATH`. 
+не делаем.
 
-### Ещё одно отличие, которое пока не трогаем
-
-Старый рабочий скрипт открывает форму так:
+Просто:
 
 ```python
-workbook = app.books.open(
-    str(project_file),
-    update_links=True,
-    ignore_read_only_recommended=True,
+addin_name = INSTALLED_ADDIN_PATH.name
+```
+
+и дальше открываем проект в **этом уже существующем Excel**:
+
+```python
+workbook = app.books.open(...)
+```
+
+и вызываем:
+
+```python
+app.api.Run(
+    f"'{addin_name}'!wrappers.Silent_Save_All_wrap"
 )
 ```
 
-
-
-А мигратор сейчас открывает v22 с:
+Также в конце `run_save_v22()` **нельзя делать**:
 
 ```python
-update_links=False
+app.quit()
 ```
 
+потому что это уже твой Excel. Просто оставляем его открытым.
 
+### Почему именно это имеет смысл
 
-Это **второе существенное отличие**.
+В ручном режиме у тебя:
 
-Поэтому я бы сейчас сделал максимально консервативно: сначала заменяем загрузку AddIn **точно на старую рабочую реализацию**. Если формулы всё равно начнут превращаться в UNC, тогда следующим тестом меняем только:
-
-```python
-update_links=False
+```text
+Windows запускает Excel
+→ Excel штатно грузит зарегистрированные AddIns
+→ надстройка нормально регистрирует UDF
+→ ты открываешь v22
+→ сохраняешь
 ```
 
-на:
+А сейчас:
 
-```python
-update_links=True
+```text
+Python создаёт отдельный COM Excel
+→ вручную дёргает AddIn
+→ открывает v22
+→ Excel почему-то воспринимает getEQParameter как external workbook UDF
+→ при Save сериализует её как UNC
 ```
 
-чтобы поведение открытия книги стало вообще **1 в 1 со старым рабочим скриптом**.
+Excel действительно дописывает полный путь к внешней книге, когда источник рассматривается как внешний workbook-link; Microsoft отдельно показывает такое поведение формул при закрытом/внешнем источнике. ([Поддержка Microsoft][2])
 
-Но одновременно две вещи сейчас менять не надо — сначала восстановим именно тот способ загрузки надстройки, который у тебя уже годно работает.
+Поэтому **если и этот вариант — работа через уже запущенный тобой Excel — превращает формулу в UNC, я бы автоматический `save-v22` окончательно выкинул**. Тогда это уже поведение самого Excel при программном сохранении/пересчёте этих UDF, и дальше бороться с ним опаснее, чем сохранить старые книги руками.
+
+Но этот тест существенно отличается от всего, что мы делали до сих пор: **Python впервые вообще не будет запускать и не будет трогать надстройку. Он будет использовать ровно тот Excel, в котором ручное сохранение у тебя работает.**
+
+[1]: https://support.microsoft.com/en-US/Excel/description-of-workbook-link-management-and-storage-in-excel?utm_source=chatgpt.com "Description of workbook link management and storage in Excel | Microsoft Support"
+[2]: https://support.microsoft.com/en-US/Excel/create-workbook-links?utm_source=chatgpt.com "Create workbook links | Microsoft Support"
