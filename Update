@@ -180,7 +180,6 @@ class UiOptions:
     mode: str
     year: int
     auto_sample_codes: bool = False
-    projects_text: str = ""
     cancelled: bool = False
 
 
@@ -236,99 +235,6 @@ def project_from_folder_name(folder_name: str) -> str:
     if not match:
         return ""
     return f"{match.group(1)}-F{match.group(2)}".upper()
-
-
-def normalize_project_number(value: str) -> str:
-    text = normalize_text(value).upper()
-    match = re.fullmatch(r"(\d{2})-F(\d+)", text)
-
-    if not match:
-        raise ValueError(f"Некорректный номер проекта: {value}")
-
-    year_part, number_part = match.groups()
-    return f"{year_part}-F{int(number_part):03d}"
-
-
-def expand_project_range(start: str, end: str) -> list[str]:
-    start_norm = normalize_project_number(start)
-    end_norm = normalize_project_number(end)
-
-    m1 = re.fullmatch(r"(\d{2}-F)(\d{3})", start_norm)
-    m2 = re.fullmatch(r"(\d{2}-F)(\d{3})", end_norm)
-
-    if not m1 or not m2:
-        raise ValueError(f"Некорректный диапазон проектов: {start}...{end}")
-
-    prefix1, number1 = m1.groups()
-    prefix2, number2 = m2.groups()
-
-    if prefix1 != prefix2:
-        raise ValueError(
-            f"Диапазон должен быть внутри одного года: {start}...{end}"
-        )
-
-    first = int(number1)
-    last = int(number2)
-
-    if last < first:
-        raise ValueError(
-            f"Конец диапазона меньше начала: {start}...{end}"
-        )
-
-    return [f"{prefix1}{number:03d}" for number in range(first, last + 1)]
-
-
-def parse_projects_input(text: str, *, year: int) -> list[str]:
-    """
-    Разбирает выбор проектов для save-v22.
-
-    Примеры:
-        26-F001
-        26-F001...26-F050
-        26-F001, 26-F005, 26-F010...26-F020
-
-    Пустая строка означает весь выбранный год.
-    """
-    raw = normalize_text(text)
-
-    if not raw:
-        return []
-
-    raw = re.sub(r"\s*\.{2,3}\s*", "...", raw)
-    parts = re.split(r"[,;\s]+", raw)
-
-    result: list[str] = []
-
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-
-        if "..." in part:
-            start, end = part.split("...", 1)
-            result.extend(expand_project_range(start, end))
-        else:
-            result.append(normalize_project_number(part))
-
-    expected_prefix = f"{year % 100:02d}-F"
-    wrong_year = [project for project in result if not project.startswith(expected_prefix)]
-
-    if wrong_year:
-        raise ValueError(
-            f"Для года {year} указаны проекты другого года: "
-            + ", ".join(wrong_year)
-        )
-
-    seen: set[str] = set()
-    unique: list[str] = []
-
-    for project in result:
-        if project in seen:
-            continue
-        seen.add(project)
-        unique.append(project)
-
-    return unique
 
 
 def year_folder(year: int) -> Path:
@@ -1608,13 +1514,11 @@ def run_save_v22(
     year: int,
     *,
     auto_sample_codes: bool = False,
-    projects_text: str = "",
 ) -> RunSummary:
     validate_legacy_addin_before_save()
 
-    # Перед сохранением каждый раз пересканируем v22, чтобы не опираться
-    # на устаревший scan-v22. Результаты прошлых сохранений в save_v22
-    # при этом не затираются.
+    # Перед сохранением каждый раз пересканируем все v22, чтобы не опираться
+    # на устаревший scan-v22.
     state = load_state()
     inspections = inspect_all_v22(
         year,
@@ -1623,100 +1527,31 @@ def run_save_v22(
     write_inspections_to_state(state, inspections)
     save_state(state)
 
-    requested_projects = parse_projects_input(
-        projects_text,
-        year=year,
-    )
-    requested_set = set(requested_projects)
-
-    if requested_set:
-        selected_inspections = [
-            item
-            for item in inspections
-            if item.project in requested_set
-        ]
-
-        found_projects = {item.project for item in selected_inspections}
-        missing_projects = [
-            project
-            for project in requested_projects
-            if project not in found_projects
-        ]
-
-        progress(
-            "SAVE v22: выбран диапазон/список проектов: "
-            + ", ".join(requested_projects)
-        )
-
-        if missing_projects:
-            progress(
-                "SAVE v22: в выбранном диапазоне не найдены v22-проекты: "
-                + ", ".join(missing_projects)
-            )
-    else:
-        selected_inspections = inspections
-        progress("SAVE v22: проекты не указаны — обрабатываю весь выбранный год")
-
-    skipped_ok: list[V22Inspection] = []
-    pending_inspections: list[V22Inspection] = []
-
-    for inspection in selected_inspections:
-        entry = project_state_entry(state, Path(inspection.folder))
-        previous_save_status = normalize_text(
-            entry.get("save_v22", {}).get("status")
-        ).upper()
-
-        if previous_save_status == "OK":
-            skipped_ok.append(inspection)
-            continue
-
-        pending_inspections.append(inspection)
-
-    ready = [
-        item
-        for item in pending_inspections
-        if item.ready_for_save
-    ]
+    ready = [item for item in inspections if item.ready_for_save]
 
     manual_precheck = sum(
         item.status.startswith("MANUAL_REVIEW")
-        for item in pending_inspections
+        for item in inspections
     )
-    blocked_precheck = (
-        len(pending_inspections)
-        - len(ready)
-        - manual_precheck
-    )
-    skipped_ok_count = len(skipped_ok)
+    blocked_precheck = len(inspections) - len(ready) - manual_precheck
 
     progress(
-        f"SAVE v22: SELECTED={len(selected_inspections)}, "
-        f"SKIP_OK={skipped_ok_count}, READY={len(ready)}, "
-        f"MANUAL={manual_precheck}, BLOCKED={blocked_precheck}"
+        f"SAVE v22: READY={len(ready)}, MANUAL={manual_precheck}, "
+        f"BLOCKED={blocked_precheck}"
     )
-
-    if skipped_ok:
-        progress(
-            "SAVE v22: уже имеют save_v22=OK и будут пропущены: "
-            + ", ".join(item.project for item in skipped_ok)
-        )
 
     if not ready:
         report_path = write_status_report(state, year)
         return RunSummary(
-            ok=blocked_precheck == 0,
+            ok=True,
             mode="save-v22",
             year=year,
-            processed=len(selected_inspections),
+            processed=len(inspections),
             succeeded=0,
             manual_review=manual_precheck,
             blocked=blocked_precheck,
-            ignored=skipped_ok_count,
-            message=(
-                "Нет выбранных v22-книг, требующих автоматического сохранения. "
-                f"SKIP_OK={skipped_ok_count}; MANUAL_REVIEW={manual_precheck}; "
-                f"BLOCKED={blocked_precheck}."
-            ),
+            ignored=0,
+            message="Нет v22-книг, готовых к автоматическому сохранению.",
             state_file=str(STATE_PATH),
             status_report=str(report_path),
         )
@@ -1724,68 +1559,30 @@ def run_save_v22(
     if len(xw.apps) == 0:
         raise RuntimeError(
             "Excel не запущен. "
-            "Сначала вручную запусти Excel и дождись загрузки надстройки."
-        )
-
-    if len(xw.apps) > 1:
-        raise RuntimeError(
-            "Запущено несколько экземпляров Excel. "
-            "Закрой лишние экземпляры и оставь только тот, "
-            "в котором штатно загружена старая надстройка."
+            "Сначала открой Excel обычным способом "
+            "и дождись загрузки надстройки."
         )
 
     app = xw.apps.active
-
-    progress(
-        f"Использую уже запущенный Excel: "
-        f"HWND={app.api.Hwnd}"
-    )
 
     save_ok = 0
     save_manual = manual_precheck
     save_failed = blocked_precheck
 
     try:
-        # Excel уже запущен пользователем, и надстройка уже должна быть
-        # штатно загружена. Ничего в Application.AddIns не переключаем.
-        addin_name = INSTALLED_ADDIN_PATH.name
+        # Для инициализации установленной xlam события должны быть включены.
+        app.display_alerts = False
+        app.api.DisplayAlerts = False
+        app.api.AskToUpdateLinks = False
+        app.api.AlertBeforeOverwriting = False
+        app.api.EnableEvents = True
+        app.screen_updating = False
 
-        # Только диагностируем состояние надстройки.
-        addin_found = False
+        progress("Подключаю старую установленную надстройку через Application.AddIns")
 
-        for i in range(1, app.api.AddIns.Count + 1):
-            addin = app.api.AddIns.Item(i)
-
-            if str(addin.Name).casefold() != addin_name.casefold():
-                continue
-
-            addin_found = True
-
-            progress(
-                f"Использую уже загруженную AddIn: "
-                f"Name={addin.Name}; "
-                f"FullName={addin.FullName}; "
-                f"Installed={addin.Installed}"
-            )
-
-            if not bool(addin.Installed):
-                raise RuntimeError(
-                    f"Надстройка {addin_name!r} найдена, "
-                    "но в текущем Excel она не установлена/не активна. "
-                    "Скрипт специально не будет её переподключать."
-                )
-
-            break
-
-        if not addin_found:
-            raise RuntimeError(
-                f"В уже запущенном Excel не найдена надстройка {addin_name!r}. "
-                "Закрой Excel, запусти его обычным способом и дождись "
-                "штатной загрузки надстройки."
-            )
+        addin_name = INSTALLED_ADDIM_PATH.name
 
         disable_excel_prompts(app)
-        app.screen_updating = False
 
         for index, inspection in enumerate(ready, start=1):
             folder = Path(inspection.folder)
@@ -1819,22 +1616,14 @@ def run_save_v22(
             else:
                 save_failed += 1
 
-            # Сохраняем state после КАЖДОГО проекта.
-            # Если процесс оборвётся, уже завершённые OK сохранятся
-            # и при следующем запуске будут автоматически пропущены.
             save_state(state)
             progress(f"{folder.name}: {status} — {message}")
 
     finally:
         try:
-            app.screen_updating = True
-            app.api.EnableEvents = True
-            app.api.DisplayAlerts = True
-            app.display_alerts = True
+            app.quit()
         except Exception:
-            logger.exception(
-                "Не удалось восстановить настройки Excel после save-v22"
-            )
+            logger.exception("Не удалось закрыть Excel после save-v22")
 
     report_path = write_status_report(state, year)
 
@@ -1842,16 +1631,16 @@ def run_save_v22(
         ok=save_failed == 0,
         mode="save-v22",
         year=year,
-        processed=len(selected_inspections),
+        processed=len(inspections),
         succeeded=save_ok,
         manual_review=save_manual,
         blocked=save_failed,
-        ignored=skipped_ok_count,
+        ignored=0,
         message=(
-            f"SAVE v22 завершён. NEW_OK={save_ok}; SKIP_OK={skipped_ok_count}; "
+            f"SAVE v22 завершён. OK={save_ok}; "
             f"MANUAL_REVIEW={save_manual}; BLOCKED/FAILED={save_failed}; "
             f"AUTO_CODES={'ON' if auto_sample_codes else 'OFF'}. "
-            "create-v23 по-прежнему запускается отдельным этапом."
+            "create-v23 запускается только отдельным следующим запуском."
         ),
         state_file=str(STATE_PATH),
         status_report=str(report_path),
@@ -2480,7 +2269,6 @@ def ask_ui_options() -> UiOptions:
             mode="scan-v22",
             year=MIGRATION_YEAR_DEFAULT,
             auto_sample_codes=False,
-            projects_text="",
             cancelled=True,
         )
 
@@ -2495,7 +2283,7 @@ def ask_ui_options() -> UiOptions:
             frame,
             text=(
                 "Каждый режим запускается ОТДЕЛЬНО.\n"
-                "Для save-v22 можно указать проект/диапазон; пусто = весь год.\n"
+                "Скрипт проходит все папки выбранного года по очереди.\n"
                 "Файлы v21 игнорируются полностью."
             ),
             justify="left",
@@ -2545,32 +2333,6 @@ def ask_ui_options() -> UiOptions:
             width=8,
         ).pack(side="left", padx=(8, 0))
 
-        projects_frame = tk.Frame(frame)
-        projects_frame.pack(fill="x", pady=(0, 12))
-
-        tk.Label(
-            projects_frame,
-            text="Проекты для save-v22:",
-        ).pack(side="left")
-
-        projects_var = tk.StringVar(value="")
-        tk.Entry(
-            projects_frame,
-            textvariable=projects_var,
-            width=42,
-        ).pack(side="left", padx=(8, 0))
-
-        tk.Label(
-            frame,
-            text=(
-                "Примеры: 26-F001 или 26-F001...26-F050 или список через запятую.\n"
-                "Пусто = весь выбранный год. Для scan-v22/create-v23 поле игнорируется.\n"
-                "Проекты, у которых в state уже save_v22=OK, автоматически пропускаются."
-            ),
-            justify="left",
-            anchor="w",
-        ).pack(fill="x", pady=(0, 12))
-
         auto_sample_codes_var = tk.BooleanVar(value=False)
         tk.Checkbutton(
             frame,
@@ -2619,19 +2381,9 @@ def ask_ui_options() -> UiOptions:
                 if not answer:
                     return
 
-            projects_text = projects_var.get().strip()
-
-            if mode == "save-v22" and projects_text:
-                try:
-                    parse_projects_input(projects_text, year=year)
-                except ValueError as exc:
-                    messagebox.showerror("Ошибка", str(exc))
-                    return
-
             result.mode = mode
             result.year = year
             result.auto_sample_codes = bool(auto_sample_codes_var.get())
-            result.projects_text = projects_text
             result.cancelled = False
             root.destroy()
 
@@ -2681,15 +2433,6 @@ def ask_ui_options() -> UiOptions:
         raw_year = input(f"Год [{MIGRATION_YEAR_DEFAULT}]: ").strip()
         year = int(raw_year) if raw_year else MIGRATION_YEAR_DEFAULT
 
-        projects_text = ""
-        if mode == "save-v22":
-            projects_text = input(
-                "Проект/диапазон для save-v22 "
-                "(например 26-F001...26-F050; пусто = весь год): "
-            ).strip()
-            if projects_text:
-                parse_projects_input(projects_text, year=year)
-
         auto_raw = input(
             "Автоматически создать шифры SSF/ПЩК/СВМЭ? [y/N]: "
         ).strip().casefold()
@@ -2699,7 +2442,6 @@ def ask_ui_options() -> UiOptions:
             mode=mode,
             year=year,
             auto_sample_codes=auto_sample_codes,
-            projects_text=projects_text,
             cancelled=False,
         )
 
@@ -2730,16 +2472,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--projects",
-        default="",
-        help=(
-            "Проект/диапазон для save-v22, например "
-            "26-F001 или 26-F001...26-F050. "
-            "Пусто = весь выбранный год."
-        ),
-    )
-
-    parser.add_argument(
         "--auto-sample-codes",
         action="store_true",
         help=(
@@ -2756,7 +2488,6 @@ def run_mode(
     year: int,
     *,
     auto_sample_codes: bool = False,
-    projects_text: str = "",
 ) -> RunSummary:
     if mode == "scan-v22":
         return run_scan_v22(
@@ -2768,7 +2499,6 @@ def run_mode(
         return run_save_v22(
             year,
             auto_sample_codes=auto_sample_codes,
-            projects_text=projects_text,
         )
 
     if mode == "create-v23":
@@ -2790,7 +2520,6 @@ def main(argv: list[str] | None = None) -> int:
         mode = options.mode
         year = options.year
         auto_sample_codes = options.auto_sample_codes
-        projects_text = options.projects_text
 
     else:
         parser = build_parser()
@@ -2802,17 +2531,12 @@ def main(argv: list[str] | None = None) -> int:
         mode = args.mode
         year = args.year
         auto_sample_codes = bool(args.auto_sample_codes)
-        projects_text = str(args.projects or "").strip()
-
-        if mode == "save-v22" and projects_text:
-            parse_projects_input(projects_text, year=year)
 
     try:
         summary = run_mode(
             mode,
             year,
             auto_sample_codes=auto_sample_codes,
-            projects_text=projects_text,
         )
     except Exception as exc:
         logger.exception("Критическая ошибка мигратора")
