@@ -1,0 +1,926 @@
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import math
+import re
+import shutil
+import sys
+import time as time_module
+import traceback
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, timedelta
+from datetime import time as dt_time
+from pathlib import Path
+from typing import Any
+
+import xlwings as xw
+
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+
+# Путь к шаблону акта качества глубинных проб.
+# Можно переопределить через CLI параметр --template.
+TEMPLATE_PATH = Path(r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\Акт качества глубинок.xlsx")
+
+# Что читать из книги с формами.
+OPOH_SHEET = "OPOH_results"
+OPOH_TABLE = "OPOH_results"
+APP_SHEET = "ProjectLIF"
+APP_TABLE = "ProjectLIF"
+
+# Что заполнять в акте.
+ACT_SHEET = "OPOH"
+ACT_HEADER_ROW = 17
+ACT_DATA_START_ROW = 18
+ACT_MAX_TEMPLATE_ROW = 32
+ACT_DATA_START_COL = 1  # A
+
+ERROR_LOG_PATH = Path(__file__).resolve().parent / "create_opoh_quality_act_errors.log"
+PROGRESS_FILE_PATH: Path | None = None
+
+INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+@dataclass
+class OPOHQualityActReport:
+    ok: bool
+    message: str
+    workbook: str | None = None
+    output_path: str | None = None
+    rows_written: int = 0
+    project_name: str | None = None
+    error_type: str | None = None
+    traceback: str | None = None
+
+
+# ============================================================
+# LOG / PROGRESS
+# ============================================================
+
+def set_progress_file(path: str | None) -> None:
+    global PROGRESS_FILE_PATH
+
+    if not path:
+        PROGRESS_FILE_PATH = None
+        return
+
+    PROGRESS_FILE_PATH = Path(path)
+    PROGRESS_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PROGRESS_FILE_PATH.write_text("", encoding="utf-8")
+
+
+def progress(message: str) -> None:
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n"
+
+    if PROGRESS_FILE_PATH is not None:
+        for _ in range(5):
+            try:
+                with PROGRESS_FILE_PATH.open("a", encoding="utf-8") as f:
+                    f.write(line)
+                return
+            except (PermissionError, OSError):
+                time_module.sleep(0.05)
+        return
+
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def write_error_log(*, message: str, error_type: str, traceback_text: str) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with ERROR_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write("\n" + "=" * 100 + "\n")
+        f.write(f"datetime: {now}\n")
+        f.write(f"error_type: {error_type}\n")
+        f.write(f"message: {message}\n")
+        f.write("-" * 100 + "\n")
+        f.write(traceback_text)
+        f.write("\n")
+
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
+
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m.%Y %H:%M:%S")
+
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+
+    text = str(value).strip()
+
+    if text.lower() in {"nan", "none", "null"}:
+        return ""
+
+    return text
+
+
+def normalize_key(value: Any) -> str:
+    return normalize_text(value).replace("\xa0", " ").strip().lower()
+
+
+def normalize_col_name(value: Any) -> str:
+    text = normalize_text(value).lower().replace("ё", "е")
+    text = re.sub(r"[\s_\-\.]+", "", text)
+    return text
+
+
+def is_empty(value: Any) -> bool:
+    if value is None:
+        return True
+
+    if isinstance(value, float) and math.isnan(value):
+        return True
+
+    return bool(isinstance(value, str) and value.strip() == "")
+
+
+def to_number(value: Any) -> float | None:
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return float(int(value))
+
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return None
+        return float(value)
+
+    text = normalize_text(value)
+
+    if not text or text == "-":
+        return None
+
+    text = text.replace("\xa0", "").replace(" ", "").replace(",", ".")
+
+    if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
+        return None
+
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def normalize_excel_date(value: Any) -> datetime | None:
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+
+    # Excel serial date. 25569 = 1970-01-01.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value <= 0:
+            return None
+        try:
+            return datetime(1899, 12, 30) + timedelta(days=float(value))
+        except Exception:
+            return None
+
+    text = normalize_text(value)
+
+    if not text or text == "-":
+        return None
+
+    # Убираем время, если оно не отделено корректно, но пробуем разные форматы.
+    formats = [
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%d.%m.%Y",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+    ]
+
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+
+    return None
+
+
+def format_date_range(values: list[Any]) -> str:
+    dates: list[date] = []
+
+    for value in values:
+        dt = normalize_excel_date(value)
+        if dt is not None:
+            dates.append(dt.date())
+
+    if not dates:
+        return "-"
+
+    min_date = min(dates)
+    max_date = max(dates)
+
+    if min_date == max_date:
+        return min_date.strftime("%d.%m.%Y")
+
+    return f"{min_date.strftime('%d.%m.%Y')} - {max_date.strftime('%d.%m.%Y')}"
+
+
+def make_safe_filename_part(value: Any, fallback: str = "Проект") -> str:
+    text = normalize_text(value)
+
+    if not text:
+        text = fallback
+
+    text = INVALID_FILENAME_CHARS_RE.sub("_", text)
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip(" .")
+
+    return text or fallback
+
+
+def value_for_excel(value: Any) -> Any:
+    """
+    Числа пишет как числа, даты — как даты, простые числовые строки — как числа.
+    Шифры проб/текст с буквами не трогает.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+
+    if isinstance(value, dt_time):
+        return value.strftime("%H:%M:%S")
+
+    if isinstance(value, (int, float, bool)):
+        return value
+
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "":
+            return None
+
+        compact = text.replace("\xa0", "").replace(" ", "")
+        if re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", compact):
+            normalized = compact.replace(",", ".")
+            num = float(normalized)
+            if "," not in compact and "." not in compact and num.is_integer():
+                return int(num)
+            return num
+
+        return text
+
+    return value
+
+BLANK_COLUMN_PREFIX = "__blank_"
+
+
+def is_blank_act_column(column_name: str) -> bool:
+    return normalize_text(column_name).startswith(BLANK_COLUMN_PREFIX)
+
+# ============================================================
+# XLWINGS READERS
+# ============================================================
+
+def normalize_path_for_compare(path: str | Path) -> str:
+    return str(path).replace("/", "\\").replace("\\\\?\\", "").strip().lower()
+
+
+def find_open_book(workbook_path: str | Path) -> xw.Book:
+    target = normalize_path_for_compare(workbook_path)
+
+    for app in xw.apps:
+        for book in app.books:
+            try:
+                full_name = book.fullname
+            except Exception:
+                continue
+
+            if normalize_path_for_compare(full_name) == target:
+                return book
+
+    # Если книга не найдена среди открытых, открываем её сами.
+    # Обычно при вызове из Excel она уже открыта.
+    return xw.Book(str(workbook_path))
+
+
+def as_2d(value: Any) -> list[list[Any]]:
+    if value is None:
+        return []
+
+    if not isinstance(value, (list, tuple)):
+        return [[value]]
+
+    if len(value) == 0:
+        return []
+
+    first = value[0]
+
+    if not isinstance(first, (list, tuple)):
+        return [list(value)]
+
+    return [list(row) for row in value]
+
+
+def read_list_object(book: xw.Book, sheet_name: str, table_name: str) -> tuple[list[str], list[dict[str, Any]]]:
+    ws = book.sheets[sheet_name]
+    table = ws.api.ListObjects(table_name)
+
+    headers_raw = as_2d(table.HeaderRowRange.Value)
+    headers = [normalize_text(v) for v in headers_raw[0]]
+
+    if table.DataBodyRange is None:
+        return headers, []
+
+    data = as_2d(table.DataBodyRange.Value)
+
+    rows: list[dict[str, Any]] = []
+
+    for values in data:
+        row: dict[str, Any] = {}
+        for header, value in zip(headers, values):
+            if header:
+                row[header] = value
+        rows.append(row)
+
+    return headers, rows
+
+
+def get_row_value(row: dict[str, Any], column_name: str, default: Any = None) -> Any:
+    target_norm = normalize_col_name(column_name)
+
+    for key, value in row.items():
+        if normalize_col_name(key) == target_norm:
+            return value
+
+    return default
+
+
+def get_sample_code(row: dict[str, Any]) -> str:
+    candidates = [
+        "sampleCode",
+        "sample code",
+        "Шифр пробы",
+        "шифр пробы",
+    ]
+
+    for candidate in candidates:
+        value = get_row_value(row, candidate)
+        text = normalize_text(value)
+        if text:
+            return text
+
+    return ""
+
+
+def build_index_by_sample_code(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        sample_code = get_sample_code(row)
+        key = normalize_key(sample_code)
+
+        if key and key not in result:
+            result[key] = row
+
+    return result
+
+
+# ============================================================
+# ACT TEMPLATE HELPERS
+# ============================================================
+
+def get_act_columns(act_book: xw.Book) -> list[str]:
+    sheet = act_book.sheets[ACT_SHEET]
+
+    # xlToLeft = -4159.
+    # Так находим последний реально используемый столбец в строке логических заголовков.
+    # Пустые столбцы внутри диапазона сохраняются.
+    last_col = sheet.api.Cells(ACT_HEADER_ROW, sheet.api.Columns.Count).End(-4159).Column
+
+    values = sheet.range(
+        (ACT_HEADER_ROW, ACT_DATA_START_COL),
+        (ACT_HEADER_ROW, last_col),
+    ).value
+
+    if not isinstance(values, list):
+        values = [values]
+
+    headers: list[str] = []
+
+    for col_offset, value in enumerate(values, start=ACT_DATA_START_COL):
+        text = normalize_text(value)
+
+        if text:
+            headers.append(text)
+        else:
+            headers.append(f"{BLANK_COLUMN_PREFIX}{col_offset}")
+
+    # служебный столбец, в шаблоне его нет
+    headers.append("sampleCode")
+
+    return headers
+
+
+def write_defined_name_value(book: xw.Book, name: str, value: Any) -> None:
+    try:
+        book.names[name].refers_to_range.value = value_for_excel(value)
+    except Exception as exc:
+        raise ValueError(f"В шаблоне акта нет именованного диапазона {name!r}") from exc
+
+
+def clear_and_write_act_table(
+    act_book: xw.Book,
+    act_rows: list[dict[str, Any]],
+    columns: list[str],
+) -> None:
+    sheet = act_book.sheets[ACT_SHEET]
+
+    available_rows = ACT_MAX_TEMPLATE_ROW - ACT_DATA_START_ROW + 1
+
+    if len(act_rows) > available_rows:
+        raise ValueError(
+            f"В шаблоне акта хватает строк только на {available_rows} проб, "
+            f"а нужно записать {len(act_rows)}. Добавь строки в шаблон или расширь скрипт."
+        )
+
+    col_count = len(columns)
+    start_col = ACT_DATA_START_COL
+    end_col = start_col + col_count - 1
+
+    # Очищаем только значения. Форматирование, картинки и фигуры не трогаем.
+    sheet.range(
+        (ACT_DATA_START_ROW, start_col),
+        (ACT_MAX_TEMPLATE_ROW, end_col),
+    ).clear_contents()
+
+    # Раскрываем строки шаблона перед заполнением.
+    for row_idx in range(ACT_DATA_START_ROW, ACT_MAX_TEMPLATE_ROW + 1):
+        sheet.range(f"{row_idx}:{row_idx}").api.EntireRow.Hidden = False
+
+    matrix: list[list[Any]] = []
+
+    for row_data in act_rows:
+        matrix_row: list[Any] = []
+
+        for column_name in columns:
+            # Пустые технические колонки шаблона оставляем пустыми.
+            if is_blank_act_column(column_name):
+                matrix_row.append(None)
+            else:
+                matrix_row.append(value_for_excel(row_data.get(column_name)))
+
+        matrix.append(matrix_row)
+
+    if matrix:
+        sheet.range((ACT_DATA_START_ROW, start_col)).resize(
+            len(matrix),
+            col_count,
+        ).value = matrix
+
+    # Скрываем неиспользуемые строки до 32 включительно.
+    first_unused = ACT_DATA_START_ROW + len(act_rows)
+
+    for row_idx in range(first_unused, ACT_MAX_TEMPLATE_ROW + 1):
+        sheet.range(f"{row_idx}:{row_idx}").api.EntireRow.Hidden = True
+
+    # Последний служебный столбец sampleCode скрываем.
+    sample_code_col = start_col + len(columns) - 1
+    sheet.range((1, sample_code_col)).api.EntireColumn.Hidden = True
+
+
+# ============================================================
+# BUILD DATA
+# ============================================================
+
+def find_project_name(app_rows: list[dict[str, Any]]) -> str:
+    for row in app_rows:
+        project = normalize_text(get_row_value(row, "Project"))
+        field = normalize_text(get_row_value(row, "Field"))
+        well = normalize_text(get_row_value(row, "Well"))
+
+        if project and field and well:
+            return f"{project}-{field}-{well}"
+
+    raise ValueError("Не удалось собрать projectName: в Append1 нет строки, где заполнены Project, Field и Well")
+
+
+def first_non_empty(rows: list[dict[str, Any]], column_name: str) -> Any:
+    for row in rows:
+        value = get_row_value(row, column_name)
+        if not is_empty(value):
+            return value
+    return None
+
+
+def create_initial_act_rows(
+    *,
+    columns: list[str],
+    opoh_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+
+    for opoh_row in opoh_rows:
+        sample_code = get_sample_code(opoh_row)
+        if not sample_code:
+            continue
+
+        act_row: dict[str, Any] = {column: None for column in columns}
+        act_row["sampleCode"] = sample_code
+
+        for column in columns:
+            if column.startswith("OPOH_"):
+                source_col = column.removeprefix("OPOH_")
+                act_row[column] = get_row_value(opoh_row, source_col)
+
+        result.append(act_row)
+
+    return result
+
+
+def fill_lif_columns(
+    *,
+    act_rows: list[dict[str, Any]],
+    columns: list[str],
+    app_index: dict[str, dict[str, Any]],
+) -> None:
+    for act_row in act_rows:
+        sample_code = normalize_key(act_row.get("sampleCode"))
+        app_row = app_index.get(sample_code)
+
+        if app_row is None:
+            continue
+
+        for column in columns:
+            if column.startswith("LIF_"):
+                source_col = column.removeprefix("LIF_")
+                act_row[column] = get_row_value(app_row, source_col)
+
+
+def calc_sum(*values: Any) -> float:
+    total = 0.0
+    has_any = False
+
+    for value in values:
+        number = to_number(value)
+        if number is not None:
+            total += number
+            has_any = True
+
+    return total if has_any else 0.0
+
+
+def fill_calc_columns(
+    *,
+    act_rows: list[dict[str, Any]],
+    opoh_index: dict[str, dict[str, Any]],
+    app_index: dict[str, dict[str, Any]],
+) -> None:
+    for act_row in act_rows:
+        sample_key = normalize_key(act_row.get("sampleCode"))
+        opoh_row = opoh_index.get(sample_key, {})
+        app_row = app_index.get(sample_key, {})
+
+        calc_hc = calc_sum(
+            get_row_value(opoh_row, "sncVolumeHC"),
+            get_row_value(opoh_row, "flcVolumeHC"),
+        )
+        calc_dm = calc_sum(
+            get_row_value(opoh_row, "sncVolumeDM"),
+            get_row_value(opoh_row, "flcVolumeDM"),
+        )
+        calc_w = calc_sum(
+            get_row_value(opoh_row, "sncVolumeW"),
+            get_row_value(opoh_row, "flcVolumeW"),
+        )
+
+        transfer_volume = to_number(act_row.get("OPOH_transferVolume"))
+        calc_v = None
+
+        if transfer_volume is not None:
+            calc_v = transfer_volume - (calc_hc + calc_dm + calc_w)
+            if calc_v < 0:
+                calc_v = 0.0
+
+        act_row["calc_HC"] = calc_hc
+        act_row["calc_DM"] = calc_dm
+        act_row["calc_W"] = calc_w
+        act_row["calc_V"] = calc_v if calc_v is not None else None
+
+        # calc_typeFluid
+        if calc_v is not None and calc_v == 0:
+            act_row["calc_typeFluid"] = "-"
+        else:
+            type_fluid = normalize_text(get_row_value(app_row, "type fluid"))
+            type_fluid_norm = type_fluid.lower().replace("ё", "е")
+
+            if type_fluid_norm == "вода":
+                act_row["calc_typeFluid"] = "Вода"
+            elif type_fluid_norm == "нефть":
+                act_row["calc_typeFluid"] = "УВ (Нефть)"
+            elif type_fluid_norm == "газ":
+                act_row["calc_typeFluid"] = "УВ (Газ)"
+            else:
+                act_row["calc_typeFluid"] = type_fluid or "-"
+
+        # calc_result
+        hot_open = to_number(act_row.get("OPOH_hotOpenPMPaAbs"))
+        p_sampling = to_number(act_row.get("LIF_PSamplingMPa"))
+        pz = to_number(act_row.get("LIF_Pz"))
+
+        if hot_open is None or p_sampling is None or pz is None:
+            act_row["calc_result"] = "-"
+        else:
+            low = min(p_sampling, pz)
+            high = max(p_sampling, pz)
+            act_row["calc_result"] = "Качественная" if low <= hot_open <= high else "Некачественная"
+
+
+def replace_empty_with_dash(act_rows: list[dict[str, Any]], columns: list[str]) -> None:
+    for row in act_rows:
+        for column in columns:
+
+            if is_blank_act_column(column):
+                continue
+
+            if is_empty(row.get(column)):
+                row[column] = "-"
+
+
+def collect_delivery_dates(
+    *,
+    act_rows: list[dict[str, Any]],
+    app_index: dict[str, dict[str, Any]],
+) -> list[Any]:
+    result: list[Any] = []
+
+    for act_row in act_rows:
+        sample_key = normalize_key(act_row.get("sampleCode"))
+        app_row = app_index.get(sample_key)
+
+        if app_row is None:
+            continue
+
+        value = get_row_value(app_row, "deliveryDate")
+        if not is_empty(value):
+            result.append(value)
+
+    return result
+
+
+def collect_opoh_datetime_values(
+    *,
+    act_rows: list[dict[str, Any]],
+    opoh_index: dict[str, dict[str, Any]],
+) -> list[Any]:
+    result: list[Any] = []
+
+    for act_row in act_rows:
+        sample_key = normalize_key(act_row.get("sampleCode"))
+        opoh_row = opoh_index.get(sample_key)
+
+        if opoh_row is None:
+            continue
+
+        for key, value in opoh_row.items():
+            key_text = normalize_text(key).lower()
+
+            if key_text == "datetimesync":
+                continue
+
+            if "datetime" in key_text and not is_empty(value):
+                result.append(value)
+
+    return result
+
+
+def fill_header(
+    *,
+    act_wb,
+    act_rows: list[dict[str, Any]],
+    app_rows: list[dict[str, Any]],
+    app_index: dict[str, dict[str, Any]],
+    opoh_index: dict[str, dict[str, Any]],
+    project_name: str,
+) -> None:
+    write_defined_name_value(act_wb, "FullNameDZO", first_non_empty(app_rows, "FullNameDZO") or "-")
+    write_defined_name_value(act_wb, "LU", first_non_empty(app_rows, "LU") or "-")
+    write_defined_name_value(act_wb, "Well", first_non_empty(app_rows, "Well") or "-")
+    write_defined_name_value(act_wb, "ProjectFieldWell", project_name)
+
+    delivery_dates = collect_delivery_dates(act_rows=act_rows, app_index=app_index)
+    write_defined_name_value(act_wb, "deliveryDate", format_date_range(delivery_dates))
+
+    opoh_dates = collect_opoh_datetime_values(act_rows=act_rows, opoh_index=opoh_index)
+    write_defined_name_value(act_wb, "dates", format_date_range(opoh_dates))
+
+
+# ============================================================
+# MAIN BUSINESS FUNCTION
+# ============================================================
+
+def create_opoh_quality_act(
+    *,
+    workbook: str,
+    template: str | None = None,
+    output_dir: str | None = None,
+) -> OPOHQualityActReport:
+    workbook_path = Path(workbook)
+    template_path = Path(template) if template else TEMPLATE_PATH
+
+    if not template_path.exists():
+        raise FileNotFoundError(f"Шаблон акта качества глубинных проб не найден: {template_path}")
+
+    output_dir_path = Path(output_dir) if output_dir else workbook_path.parent
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+
+    progress(f"Ищу открытую книгу с формами: {workbook_path.name}")
+    book = find_open_book(workbook_path)
+
+    progress(f"Читаю таблицу {OPOH_SHEET}/{OPOH_TABLE}")
+    _, opoh_rows = read_list_object(book, OPOH_SHEET, OPOH_TABLE)
+
+    progress(f"Читаю таблицу {APP_SHEET}/{APP_TABLE}")
+    _, app_rows = read_list_object(book, APP_SHEET, APP_TABLE)
+
+    if not opoh_rows:
+        raise ValueError("В таблице OPOH_results нет строк для создания акта")
+
+    if not app_rows:
+        raise ValueError("В таблице Append1 нет строк для заполнения шапки и LIF-данных")
+
+    progress("Определяю Project-Field-Well")
+    project_name = find_project_name(app_rows)
+
+    output_name_project = make_safe_filename_part(project_name)
+    timestamp = datetime.now().strftime("%d-%m-%Y, %H-%M")
+    output_path = output_dir_path / f"{output_name_project}_акт качества глубинных проб_{timestamp}.xlsx"
+
+    progress(f"Копирую шаблон акта: {output_path.name}")
+    shutil.copy2(template_path, output_path)
+
+    progress("Открываю созданный акт")
+
+    act_book: xw.Book | None = None
+
+    try:
+        act_book = book.app.books.open(
+            str(output_path),
+            update_links=False,
+            read_only=False,
+        )
+
+        columns = get_act_columns(act_book)
+
+        progress("Создаю таблицу акта в памяти")
+        opoh_index = build_index_by_sample_code(opoh_rows)
+        app_index = build_index_by_sample_code(app_rows)
+
+        act_rows = create_initial_act_rows(
+            columns=columns,
+            opoh_rows=opoh_rows,
+        )
+
+        if not act_rows:
+            raise ValueError("Не найдено ни одной строки OPOH_results с заполненным sampleCode")
+
+        progress("Заполняю LIF-данные")
+        fill_lif_columns(
+            act_rows=act_rows,
+            columns=columns,
+            app_index=app_index,
+        )
+
+        progress("Заполняю расчетные поля")
+        fill_calc_columns(
+            act_rows=act_rows,
+            opoh_index=opoh_index,
+            app_index=app_index,
+        )
+
+        progress("Заполняю пустые значения прочерками")
+        replace_empty_with_dash(act_rows, columns)
+
+        progress("Заполняю шапку акта")
+        fill_header(
+            act_wb=act_book,
+            act_rows=act_rows,
+            app_rows=app_rows,
+            app_index=app_index,
+            opoh_index=opoh_index,
+            project_name=project_name,
+        )
+
+        progress(f"Записываю таблицу в акт: {len(act_rows)} строк")
+        clear_and_write_act_table(act_book, act_rows, columns)
+
+        progress("Сохраняю акт")
+        act_book.save()
+
+
+    finally:
+        try:
+            act_book.close()
+        finally:
+            act_book = None
+            book = None
+            gc.collect()
+
+    progress("Акт качества глубинных проб создан")
+
+    return OPOHQualityActReport(
+        ok=True,
+        message="Акт качества глубинных проб создан",
+        workbook=str(workbook_path),
+        output_path=str(output_path),
+        rows_written=len(act_rows),
+        project_name=project_name,
+    )
+
+
+# ============================================================
+# JSON / CLI
+# ============================================================
+
+def run_json(**kwargs: Any) -> str:
+    try:
+        report = create_opoh_quality_act(**kwargs)
+        return json.dumps(asdict(report), ensure_ascii=False, indent=2)
+
+    except Exception as exc:
+        traceback_text = traceback.format_exc()
+        error_type = type(exc).__name__
+        message = str(exc)
+
+        write_error_log(
+            message=message,
+            error_type=error_type,
+            traceback_text=traceback_text,
+        )
+
+        report = OPOHQualityActReport(
+            ok=False,
+            message=(
+                f"{error_type}: {message}\n\n"
+                f"Полный traceback записан в лог:\n{ERROR_LOG_PATH}"
+            ),
+            workbook=str(kwargs.get("workbook", "")) or None,
+            output_path=None,
+            rows_written=0,
+            project_name=None,
+            error_type=error_type,
+            traceback=None,
+        )
+
+        return json.dumps(asdict(report), ensure_ascii=False, indent=2)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Создание акта качества глубинных проб по OPOH_results и Append1"
+    )
+
+    parser.add_argument("--workbook", required=True, help="Путь к книге Excel с формами исследований")
+    parser.add_argument("--template", default=None, help="Путь к шаблону акта. Если не задан, используется TEMPLATE_PATH")
+    parser.add_argument("--output-dir", default=None, help="Папка для сохранения акта. Если не задана, папка книги с формами")
+    parser.add_argument("--progress-file", default=None, help="Файл для вывода прогресса")
+
+    args = parser.parse_args(argv)
+
+    set_progress_file(args.progress_file)
+
+    json_result = run_json(
+        workbook=args.workbook,
+        template=args.template,
+        output_dir=args.output_dir,
+    )
+
+    print(json_result)
+
+    try:
+        payload = json.loads(json_result)
+        return 0 if payload.get("ok") else 1
+    except Exception:
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
