@@ -1,22 +1,1726 @@
-====================================================================================================
-datetime: 2026-08-28 02:27:58
-mode: save
-error_type: ValueError
-message: Таблица JOIN_SOURCE_DATA, строка DataBodyRange #1: в столбце resultIdJOIN указан временный ключ 'temp_1', но такой ключ не найден в родительской таблице.
-----------------------------------------------------------------------------------------------------
-Traceback (most recent call last):
-  File "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sync.py", line 1400, in run_json
-    report = run_save(
-             ^^^^^^^^^
-  File "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sync.py", line 1329, in run_save
-    return service.save_to_db(
-           ^^^^^^^^^^^^^^^^^^^
-  File "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sync.py", line 290, in save_to_db
-    parent_report, child_report = self._save_parent_and_child(
-                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sync.py", line 557, in _save_parent_and_child
-    child_fk_temp_count = self._replace_child_temp_fk_with_real_id(
-                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sync.py", line 810, in _replace_child_temp_fk_with_real_id
-    raise ValueError(
-ValueError: Таблица JOIN_SOURCE_DATA, строка DataBodyRange #1: в столбце resultIdJOIN указан временный ключ 'temp_1', но такой ключ не найден в родительской таблице.
+Option Explicit
+
+'íàçâàíèÿ êîëîíîê â ôîðìå òàáëèöå
+Private Const COL_MIX_SAMPLE_CODE_FORM As String = "Øèôð ïðîáû äëÿ îáúåäèíåíèÿ"
+Private Const COL_DEPLETED_FORM As String = "Ïðîáà èçðàñõîäîâàíà"
+
+' íàçâàíèÿ êîëîíîê â òàáëèöå sourceData è ÁÄ
+Private Const COL_MIX_SAMPLE_CODE_DB As String = "mixSampleCode"
+Private Const COL_DEPLETED_DB As String = "depleted"
+Private Const COL_ROW_ID_DB As String = "rowIdJoin"
+Private Const COL_RESULT_ID_CHILD_DB As String = "resultIdJoin"
+
+' íàçâàíèÿ êîëîíîê â òàáëèöå _results è ÁÄ
+Private Const COL_RESULT_ID_DB As String = "resultIdJoin"
+Private Const COL_TASK_ID_DB As String = "taskId"
+Private Const COL_OPERATOR_DB As String = "operator"
+Private Const COL_DATE_DB As String = "date"
+Private Const COL_EQUIPMENT_DB As String = "equipment"
+Private Const COL_EQUIPMENT_NUMBER_DB As String = "equipmentNumber"
+Private Const COL_PREPARATION_PRESSURE_DB As String = "preparationPressure"
+Private Const COL_ABSULUTE_PRESSURE_DB As String = "absolutePressure"
+Private Const COL_PRESSURE_UNIT_DB As String = "pressureUnit"
+Private Const COL_PREPARATION_TEMP_DB As String = "preparationTemperature"
+Private Const COL_PREPARATION_PRES_MPA_DB As String = "preparationPressureMPa"
+Private Const COL_COMPLETE_FWC_DB As String = "completeFWC"
+Private Const COL_DATE_TIME_SYNC_DB As String = "dateTimeSync"
+
+Private Const JOIN_FIRST_FORM_FIRST_COL As Long = 1
+Private Const JOIN_PAGE_ROW = 10
+Private Const JOIN_PAGE_FIRST_COL = 3
+
+Private Enum JOINFormState
+    JOIN_FORM_EMPTY = 0
+    JOIN_FORM_RESERVED = 1
+    JOIN_FORM_FILLED = 2
+End Enum
+
+Public Function cancelCurrentTaskJOIN() As macroResult
+    
+    cancelCurrentTaskJOIN = MACRO_FAILED
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetJOIN As Worksheet
+    Set sheetJOIN = wb.Worksheets("JOIN")
+    
+    Dim lenght As Integer
+    lenght = sheetJOIN.Range("JOIN_2_sampleCode").Column - sheetJOIN.Range("JOIN_1_sampleCode").Column
+    
+    Dim curFormIndex As Integer
+    curFormIndex = (activeCell.Column - JOIN_FIRST_FORM_FIRST_COL) \ lenght + 1
+    
+    Dim taskCell As Range
+    Set taskCell = sheetJOIN.Range("JOIN_" & curFormIndex & "_taskId")
+    
+    Dim answer As Integer
+    
+    answer = MsgBox("Âû äåéñòâèòåëüíî õîòèòå óäàëèòü çàäàíèå ¹" & taskCell.value & "?", vbQuestion + vbYesNo, "Ïîäòâåðæäåíèå")
+    
+    If answer <> vbYes Then
+        cancelCurrentTaskJOIN = MACRO_NO_CHANGES
+        Exit Function
+    End If
+    
+    Dim comment As String
+    comment = InputBox("Ââåäèòå ïðè÷èíó îòìåíû:", "Îêíî ââîäà")
+    
+    Dim syncResult As String
+    syncResult = SetTaskStatusOnly(taskCell.value, "JOIN", "Îòìåíà", comment)
+
+    If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
+        With taskCell.MergeArea
+            .Interior.ColorIndex = 3
+            If .Locked = False Then
+                .Locked = True
+            End If
+        End With
+        cancelCurrentTaskJOIN = MACRO_CHANGED
+        
+    ElseIf syncResult = "NoComment" Or syncResult = "NoTaskId" Then
+        cancelCurrentTaskJOIN = MACRO_NO_CHANGES
+        
+    End If
+End Function
+
+Public Sub AddFormJOIN()
+
+    Dim sheetJOIN As Worksheet
+    Set sheetJOIN = ActiveWorkbook.Worksheets("JOIN")
+    
+    Dim lastList As Integer
+    Dim lastColumn As Integer
+    Dim firstColumn As Integer
+    Dim lenght As Integer
+    Dim dataRow As Integer
+    lenght = sheetJOIN.Range("Join_2_sampleCode").Column - sheetJOIN.Range("Join_1_sampleCode").Column
+    lastList = sheetJOIN.ListObjects.count + 1
+    lastColumn = lastList * lenght + JOIN_FIRST_FORM_FIRST_COL - 1
+    firstColumn = lastColumn - lenght + 1
+    dataRow = sheetJOIN.Range("Join_source_1").row
+    
+    sheetJOIN.Activate
+    Range(sheetJOIN.columns(firstColumn - lenght), sheetJOIN.columns(lastColumn - lenght)).EntireColumn.Copy
+    sheetJOIN.columns(firstColumn).Select
+    sheetJOIN.Paste
+    Application.CutCopyMode = False
+    
+    sheetJOIN.Cells(JOIN_PAGE_ROW, firstColumn + JOIN_PAGE_FIRST_COL - 1).value = lastList
+    
+    Dim name As String
+    Dim new_name As String
+    Dim prev_src_name As String
+    Dim new_src_name As String
+    name = "JOIN_" & (lastList - 1)
+    prev_src_name = "JOIN_source_" & (lastList - 1)
+    new_name = "JOIN_" & lastList
+    new_src_name = "JOIN_source_" & lastList
+    
+    Dim xTable As ListObject
+    
+    Dim i As Long
+    Dim x As Long
+    For i = sheetJOIN.ListObjects.count To 1 Step -1
+        Set xTable = sheetJOIN.ListObjects(i)
+        
+        If xTable.name Like name & "#*" Then
+            xTable.name = new_name
+            For x = 1 To xTable.ListRows.count
+                xTable.ListRows(1).Delete
+            Next x
+            Exit For
+        End If
+    Next i
+    
+    For i = sheetJOIN.ListObjects.count To 1 Step -1
+        Set xTable = sheetJOIN.ListObjects(i)
+        If xTable.name Like prev_src_name & "#*" Then
+            xTable.name = new_src_name
+            Exit For
+        End If
+    Next i
+    
+    Set xTable = sheetJOIN.ListObjects(new_src_name)
+
+    If Not xTable.DataBodyRange Is Nothing Then
+        If ListColumnExists(xTable, COL_ROW_ID_DB) Then
+            xTable.ListColumns(COL_ROW_ID_DB).DataBodyRange.ClearContents
+        End If
+    End If
+
+
+    Dim TableJoinResult As ListObject
+    Set TableJoinResult = ActiveWorkbook.Worksheets("Join_results").ListObjects("Join_results")
+    
+    Dim name_rng As Range
+    Dim oldName As String
+    For Each name_rng In TableJoinResult.HeaderRowRange
+        If name_rng.value = "dateTimeSync" Then
+            GoTo cont
+        End If
+        Dim current As Range
+        oldName = name & "_" & name_rng.value
+        Set current = sheetJOIN.Cells(sheetJOIN.Range(oldName).row, sheetJOIN.Range(oldName).Column + lenght)
+        current.name = Replace(oldName, name, new_name)
+        If Not current.HasFormula Then
+            current.value = ""
+        Else
+            Application.DisplayAlerts = False
+            On Error Resume Next
+            current.Formula = Replace(current.Formula, "_" & (lastList - 1), "_" & lastList)
+            Application.DisplayAlerts = True
+        End If
+cont:
+    Next name_rng
+
+    'sheetJoin.PageSetup.PrintArea = Range(Cells(1, 1), Cells(59, lastcolumn + 10)).Address
+    
+    Dim sh As CheckBox
+    Dim count As Integer
+    count = 0
+    Set xTable = sheetJOIN.ListObjects("JOIN_source_" & lastList)
+    For x = sheetJOIN.CheckBoxes.count To 1 Step -1
+        If count = xTable.ListRows.count + 2 Then
+            Exit For
+        End If
+        Set sh = sheetJOIN.CheckBoxes(x)
+        'Debug.Print sh.TopLeftCell.Column
+        If sh.TopLeftCell.Column >= sheetJOIN.ListObjects("JOIN_source_" & lastList).ListColumns("Ïðîáà èçðàñõîäîâàíà").DataBodyRange.Column Then
+            dataRow = sh.TopLeftCell.row - xTable.HeaderRowRange.row
+            If dataRow < 0 Then
+                sh.name = "CheckBox_" & lastList
+            Else
+                sh.name = "CheckBox_Join_" & lastList & "_" & dataRow
+            End If
+            sh.linkedCell = sh.TopLeftCell.Address
+            sh.TopLeftCell.ClearContents
+            count = count + 1
+        ElseIf sh.TopLeftCell.row = sheetJOIN.Range("JOIN_1_absolutePressure").row Then
+            If sh.TopLeftCell.Column = sheetJOIN.Range("JOIN_" & lastList & "_absolutePressure").Column Then
+                sh.name = "CheckBox_Join_" & lastList & "_absolute"
+                sh.linkedCell = sh.TopLeftCell.Address
+                sh.value = xlOff
+                count = count + 1
+            End If
+        ElseIf sh.TopLeftCell.row = sheetJOIN.Range("JOIN_1_completeFWC").row Then
+            If sh.TopLeftCell.Column = sheetJOIN.Range("JOIN_" & lastList & "_completeFWC").Column Then
+                sh.name = "CheckBox_Join_" & lastList & "_FWCcomlete"
+                sh.linkedCell = sh.TopLeftCell.Address
+                sh.TopLeftCell.ClearContents
+                count = count + 1
+            End If
+        End If
+    Next x
+    
+    sheetJOIN.Range(new_src_name & "[[Íà÷àëüíàÿ ìàññà ïèêíîìåòðà, ã]:[Êîíå÷íîå ïîëîæåíèå ïîðøíÿ]]").ClearContents
+    sheetJOIN.Range(new_src_name & "[[Àêòèâíà]]").ClearContents
+
+End Sub
+
+Public Function Save_JOIN(Optional ByVal taskStatus As String = "") As macroResult
+    On Error GoTo ErrHandler
+    Save_JOIN = MACRO_FAILED
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+    
+    Dim newHashResult As String
+    Dim oldHashResult As String
+    Dim lastWorkflowStage As String
+    
+    newHashResult = CalculateCurrentJOINHash()
+    oldHashResult = GetWorkbookMetadataProperty(wb, PROP_JOIN_DATA_HASH)
+    lastWorkflowStage = GetWorkbookMetadataProperty(wb, PROP_JOIN_LAST_WORKFLOW_STAGE)
+    
+    If Not ShouldSaveStudy(newHashResult, oldHashResult, lastWorkflowStage, taskStatus) Then
+        Save_JOIN = MACRO_NO_CHANGES
+        Exit Function
+    End If
+    
+    Dim sheetJOIN As Worksheet
+    Set sheetJOIN = wb.Worksheets("JOIN")
+
+    Dim sheetJOINResults As Worksheet
+    Set sheetJOINResults = wb.Worksheets("Join_results")
+
+    Dim sheetJOINSourceData As Worksheet
+    Set sheetJOINSourceData = wb.Worksheets("Join_sourceData")
+
+    Dim joinTable As ListObject
+    Set joinTable = sheetJOINResults.ListObjects("Join_results")
+
+    Dim joinSourceDataTable As ListObject
+    Set joinSourceDataTable = sheetJOINSourceData.ListObjects("Join_sourceData")
+
+    Dim parentRows As Collection
+    Set parentRows = New Collection
+
+    Dim childRows As Collection
+    Set childRows = New Collection
+
+    Dim newResultIDs As Collection
+    Set newResultIDs = New Collection
+    
+    Dim i As Long
+    Dim x As Long
+
+    i = 1
+
+    Do While NamedRangeExists(wb, "JOIN_" & i & "_sampleCode")
+
+        Dim formState As JOINFormState
+
+        formState = Get_JOIN_FormState(i)
+
+        Select Case formState
+
+            Case JOIN_FORM_EMPTY, _
+                JOIN_FORM_RESERVED
+
+                GoTo NextForm
+
+            Case JOIN_FORM_FILLED
+
+        End Select
+
+        If sheetJOIN.Range("JOIN_" & i & "_TaskId").Interior.ColorIndex = 3 Then
+            GoTo NextForm
+        End If
+
+        If Not Validate_JOIN_Form(i) Then
+            Exit Function
+        End If
+
+        Dim resultIdValue As Variant
+        Dim parentKey As String
+
+        resultIdValue = sheetJOIN.Range("JOIN_" & i & "_resultIdJoin").value
+
+        If Len(NormalizeKeyValue(resultIdValue)) = 0 Or NormalizeKeyValue(resultIdValue) = "0" Then
+            parentKey = "temp_" & i
+        Else
+            parentKey = NormalizeKeyValue(resultIdValue)
+        End If
+        
+        If IsNumeric(parentKey) Then
+            newResultIDs.Add parentKey
+        End If
+
+        Dim parentRow() As Variant
+        ReDim parentRow(1 To joinTable.ListColumns.count)
+
+        Dim headerCell As Range
+        Dim headerName As String
+        Dim parentColIndex As Long
+        Dim formRangeName As String
+
+        For Each headerCell In joinTable.HeaderRowRange.Cells
+
+            headerName = CStr(headerCell.value)
+            parentColIndex = joinTable.ListColumns(headerName).index
+            formRangeName = "JOIN_" & i & "_" & headerName
+
+            If headerName = COL_DATE_TIME_SYNC_DB Then
+                parentRow(parentColIndex) = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+
+            ElseIf headerName = COL_RESULT_ID_DB Then
+                parentRow(parentColIndex) = parentKey
+
+            ElseIf NamedRangeExists(wb, formRangeName) Then
+                parentRow(parentColIndex) = FormatValueForSyncText( _
+                    headerName, _
+                    sheetJOIN.Range(formRangeName).value _
+                )
+
+            Else
+                parentRow(parentColIndex) = vbNullString
+
+            End If
+
+        Next headerCell
+
+        parentRows.Add parentRow
+
+        Dim srcTable As ListObject
+        Set srcTable = sheetJOIN.ListObjects("JOIN_source_" & i)
+
+        If Not srcTable.DataBodyRange Is Nothing Then
+
+            For x = 1 To srcTable.ListRows.count
+
+                Dim hasSourceData As Boolean
+                Dim oldRowIdJoin As String
+
+                hasSourceData = SourceRowHasData( _
+                    srcTable, _
+                    x, _
+                    Array(COL_MIX_SAMPLE_CODE_FORM), _
+                    Array("AND") _
+                )
+
+                oldRowIdJoin = NormalizeKeyValue( _
+                    srcTable.DataBodyRange.Cells( _
+                        x, _
+                        srcTable.ListColumns(COL_ROW_ID_DB).index _
+                    ).value _
+                )
+
+                ' Äîáàâëÿåì ñòðîêó, åñëè:
+                ' 1) åñòü øèôð ïðîáû äëÿ îáúåäèíåíèÿ;
+                ' 2) äàííûõ óæå íåò, íî åñòü ñòàðûé rowIdJoin — çíà÷èò ñòðîêó íàäî óäàëèòü â ÁÄ.
+                If hasSourceData Or Len(oldRowIdJoin) > 0 Then
+
+                    Dim childRow() As Variant
+                    ReDim childRow(1 To joinSourceDataTable.ListColumns.count)
+
+                    childRow(joinSourceDataTable.ListColumns(COL_ROW_ID_DB).index) = oldRowIdJoin
+                    childRow(joinSourceDataTable.ListColumns(COL_RESULT_ID_CHILD_DB).index) = parentKey
+
+                    If hasSourceData Then
+
+                        childRow(joinSourceDataTable.ListColumns(COL_MIX_SAMPLE_CODE_DB).index) = _
+                            FormatValueForSyncText( _
+                                COL_MIX_SAMPLE_CODE_DB, _
+                                srcTable.DataBodyRange.Cells( _
+                                    x, _
+                                    srcTable.ListColumns(COL_MIX_SAMPLE_CODE_FORM).index _
+                                ).value _
+                            )
+
+                        If ListColumnExists(srcTable, COL_DEPLETED_FORM) _
+                            And ListColumnExists(joinSourceDataTable, COL_DEPLETED_DB) Then
+
+                            childRow(joinSourceDataTable.ListColumns(COL_DEPLETED_DB).index) = _
+                                FormatValueForSyncText( _
+                                    COL_DEPLETED_DB, _
+                                    srcTable.DataBodyRange.Cells( _
+                                        x, _
+                                        srcTable.ListColumns(COL_DEPLETED_FORM).index _
+                                    ).value _
+                                )
+
+                        End If
+
+                    End If
+
+                    childRows.Add childRow
+
+                End If
+
+            Next x
+
+        End If
+
+NextForm:
+        i = i + 1
+    Loop
+
+    Dim cellID As Range
+    Dim oldResultID As String
+
+    If Not joinTable.DataBodyRange Is Nothing Then
+
+        For Each cellID In _
+            joinTable.ListColumns( _
+                COL_RESULT_ID_DB _
+            ).DataBodyRange.Cells
+
+            If Not IsError(cellID.value) Then
+
+                oldResultID = _
+                    NormalizeKeyValue(cellID.value)
+
+                If IsNumeric(oldResultID) _
+                And oldResultID <> "0" Then
+
+                    If Not CollectionContains( _
+                        newResultIDs, _
+                        oldResultID _
+                    ) Then
+
+                        MsgBox _
+                            "Óäàëåíû äàííûå ñèíõðîíèçèðîâàííîé ôîðìû JOIN. " & _
+                            "Ñèíõðîíèçàöèÿ íåâîçìîæíà. " & _
+                            "Âûçîâèòå çàãðóçêó äàííûõ èç ÁÄ.", _
+                            vbExclamation
+
+                        Save_JOIN = MACRO_FAILED
+                        Exit Function
+
+                    End If
+
+                End If
+
+            End If
+
+        Next cellID
+
+    End If
+
+    WriteCollectionToListObject joinTable, parentRows
+    WriteCollectionToListObject joinSourceDataTable, childRows
+
+
+    Dim syncResult As String
+    syncResult = RunStudySync("save", studies:="JOIN", taskStatus:=taskStatus)
+
+    If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
+
+        Call DeleteEmptyRowsByColumns( _
+            joinSourceDataTable, _
+            COL_ROW_ID_DB, _
+            Array(COL_MIX_SAMPLE_CODE_DB) _
+        )
+
+        Call Load_JOIN_results_to_forms("by_key", Array(COL_RESULT_ID_DB, COL_ROW_ID_DB))
+
+        newHashResult = CalculateCurrentJOINHash()
+        Call SetWorkbookMetadataProperty(wb, PROP_JOIN_DATA_HASH, newHashResult, False)
+        Call SetWorkbookMetadataProperty(wb, PROP_JOIN_LAST_WORKFLOW_STAGE, EffectiveWorkflowStage(taskStatus), False)
+        SetStudySyncStatus wb, PROP_JOIN_DATA_STATE, SYNC_STATUS_SYNCED, False
+        ClearStudyHashCheck wb, "JOIN"
+    Else
+        MsgBox "Ñèíõðîíèçàöèÿ JOIN íå ïîäòâåðæäåíà êàê óñïåøíàÿ." & vbCrLf & vbCrLf & syncResult, vbExclamation
+        Exit Function
+    End If
+
+    Save_JOIN = MACRO_CHANGED
+    Exit Function
+
+ErrHandler:
+    Debug.Print Err.Number & ": " & Err.Description
+    Save_JOIN = MACRO_FAILED
+End Function
+
+Public Function CalculateCurrentJOINHash() As String
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim data As Object
+    Set data = Build_JOIN_HashData(wb)
+
+    CalculateCurrentJOINHash = CalculateDataHash(data)
+
+End Function
+
+
+Private Function Build_JOIN_HashData( _
+    ByVal wb As Workbook _
+) As Object
+
+    Dim data As Object
+    Set data = CreateObject("Scripting.Dictionary")
+
+    Dim sheetJOIN As Worksheet
+    Set sheetJOIN = wb.Worksheets("JOIN")
+
+    Dim joinTable As ListObject
+    Set joinTable = _
+        wb.Worksheets("Join_results") _
+          .ListObjects("Join_results")
+
+    Dim i As Long
+    Dim formIndex As Long
+
+    i = 1
+    formIndex = 0
+
+    Do While NamedRangeExists(wb, "JOIN_" & i & "_sampleCode")
+
+        If sheetJOIN.Range( _
+            "JOIN_" & i & "_TaskId" _
+        ).Interior.ColorIndex = 3 Then
+            GoTo NextForm
+        End If
+
+        If Get_JOIN_FormState(i) <> JOIN_FORM_FILLED Then
+            GoTo NextForm
+        End If
+
+        formIndex = formIndex + 1
+
+        ' Ðîäèòåëüñêèå ïîëÿ.
+        Dim headerCell As Range
+        Dim headerName As String
+        Dim rangeName As String
+        Dim formatValue As Variant
+
+        For Each headerCell In joinTable.HeaderRowRange.Cells
+
+            headerName = CStr(headerCell.value)
+
+            Select Case headerName
+
+                Case COL_DATE_TIME_SYNC_DB, _
+                     COL_RESULT_ID_DB
+
+                    ' Ñëóæåáíûå ïîëÿ íå õåøèðóåì.
+
+                Case Else
+
+                    rangeName = _
+                        "JOIN_" & i & "_" & headerName
+
+                    If NamedRangeExists(wb, rangeName) Then
+
+                        formatValue = FormatValueForSyncText( _
+                            headerName, _
+                            sheetJOIN.Range(rangeName).value _
+                        )
+
+                    Else
+                        formatValue = vbNullString
+                    End If
+
+                    data.Add _
+                        formIndex & "." & headerName, _
+                        formatValue
+
+            End Select
+
+        Next headerCell
+
+        ' Äî÷åðíèå ñòðîêè.
+        Dim srcTable As ListObject
+        Set srcTable = _
+            sheetJOIN.ListObjects("JOIN_source_" & i)
+
+        Dim x As Long
+        Dim sourceIndex As Long
+
+        sourceIndex = 0
+
+        For x = 1 To srcTable.ListRows.count
+
+            If SourceRowHasData( _
+                srcTable, _
+                x, _
+                Array(COL_MIX_SAMPLE_CODE_FORM), _
+                Array("AND") _
+            ) Then
+
+                sourceIndex = sourceIndex + 1
+
+                formatValue = FormatValueForSyncText( _
+                    COL_MIX_SAMPLE_CODE_DB, _
+                    srcTable.DataBodyRange.Cells( _
+                        x, _
+                        srcTable.ListColumns( _
+                            COL_MIX_SAMPLE_CODE_FORM _
+                        ).index _
+                    ).value _
+                )
+
+                data.Add _
+                    formIndex & "." & _
+                    COL_MIX_SAMPLE_CODE_DB & "." & _
+                    sourceIndex, _
+                    formatValue
+
+                formatValue = FormatValueForSyncText( _
+                    COL_DEPLETED_DB, _
+                    srcTable.DataBodyRange.Cells( _
+                        x, _
+                        srcTable.ListColumns( _
+                            COL_DEPLETED_FORM _
+                        ).index _
+                    ).value _
+                )
+
+                data.Add _
+                    formIndex & "." & _
+                    COL_DEPLETED_DB & "." & _
+                    sourceIndex, _
+                    formatValue
+
+            End If
+
+        Next x
+
+NextForm:
+        i = i + 1
+
+    Loop
+
+    Set Build_JOIN_HashData = data
+
+End Function
+
+Private Function Validate_JOIN_Form( _
+    ByVal formIndex As Long _
+) As Boolean
+
+    Validate_JOIN_Form = False
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetJOIN As Worksheet
+    Set sheetJOIN = wb.Worksheets("JOIN")
+
+    Dim resultTable As ListObject
+    Set resultTable = _
+        wb.Worksheets("Join_results") _
+          .ListObjects("Join_results")
+
+    Dim errors As String
+    Dim errorCount As Long
+
+    If formIndex <= 0 Then
+        MsgBox _
+            "Íåêîððåêòíûé íîìåð ôîðìû JOIN: " & formIndex, _
+            vbExclamation
+        Exit Function
+    End If
+
+    If Not NamedRangeExists( _
+        wb, _
+        "JOIN_" & formIndex & "_sampleCode" _
+    ) Or Not ListObjectExists( _
+        sheetJOIN, _
+        "JOIN_source_" & formIndex _
+    ) Then
+
+        MsgBox _
+            "Ôîðìà JOIN_" & formIndex & " íå íàéäåíà.", _
+            vbExclamation
+
+        Exit Function
+    End If
+
+
+    ' =============================================================
+    ' ÏÎËß ÎÑÍÎÂÍÎÉ ÔÎÐÌÛ
+    ' =============================================================
+
+    Dim headerCell As Range
+    Dim rng As Range
+
+    Dim fieldName As String
+    Dim fieldCaption As String
+    Dim rangeName As String
+
+    Dim fieldValue As Variant
+    Dim valueText As String
+
+    For Each headerCell In resultTable.HeaderRowRange.Cells
+
+        fieldName = CStr(headerCell.value)
+
+        If fieldName = COL_DATE_TIME_SYNC_DB Then
+            GoTo next_header
+        End If
+
+        rangeName = _
+            "JOIN_" & formIndex & "_" & fieldName
+
+        If Not NamedRangeExists(wb, rangeName) Then
+
+            AddValidationError _
+                errors, _
+                errorCount, _
+                "Íå íàéäåí èìåíîâàííûé äèàïàçîí: " & rangeName
+
+            GoTo next_header
+        End If
+
+        Set rng = _
+            wb.Names(rangeName) _
+              .RefersToRange.Cells(1, 1)
+
+        ClearValidationFill rng
+
+        fieldValue = rng.value
+        fieldCaption = JOIN_FieldCaption(fieldName)
+
+        If IsError(fieldValue) Then
+
+            AddValidationError _
+                errors, _
+                errorCount, _
+                rangeName & _
+                " ñîäåðæèò îøèáêó Excel: " & rng.text & _
+                " (" & rng.Worksheet.name & _
+                "!" & rng.Address(False, False) & ")", _
+                rng
+
+            GoTo next_header
+        End If
+
+        valueText = Trim$(CStr(fieldValue))
+
+
+        ' =========================================================
+        ' ÃÐÓÏÏÀ 1. ÎÁßÇÀÒÅËÜÍÛÅ ÏÎËß
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case "sampleCode", _
+                 COL_OPERATOR_DB, _
+                 COL_DATE_DB, _
+                 COL_EQUIPMENT_DB, _
+                 COL_EQUIPMENT_NUMBER_DB, _
+                 COL_PREPARATION_PRESSURE_DB, _
+                 COL_PRESSURE_UNIT_DB, _
+                 COL_PREPARATION_TEMP_DB, _
+                 COL_PREPARATION_PRES_MPA_DB
+
+                If valueText = "" Then
+
+                    AddValidationError _
+                        errors, _
+                        errorCount, _
+                        "Íå çàïîëíåíî îáÿçàòåëüíîå ïîëå """ & _
+                        fieldCaption & """: " & rangeName, _
+                        rng
+
+                End If
+
+        End Select
+
+
+        ' =========================================================
+        ' ÃÐÓÏÏÀ 2. ×ÈÑËÎÂÛÅ ÏÎËß
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_RESULT_ID_DB, _
+                 COL_TASK_ID_DB, _
+                 COL_PREPARATION_PRESSURE_DB, _
+                 COL_PREPARATION_TEMP_DB, _
+                 COL_PREPARATION_PRES_MPA_DB
+
+                If valueText <> "" Then
+
+                    If Not IsNumeric(fieldValue) Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Ïîëå """ & fieldCaption & _
+                            """ äîëæíî ñîäåðæàòü ÷èñëî: " & _
+                            rangeName, _
+                            rng
+
+                    ElseIf fieldName = COL_TASK_ID_DB Then
+
+                        If CDbl(fieldValue) <> Fix(CDbl(fieldValue)) Then
+
+                            AddValidationError _
+                                errors, _
+                                errorCount, _
+                                "Ïîëå """ & fieldCaption & _
+                                """ äîëæíî ñîäåðæàòü öåëîå ÷èñëî: " & _
+                                rangeName, _
+                                rng
+
+                        ElseIf CDbl(fieldValue) > 0 Then
+
+                            Dim taskCheckResult As String
+
+                            taskCheckResult = _
+                                CheckJOINTask( _
+                                    CLng(fieldValue), _
+                                    formIndex _
+                                )
+
+                            If taskCheckResult <> "OK" Then
+
+                                AddValidationError _
+                                    errors, _
+                                    errorCount, _
+                                    taskCheckResult, _
+                                    rng
+
+                            End If
+
+                        End If
+
+                    End If
+
+                End If
+
+        End Select
+
+
+        ' =========================================================
+        ' ÃÐÓÏÏÀ 3. ÖÅËÛÅ ×ÈÑËÀ
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_RESULT_ID_DB
+
+                If valueText <> "" _
+                   And IsNumeric(fieldValue) Then
+
+                    If CDbl(fieldValue) <> _
+                       Fix(CDbl(fieldValue)) Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Ïîëå """ & fieldCaption & _
+                            """ äîëæíî ñîäåðæàòü öåëîå ÷èñëî: " & _
+                            rangeName, _
+                            rng
+
+                    End If
+
+                End If
+
+        End Select
+
+
+        ' =========================================================
+        ' ÃÐÓÏÏÀ 4. ÍÅÎÒÐÈÖÀÒÅËÜÍÛÅ ×ÈÑËÀ
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_RESULT_ID_DB, _
+                 COL_TASK_ID_DB, _
+                 COL_PREPARATION_PRESSURE_DB, _
+                 COL_PREPARATION_PRES_MPA_DB
+
+                If valueText <> "" _
+                   And IsNumeric(fieldValue) Then
+
+                    If CDbl(fieldValue) < 0 Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Ïîëå """ & fieldCaption & _
+                            """ íå ìîæåò áûòü îòðèöàòåëüíûì: " & _
+                            rangeName, _
+                            rng
+
+                    End If
+
+                End If
+
+        End Select
+
+
+        ' =========================================================
+        ' ÃÐÓÏÏÀ 5. ÄÀÒÀ
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_DATE_DB
+
+                If valueText <> "" Then
+
+                    If Not IsDate(fieldValue) Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Çíà÷åíèå ïîëÿ """ & fieldCaption & _
+                            """ íåâîçìîæíî ïðåîáðàçîâàòü â äàòó: " & _
+                            rangeName, _
+                            rng
+
+                    End If
+
+                End If
+
+        End Select
+
+
+        ' =========================================================
+        ' ÃÐÓÏÏÀ 6. ÈÑÏÎËÍÈÒÅËÜ
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_OPERATOR_DB
+
+                If valueText <> "" Then
+
+                    If Not IsValidExecutor(fieldValue) Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Íåâåðíî óêàçàí èñïîëíèòåëü: " & _
+                            rangeName, _
+                            rng
+
+                    End If
+
+                End If
+
+        End Select
+
+
+        ' =========================================================
+        ' ÃÐÓÏÏÀ 7. BOOLEAN
+        ' =========================================================
+
+        Select Case fieldName
+
+            Case COL_ABSULUTE_PRESSURE_DB, _
+                 COL_COMPLETE_FWC_DB
+
+                If valueText <> "" Then
+
+                    If VarType(fieldValue) <> vbBoolean Then
+
+                        AddValidationError _
+                            errors, _
+                            errorCount, _
+                            "Ïîëå """ & fieldCaption & _
+                            """ äîëæíî ñîäåðæàòü True/False: " & _
+                            rangeName, _
+                            rng
+
+                    End If
+
+                End If
+
+        End Select
+
+
+next_header:
+    Next headerCell
+
+
+    ' =============================================================
+    ' ÒÀÁËÈÖÀ JOIN_SOURCE_N
+    ' =============================================================
+
+    Dim sourceTable As ListObject
+    Dim sourceTableName As String
+
+    sourceTableName = _
+        "JOIN_source_" & formIndex
+
+    Set sourceTable = _
+        sheetJOIN.ListObjects(sourceTableName)
+
+    If Not ListColumnExists(sourceTable, COL_ROW_ID_DB) _
+       Or Not ListColumnExists(sourceTable, COL_MIX_SAMPLE_CODE_FORM) _
+       Or Not ListColumnExists(sourceTable, COL_DEPLETED_FORM) Then
+
+        AddValidationError _
+            errors, _
+            errorCount, _
+            "Â òàáëèöå " & sourceTableName & _
+            " íå íàéäåíû îáÿçàòåëüíûå ñòîëáöû."
+
+        GoTo after_source_validation
+
+    End If
+
+    If sourceTable.DataBodyRange Is Nothing Then
+
+        AddValidationError _
+            errors, _
+            errorCount, _
+            "Òàáëèöà " & sourceTableName & _
+            " íå ñîäåðæèò ñòðîê."
+
+        GoTo after_source_validation
+
+    End If
+
+
+    ' =============================================================
+    ' ÏÐÎÂÅÐÊÀ ÑÒÐÎÊ SOURCE
+    ' =============================================================
+
+    Dim mixCol As Long
+    Dim depletedCol As Long
+
+    mixCol = _
+        sourceTable.ListColumns( _
+            COL_MIX_SAMPLE_CODE_FORM _
+        ).index
+
+    depletedCol = _
+        sourceTable.ListColumns( _
+            COL_DEPLETED_FORM _
+        ).index
+
+    Dim mixCell As Range
+    Dim depletedCell As Range
+
+    Dim mixValue As Variant
+    Dim depletedValue As Variant
+
+    Dim mixText As String
+    Dim filledMixCount As Long
+    Dim rowIndex As Long
+
+    For rowIndex = 1 To sourceTable.ListRows.count
+
+        Set mixCell = _
+            sourceTable.DataBodyRange.Cells( _
+                rowIndex, _
+                mixCol _
+            )
+
+        Set depletedCell = _
+            sourceTable.DataBodyRange.Cells( _
+                rowIndex, _
+                depletedCol _
+            )
+
+        ClearValidationFill mixCell
+        ClearValidationFill depletedCell
+
+        mixValue = mixCell.value
+        depletedValue = depletedCell.value
+
+
+        ' ---------------------------------------------------------
+        ' ØÈÔÐ ÏÐÎÁÛ
+        ' ---------------------------------------------------------
+
+        If IsError(mixValue) Then
+
+            AddValidationError _
+                errors, _
+                errorCount, _
+                sourceTableName & _
+                ", ñòðîêà " & rowIndex & _
+                ": øèôð ïðîáû ñîäåðæèò îøèáêó Excel.", _
+                mixCell
+
+            GoTo next_source_row
+
+        End If
+
+        mixText = Trim$(CStr(mixValue))
+
+
+        ' ---------------------------------------------------------
+        ' ÏÐÎÁÀ ÈÇÐÀÑÕÎÄÎÂÀÍÀ
+        ' ---------------------------------------------------------
+
+        If IsError(depletedValue) Then
+
+            AddValidationError _
+                errors, _
+                errorCount, _
+                sourceTableName & _
+                ", ñòðîêà " & rowIndex & _
+                ": ïîëå ""Ïðîáà èçðàñõîäîâàíà"" " & _
+                "ñîäåðæèò îøèáêó Excel.", _
+                depletedCell
+
+            GoTo next_source_row
+
+        End If
+
+
+        If mixText <> "" Then
+
+            filledMixCount = filledMixCount + 1
+
+            If VarType(depletedValue) <> vbBoolean Then
+
+                AddValidationError _
+                    errors, _
+                    errorCount, _
+                    sourceTableName & _
+                    ", ñòðîêà " & rowIndex & _
+                    ": ïîëå ""Ïðîáà èçðàñõîäîâàíà"" " & _
+                    "äîëæíî ñîäåðæàòü True/False.", _
+                    depletedCell
+
+            End If
+
+        Else
+
+            ' Åñëè øèôðà íåò, íî ïîëüçîâàòåëü óñòàíîâèë
+            ' ôëàã "Ïðîáà èçðàñõîäîâàíà", ñòðîêà íåêîððåêòíà.
+            If VarType(depletedValue) = vbBoolean Then
+
+                If CBool(depletedValue) Then
+
+                    AddValidationError _
+                        errors, _
+                        errorCount, _
+                        sourceTableName & _
+                        ", ñòðîêà " & rowIndex & _
+                        ": óñòàíîâëåí ïðèçíàê ""Ïðîáà èçðàñõîäîâàíà"", " & _
+                        "íî íå óêàçàí øèôð ïðîáû.", _
+                        mixCell
+
+                End If
+
+            End If
+
+        End If
+
+
+next_source_row:
+    Next rowIndex
+
+
+    ' =============================================================
+    ' ÄÎËÆÍÎ ÁÛÒÜ ÌÈÍÈÌÓÌ ÄÂÅ ÏÐÎÁÛ
+    ' =============================================================
+
+    If filledMixCount < 2 Then
+
+        AddValidationError _
+            errors, _
+            errorCount, _
+            "Â òàáëèöå " & sourceTableName & _
+            " äîëæíî áûòü óêàçàíî ìèíèìóì äâå ïðîáû äëÿ îáúåäèíåíèÿ."
+
+    End If
+
+
+after_source_validation:
+
+    If errorCount > 0 Then
+
+        MsgBox _
+            "JOIN_" & formIndex & _
+            " íå ñîõðàíåíà. Èñïðàâüòå îøèáêè:" & _
+            vbCrLf & vbCrLf & errors, _
+            vbExclamation
+
+        Exit Function
+
+    End If
+
+    Validate_JOIN_Form = True
+
+End Function
+
+Private Function JOIN_FieldCaption( _
+    ByVal fieldName As String _
+) As String
+
+    Select Case fieldName
+
+        Case COL_RESULT_ID_DB
+            JOIN_FieldCaption = "Íîìåð ðåçóëüòàòà"
+
+        Case COL_TASK_ID_DB
+            JOIN_FieldCaption = "Íîìåð çàäàíèÿ"
+
+        Case "sampleCode"
+            JOIN_FieldCaption = "Øèôð ïðîáû"
+
+        Case COL_OPERATOR_DB
+            JOIN_FieldCaption = "Èñïîëíèòåëü"
+
+        Case COL_DATE_DB
+            JOIN_FieldCaption = "Äàòà"
+
+        Case COL_EQUIPMENT_DB
+            JOIN_FieldCaption = "Îáîðóäîâàíèå"
+
+        Case COL_EQUIPMENT_NUMBER_DB
+            JOIN_FieldCaption = "Íîìåð îáîðóäîâàíèÿ"
+
+        Case COL_PREPARATION_PRESSURE_DB
+            JOIN_FieldCaption = "Äàâëåíèå âîññòàíîâëåíèÿ"
+
+        Case COL_ABSULUTE_PRESSURE_DB
+            JOIN_FieldCaption = "Äàâëåíèå àáñîëþòíîå"
+
+        Case COL_PRESSURE_UNIT_DB
+            JOIN_FieldCaption = "Åäèíèöà èçìåðåíèÿ äàâëåíèÿ"
+
+        Case COL_PREPARATION_TEMP_DB
+            JOIN_FieldCaption = "Òåìïåðàòóðà âîññòàíîâëåíèÿ"
+
+        Case COL_PREPARATION_PRES_MPA_DB
+            JOIN_FieldCaption = "Äàâëåíèå ïîäãîòîâêè, ÌÏà"
+
+        Case COL_COMPLETE_FWC_DB
+            JOIN_FieldCaption = "Âûïîëíåíî FWC"
+
+        Case Else
+            JOIN_FieldCaption = fieldName
+
+    End Select
+
+End Function
+
+Private Function CheckJOINTask( _
+    ByVal taskId As Long, _
+    ByVal pageNumber As Long _
+) As String
+
+    Dim tasks As ListObject
+    Set tasks = _
+        ActiveWorkbook.Worksheets("Task") _
+            .ListObjects(1)
+
+    Dim taskCheck As Range
+
+    Set taskCheck = _
+        tasks.ListColumns("Íîìåð çàäàíèÿ") _
+            .DataBodyRange.Find( _
+                What:=taskId, _
+                LookAt:=xlWhole, _
+                SearchOrder:=xlByColumns _
+            )
+
+    If taskCheck Is Nothing Then
+
+        CheckJOINTask = _
+            "Óêàçàí íåèçâåñòíûé íîìåð çàäàíèÿ " & _
+            taskId & _
+            " íà ñòðàíèöå " & pageNumber & _
+            ". Ïîïðîáóéòå îáíîâèòü äàííûå ïðîåêòà " & _
+            "èëè èñïðàâüòå çíà÷åíèå."
+
+        Exit Function
+
+    End If
+
+    Dim taskRowIndex As Long
+    taskRowIndex = _
+        taskCheck.row _
+        - tasks.DataBodyRange.row _
+        + 1
+
+    Dim taskType As String
+
+    taskType = Trim$(CStr( _
+        tasks.ListColumns("Çàäàíèå") _
+            .DataBodyRange.Cells( _
+                taskRowIndex, _
+                1 _
+            ).value _
+    ))
+
+    If StrComp( _
+        taskType, _
+        "JOIN", _
+        vbTextCompare _
+    ) <> 0 Then
+
+        CheckJOINTask = _
+            "Óêàçàí íåâåðíûé íîìåð çàäàíèÿ " & _
+            taskId & _
+            " íà ñòðàíèöå " & pageNumber & _
+            ". Óêàçàííîå çàäàíèå èìååò òèï """ & _
+            taskType & _
+            """, îæèäàåòñÿ JOIN."
+
+        Exit Function
+
+    End If
+
+    CheckJOINTask = "OK"
+
+End Function
+
+Public Function Load_JOIN_results_to_forms( _
+    Optional ByVal mode As String = "sequential", _
+    Optional ByVal fields As Variant, _
+    Optional ByVal silence As Boolean = False _
+) As String
+
+    On Error GoTo CleanFail
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetJOIN As Worksheet
+    Set sheetJOIN = wb.Worksheets("JOIN")
+
+    Dim resultTable As ListObject
+    Set resultTable = wb.Worksheets("Join_results").ListObjects("Join_results")
+
+    Dim sourceTable As ListObject
+    Set sourceTable = wb.Worksheets("Join_sourceData").ListObjects("Join_sourceData")
+
+    Dim fieldFilter As Object
+    Set fieldFilter = BuildFieldFilter(fields)
+
+    Dim text As String
+    Dim warnText As String
+
+    mode = LCase$(Trim$(mode))
+    If mode = "" Then mode = "sequential"
+
+    If mode <> "by_key" And mode <> "sequential" Then
+        text = "ERROR|mode äîëæåí áûòü 'by_key' èëè 'sequential'"
+        Load_JOIN_results_to_forms = text
+
+        If Not silence Then
+            MsgBox text, vbExclamation
+        End If
+
+        Exit Function
+    End If
+
+    If resultTable.DataBodyRange Is Nothing Then
+        text = "OK|Òàáëèöà Join_results ïóñòàÿ."
+        Load_JOIN_results_to_forms = text
+
+        If Not silence Then
+            MsgBox text, vbInformation
+        End If
+
+        Exit Function
+    End If
+
+    Dim resultRowIndex As Long
+    Dim formIndex As Long
+    Dim notFoundCount As Long
+
+    For resultRowIndex = 1 To resultTable.ListRows.count
+
+        If mode = "sequential" Then
+            formIndex = resultRowIndex
+            EnsureJOINFormExists wb, formIndex
+        Else
+            formIndex = FindFormIndexForResultRow( _
+                wb, _
+                sheetJOIN, _
+                resultTable, _
+                resultRowIndex, _
+                "JOIN", _
+                Array("sampleCode", COL_TASK_ID_DB) _
+            )
+        End If
+
+        If formIndex = 0 Or _
+           Not NamedRangeExists(wb, "JOIN_" & formIndex & "_sampleCode") Then
+
+            notFoundCount = notFoundCount + 1
+
+            warnText = warnText & _
+                "Íå íàéäåíà ôîðìà äëÿ ñòðîêè Join_results #" & _
+                resultRowIndex & vbCrLf & _
+                "sampleCode = " & _
+                GetTableValue(resultTable, resultRowIndex, "sampleCode") & vbCrLf & _
+                "TaskId = " & _
+                GetTableValue(resultTable, resultRowIndex, COL_TASK_ID_DB) & _
+                vbCrLf & vbCrLf
+
+            GoTo NextResultRow
+        End If
+
+        FillOneJOINFormFromResultRow _
+            wb, _
+            sheetJOIN, _
+            resultTable, _
+            sourceTable, _
+            resultRowIndex, _
+            formIndex, _
+            fieldFilter
+
+NextResultRow:
+    Next resultRowIndex
+
+    If notFoundCount = 0 Then
+        text = "OK|Äàííûå JOIN ïåðåíåñåíû â ôîðìû."
+        Load_JOIN_results_to_forms = text
+
+        If Not silence Then
+            MsgBox text, vbInformation
+        End If
+    Else
+        text = _
+            "WARN|Äàííûå JOIN ïåðåíåñåíû ÷àñòè÷íî. " & _
+            "Íå íàéäåíî ôîðì: " & notFoundCount & _
+            vbCrLf & warnText
+
+        Load_JOIN_results_to_forms = text
+
+        If Not silence Then
+            MsgBox text, vbExclamation
+        End If
+    End If
+
+    Exit Function
+
+CleanFail:
+    text = _
+        "ERROR|" & _
+        CStr(Err.Number) & "|" & _
+        Err.Description
+
+    Load_JOIN_results_to_forms = text
+
+    If Not silence Then
+        MsgBox text, vbCritical
+    End If
+
+End Function
+
+Private Sub EnsureJOINFormExists( _
+    ByVal wb As Workbook, _
+    ByVal formIndex As Long _
+)
+
+    Do While Not NamedRangeExists(wb, "JOIN_" & formIndex & "_sampleCode")
+        Call AddFormJOIN
+    Loop
+
+End Sub
+
+Public Function FindEmptyFormJOIN() As Long
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetJOIN As Worksheet
+    Set sheetJOIN = wb.Worksheets("JOIN")
+
+    Dim formIndex As Long
+    formIndex = 1
+
+    Do While NamedRangeExists(wb, "JOIN_" & formIndex & "_sampleCode")
+
+        If Get_JOIN_FormState(formIndex) = JOIN_FORM_EMPTY Then
+            FindEmptyFormJOIN = formIndex
+            Exit Function
+        End If
+
+        formIndex = formIndex + 1
+
+    Loop
+
+    Call AddFormJOIN
+
+    FindEmptyFormJOIN = formIndex
+
+End Function
+
+Private Sub FillOneJOINFormFromResultRow( _
+    ByVal wb As Workbook, _
+    ByVal sheetJOIN As Worksheet, _
+    ByVal resultTable As ListObject, _
+    ByVal sourceTable As ListObject, _
+    ByVal resultRowIndex As Long, _
+    ByVal formIndex As Long, _
+    ByVal fieldFilter As Object _
+)
+
+    Dim resultId As Variant
+    resultId = GetTableValue(resultTable, resultRowIndex, COL_RESULT_ID_DB)
+
+    Call CopyTableRowToNamedRanges( _
+        wb, _
+        sheetJOIN, _
+        resultTable, _
+        resultRowIndex, _
+        "JOIN", _
+        formIndex, _
+        fieldFilter _
+    )
+
+    If Len(NormalizeKeyValue(resultId)) > 0 Then
+        FillJOINSourceTableFromSourceData sheetJOIN, sourceTable, formIndex, resultId, fieldFilter
+    End If
+
+End Sub
+
+
+Private Sub FillJOINSourceTableFromSourceData( _
+    ByVal sheetJOIN As Worksheet, _
+    ByVal sourceTable As ListObject, _
+    ByVal formIndex As Long, _
+    ByVal resultId As Variant, _
+    ByVal fieldFilter As Object _
+)
+
+    Dim formSourceTable As ListObject
+    Set formSourceTable = sheetJOIN.ListObjects("JOIN_source_" & formIndex)
+
+    If formSourceTable.DataBodyRange Is Nothing Then
+        MsgBox "Â òàáëèöå JOIN_source_" & formIndex & " íåò ñòðîê äëÿ çàãðóçêè äàííûõ.", vbExclamation
+        Exit Sub
+    End If
+
+    Call ClearMappedColumnsInTable( _
+        formSourceTable, _
+        JOINSourceLoadMappings(), _
+        fieldFilter _
+    )
+
+    Call CopyMatchingTableRowsToTableRows( _
+        sourceTable, _
+        formSourceTable, _
+        COL_RESULT_ID_CHILD_DB, _
+        resultId, _
+        JOINSourceLoadMappings(), _
+        fieldFilter _
+    )
+
+End Sub
+
+Private Function JOINSourceMappings() As Variant
+
+    JOINSourceMappings = Array( _
+        Array(COL_MIX_SAMPLE_CODE_DB, COL_MIX_SAMPLE_CODE_FORM), _
+        Array(COL_DEPLETED_DB, COL_DEPLETED_FORM) _
+    )
+
+End Function
+
+Private Function JOINSourceLoadMappings() As Variant
+
+    JOINSourceLoadMappings = Array( _
+        Array(COL_ROW_ID_DB, COL_ROW_ID_DB), _
+        Array(COL_MIX_SAMPLE_CODE_DB, COL_MIX_SAMPLE_CODE_FORM), _
+        Array(COL_DEPLETED_DB, COL_DEPLETED_FORM) _
+    )
+
+End Function
+
+Sub equipmentModelsRefreshJOIN()
+
+    Dim sheetJOIN As Worksheet
+    Set sheetJOIN = ActiveWorkbook.Sheets("JOIN")
+    
+    Dim eq() As String
+    
+    eq = getEquipmentModels("", "PVTCell")
+    Dim strEq As String
+    strEq = eq(1)
+    
+    Dim i As Long
+    
+    For i = 2 To UBound(eq)
+        strEq = strEq & "," & eq(i)
+    Next i
+    
+    Dim CellTS As Range
+    i = 1
+    
+    On Error Resume Next
+    Do While True
+        Set CellTS = Nothing
+        Set CellTS = sheetJOIN.Range("JOIN_" & i & "_equipment")
+        If CellTS Is Nothing Then Exit Do
+        
+        With CellTS.Validation
+            .Delete
+            .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:= _
+            xlBetween, Formula1:=strEq
+            .IgnoreBlank = True
+            .InCellDropdown = True
+            .ShowInput = True
+            .ShowError = True
+        End With
+        i = i + 1
+    Loop
+    On Error GoTo 0
+    
+End Sub
+
+Private Function Get_JOIN_FormState(ByVal formIndex As Long) As JOINFormState
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetJOIN As Worksheet
+    Set sheetJOIN = wb.Worksheets("JOIN")
+
+    If formIndex <= 0 Then
+        Get_JOIN_FormState = JOIN_FORM_RESERVED
+        Exit Function
+    End If
+
+    If Not NamedRangeExists(wb, "JOIN_" & formIndex & "_sampleCode") Then
+        Get_JOIN_FormState = JOIN_FORM_RESERVED
+        Exit Function
+    End If
+
+    Dim sampleCode As String
+    sampleCode = Trim$(CStr(sheetJOIN.Range("JOIN_" & formIndex & "_sampleCode").value))
+
+    Dim hasSampleCode As Boolean
+    hasSampleCode = (sampleCode <> "")
+
+    Dim filledMixRowsCount As Long
+    filledMixRowsCount = JOIN_CountFilledMixSampleRows(formIndex)
+
+    Dim hasEnoughMixSamples As Boolean
+    hasEnoughMixSamples = (filledMixRowsCount >= 2)
+
+    ' Ïóñòàÿ ôîðìà:
+    ' - sampleCode ïóñòîé
+    ' - â JOIN_source_N ìåíüøå äâóõ çàïîëíåííûõ ñòðîê â ñòîëáöå
+    '   "Øèôð ïðîáû äëÿ îáúåäèíåíèÿ"
+    If Not hasSampleCode And Not hasEnoughMixSamples Then
+        Get_JOIN_FormState = JOIN_FORM_EMPTY
+        Exit Function
+    End If
+
+    ' Çàïîëíåííàÿ ôîðìà:
+    ' - sampleCode çàïîëíåí
+    ' - åñòü ìèíèìóì 2 ïðîáû äëÿ îáúåäèíåíèÿ
+    If hasSampleCode And hasEnoughMixSamples Then
+        Get_JOIN_FormState = JOIN_FORM_FILLED
+        Exit Function
+    End If
+
+    ' Âñ¸ ïðîìåæóòî÷íîå:
+    ' - sampleCode åñòü, íî ïðîá ìåíüøå äâóõ
+    ' - sampleCode íåò, íî ïðîáû óæå âíåñåíû
+    Get_JOIN_FormState = JOIN_FORM_RESERVED
+
+End Function
+
+Private Function JOIN_CountFilledMixSampleRows(ByVal formIndex As Long) As Long
+
+    JOIN_CountFilledMixSampleRows = 0
+
+    Dim wb As Workbook
+    Set wb = ActiveWorkbook
+
+    Dim sheetJOIN As Worksheet
+    Set sheetJOIN = wb.Worksheets("JOIN")
+
+    If Not ListObjectExists(sheetJOIN, "JOIN_source_" & formIndex) Then
+        Exit Function
+    End If
+
+    Dim srcTable As ListObject
+    Set srcTable = sheetJOIN.ListObjects("JOIN_source_" & formIndex)
+
+    If srcTable.DataBodyRange Is Nothing Then
+        Exit Function
+    End If
+
+    If Not ListColumnExists(srcTable, COL_MIX_SAMPLE_CODE_FORM) Then
+        Exit Function
+    End If
+
+    Dim mixCol As Long
+    mixCol = srcTable.ListColumns(COL_MIX_SAMPLE_CODE_FORM).index
+
+    Dim rowIndex As Long
+    Dim v As Variant
+
+    For rowIndex = 1 To srcTable.ListRows.count
+
+        v = srcTable.DataBodyRange.Cells(rowIndex, mixCol).value
+
+        If IsError(v) Then
+            JOIN_CountFilledMixSampleRows = JOIN_CountFilledMixSampleRows + 1
+        ElseIf Trim$(CStr(v)) <> "" Then
+            JOIN_CountFilledMixSampleRows = JOIN_CountFilledMixSampleRows + 1
+        End If
+
+    Next rowIndex
+
+End Function
+
+Public Function Validate_JOIN() As macroResult
+    Validate_JOIN = Save_JOIN("Âàëèäèðîâàíî")
+End Function
+
+Public Sub Load_JOIN()
+    LoadResearchesFromDB "JOIN"
+End Sub
