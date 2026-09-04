@@ -1,2718 +1,1388 @@
-Option Explicit
+from __future__ import annotations
 
-Private Enum APFormState
-    AP_FORM_EMPTY = 0       ' пустая, не нужна
-    AP_FORM_RESERVED = 1    ' зарезервирована, не сохраняем
-    AP_FORM_FILLED = 2      ' заполнена, можно валидировать и сохранять
-End Enum
+import argparse
+import gc
+import json
+import logging
+import re
+import shutil
+import sys
+import time
+import traceback
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
-Private Const COL_PRESSURE_FORM As String = "Давление, psig"
-Private Const COL_TEMPERATURE_FORM As String = "Температура, °С"
-Private Const COL_DENSITY_FORM As String = "Плотность, г/см3"
-Private Const COL_ACTIVE_FORM As String = "Активна"
-
-Private Const COL_ROW_ID_DB As String = "rowIdAP"
-Private Const COL_RESULT_ID_DB As String = "resultIdAP"
-Private Const COL_PRESSURE_DB As String = "pressure"
-Private Const COL_TEMPERATURE_DB As String = "temperature"
-Private Const COL_DENSITY_DB As String = "density"
-Private Const COL_ACTIVE_DB As String = "active"
-
-Private Const AP_FIRST_FORM_FIRST_COL As Long = 1
-Private Const AP_PAGE_ROW = 11
-Private Const AP_PAGE_FIRST_COL = 4
+import xlwings as xw
 
 
-Public Sub DeleteLastListAP2()
-    
-    Dim sheetAP As Worksheet
-    Set sheetAP = ActiveWorkbook.Worksheets("AP")
-    
-    Dim sheetAPresults As Worksheet
-    Set sheetAPresults = ActiveWorkbook.Worksheets("AP_results")
-    
-    Dim tableResults As ListObject
-    Set tableResults = sheetAPresults.ListObjects("AP_results")
-    
-    Dim lastForm As Long
-    lastForm = sheetAP.ListObjects.count
-    
-    If lastForm <= 2 Then
-        MsgBox "Нельзя удалить 2 первые формы"
-        Exit Sub
-    End If
-    
-    Dim countFormCols As Long
-    countFormCols = sheetAP.Range("AP_2_sampleCode").Column - sheetAP.Range("AP_1_sampleCode").Column
-    
-    Dim firstColLastForm As Long
-    firstColLastForm = AP_FIRST_FORM_FIRST_COL + (lastForm - 1) * countFormCols
-    
-    Dim lastColLastForm As Long
-    lastColLastForm = firstColLastForm + countFormCols - 1
-    
-    Dim headerCell As Range
-    Dim namedRange As String
-    
-    For Each headerCell In tableResults.HeaderRowRange.Cells
-        namedRange = "AP_" & lastForm & "_" & CStr(headerCell.value)
-        
-        If NamedRangeExists(ActiveWorkbook, namedRange) Then
-            ActiveWorkbook.Names(namedRange).Delete
-        End If
-    Next headerCell
-    
-    sheetAP.Range( _
-        sheetAP.columns(firstColLastForm), _
-        sheetAP.columns(lastColLastForm) _
-    ).EntireColumn.Delete
-    
-    Call DeleteCheckBoxesFromColumnRight(sheetAP, firstColLastForm)
+# =============================================================================
+# Настройки
+# =============================================================================
 
-End Sub
+BASE_PROJECTS_DIR = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\Работа\2026"
+CLEAN_V23_TEMPLATE = r"L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\XX-FXXX-XXX-XXX_Форма_v23.0.1.xlsx"
 
-Public Function cancelCurrentTaskAP() As macroResult
-    
-    cancelCurrentTaskAP = MACRO_FAILED
-    
-    Dim wb As Workbook
-    Set wb = ActiveWorkbook
+PROJECT_CELL_SHEET = "OP"
+PROJECT_CELL_ADDRESS = "B6"
 
-    Dim sheetAP As Worksheet
-    Set sheetAP = wb.Worksheets("AP")
-    
-    Dim lenght As Integer
-    lenght = sheetAP.Range("AP_2_sampleCode").Column - sheetAP.Range("AP_1_sampleCode").Column
-    
-    Dim curFormIndex As Integer
-    curFormIndex = (activeCell.Column - AP_FIRST_FORM_FIRST_COL) \ lenght + 1
-    
-    Dim taskCell As Range
-    Set taskCell = sheetAP.Range("AP_" & curFormIndex & "_taskId")
-    
-    Dim answer As Integer
-    
-    answer = MsgBox("Вы действительно хотите удалить задание №" & taskCell.value & "?", vbQuestion + vbYesNo, "Подтверждение")
-    
-    If answer <> vbYes Then
-        cancelCurrentTaskAP = MACRO_NO_CHANGES
-        Exit Function
-    End If
-    
-    Dim comment As String
-    comment = InputBox("Введите причину отмены:", "Окно ввода")
-    
-    If comment = "" Then
-        
-    End If
-    
-    Dim syncResult As String
-    syncResult = SetTaskStatusOnly(taskCell.value, "AP", "Отмена", comment)
+PROJECT_DIR = Path(__file__).resolve().parent
+LOG_PATH = PROJECT_DIR / "migrate_v20_to_v23.log"
 
-    If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
-        With taskCell.MergeArea
-            .Interior.ColorIndex = 3
-            If .Locked = False Then
-                .Locked = True
-            End If
-        End With
-        cancelCurrentTaskAP = MACRO_CHANGED
-    
-    ElseIf syncResult = "NoComment" Or syncResult = "NoTaskId" Then
-    
-        cancelCurrentTaskAP = MACRO_NO_CHANGES
-        
-    End If
-    
-End Function
+STUDIES = ["AP", "BP", "GC", "GOR", "SSF", "OP", "EMV"]
 
-Public Sub AddFormAP()
-    
-    Dim sheetAP As Worksheet
-    Set sheetAP = ActiveWorkbook.Worksheets("AP")
-    
-    Dim lastList As Integer
-    Dim lastColumn As Integer
-    Dim firstColumn As Integer
-    Dim lenght As Integer
-    Dim dataRow As Integer
-    
-    Dim i As Long
-    Dim X As Long
-    Dim oldName As String
-    
-    lenght = sheetAP.Range("AP_2_sampleCode").Column - sheetAP.Range("AP_1_sampleCode").Column
-    lastList = sheetAP.ListObjects.count + 1
-    lastColumn = lastList * lenght
-    firstColumn = lastColumn - lenght + 1
-    dataRow = sheetAP.Range("AP_source_1").row
-    
-    sheetAP.Activate
-    sheetAP.Range(sheetAP.columns(firstColumn - lenght), sheetAP.columns(lastColumn - lenght)).EntireColumn.Select
-    sheetAP.Application.Selection.Copy
-    sheetAP.columns(firstColumn).Select
-    sheetAP.Paste
-    
-    sheetAP.Cells(AP_PAGE_ROW, AP_PAGE_FIRST_COL + firstColumn - AP_FIRST_FORM_FIRST_COL).value = lastList
-    
-    Dim name As String
-    Dim new_name As String
-    Dim prev_src_name As String
-    Dim new_src_name As String
-    
-    name = "AP_" & (lastList - 1)
-    prev_src_name = "AP_source_" & (lastList - 1)
-    new_name = "AP_" & lastList
-    new_src_name = "AP_source_" & lastList
-    
-    Dim TableAPResult As ListObject
-    Set TableAPResult = ActiveWorkbook.Worksheets("AP_results").ListObjects("AP_results")
-    
-    Dim name_rng As Range
+UNPROTECT_PASSWORDS = ("1984", "9184", "")
+PROTECT_PASSWORD = "1984"
 
-    For Each name_rng In TableAPResult.HeaderRowRange
-        If name_rng.value = "dateTimeSync" Then
-            GoTo cont
-        End If
-        
-        Dim current As Range
-        oldName = name & "_" & name_rng.value
-        
-        Set current = sheetAP.Cells(sheetAP.Range(oldName).row, sheetAP.Range(oldName).Column + lenght)
-        current.name = Replace(oldName, name, new_name)
-        
-        If Not current.HasFormula Then
-            current.value = ""
-        Else
-            If current.HasArray Then
-                current.FormulaArray = Replace(current.FormulaArray, "_" & (lastList - 1), "_" & lastList)
-            Else
-                current.Formula = Replace(current.Formula, "_" & (lastList - 1), "_" & lastList)
-            End If
-        End If
-cont:
-    Next name_rng
-    
-    Dim xTable As ListObject
-    
-    For i = sheetAP.ListObjects.count To 1 Step -1
-        Set xTable = sheetAP.ListObjects(i)
-        
-        If xTable.name Like name & "##*" Then
-            xTable.name = new_name
-            
-            For X = 1 To xTable.ListRows.count
-                xTable.ListRows(1).Delete
-            Next X
-            
-            Exit For
-        End If
-    Next i
-    
-    For i = sheetAP.ListObjects.count To 1 Step -1
-        Set xTable = sheetAP.ListObjects(i)
-        
-        If xTable.name Like prev_src_name & "##*" Then
-            xTable.name = new_src_name
-            Exit For
-        End If
-    Next i
-        
-    ' находим столбцы данных давления, температуры, вязкости
-    Dim PCol As Integer
-    Dim VCol As Integer
-    Dim TCol As Integer
-    
-    PCol = xTable.ListColumns("VPR P").Range.Column
-    VCol = xTable.ListColumns("VPR d").Range.Column
-    TCol = xTable.ListColumns("VPR T").Range.Column
-    
-    ' создаем именованные диапазоны
-    ActiveWorkbook.Names.Add name:=new_name & "_P", RefersToR1C1:= _
-        "=OFFSET(AP!R" & dataRow & "C" & PCol & ", 0, 0, COUNT(" & new_src_name & "[VPR P]), 1)"
-        
-    ActiveWorkbook.Names.Add name:=new_name & "_d", RefersToR1C1:= _
-        "=OFFSET(AP!R" & dataRow & "C" & VCol & ", 0, 0, COUNT(" & new_src_name & "[VPR d]), 1)"
-        
-    ActiveWorkbook.Names.Add name:=new_name & "_Tt", RefersToR1C1:= _
-        "=OFFSET(AP!R" & dataRow & "C" & TCol & ", 0, 0, COUNT(" & new_src_name & "[VPR T]), 1)"
-    
-    sheetAP.Range(new_name & "_ka").FormulaArray = "=LINEST(" & new_name & "_d, " & new_name & "_P^{1,2}, 1, 0)"
-    
-    Dim chrt As Chart
+# Технические / служебные поля, которые из старой формы не переносим.
+# sampleCode НЕ является техническим ID: в v20 он назывался Id и должен быть перенесён.
+SKIP_RESULT_FIELDS = {
+    "datetimesync",
+    "page",
+    "analysenumber",
+}
 
-    For i = sheetAP.Shapes.count To 1 Step -1
-        If sheetAP.Shapes(i).Type = 3 Then
-            If sheetAP.Shapes(i).TopLeftCell.Column = sheetAP.Shapes("AP_1_chart").TopLeftCell.Column + lenght * (lastList - 1) Then
-                sheetAP.Shapes(i).name = new_name & "_chart"
-                Set chrt = sheetAP.Shapes(i).Chart
-            End If
-        End If
-    Next i
-    
-    xTable.ShowAutoFilterDropDown = False
-    
-    chrt.FullSeriesCollection(1).XValues = _
-        "='" & ActiveWorkbook.name & "'!" & new_name & "_P"
-        
-    chrt.FullSeriesCollection(1).values = _
-        "='" & ActiveWorkbook.name & "'!" & new_name & "_d"
-    
-    With sheetAP
-        .Range(.Cells(dataRow, firstColumn + 2), .Cells(dataRow, firstColumn + 4)).value = 0
-        .Range(.Cells(dataRow + 1, firstColumn + 2), .Cells(dataRow + xTable.ListRows.count - 1, firstColumn + 4)).ClearContents
-    End With
-    
-    Dim sh As CheckBox
-    Dim count As Integer
-    
-    count = 0
-    sheetAP.Activate
-    
-    For X = sheetAP.CheckBoxes.count To 1 Step -1
-        Set sh = sheetAP.CheckBoxes(X)
-        
-        If sh.TopLeftCell.Column >= sheetAP.Range("AP_" & lastList & "_Correct").Column Then
-            dataRow = sh.TopLeftCell.row - xTable.HeaderRowRange.row
-            
-            If dataRow < 0 Then
-                sh.name = "CheckBox_" & lastList
-                sh.value = xlOn
-            Else
-                sh.name = "CheckBox_AP_" & lastList & "_" & dataRow
-            End If
-            
-            sh.linkedCell = sh.TopLeftCell.Address
-            
-            count = count + 1
-            
-            If count = xTable.ListRows.count + 1 Then
-                Exit For
-            End If
-        End If
-    Next X
-    sheetAP.Range(new_src_name & "[" & COL_ROW_ID_DB & "]").ClearContents
-    sheetAP.Range(new_src_name & "[[Давление, psig]:[Плотность, г/см3]]").ClearContents
-    sheetAP.Range(new_src_name & "[[Давление, psig]:[Активна]]").Resize(1, 3).value = 0
-    sheetAP.Range(new_src_name & "[Активна]").value = True
-    
-    sheetAP.Range(new_name & "_sampleCode").Resize(1, 2).Locked = False
-    sheetAP.Range(new_name & "_sampleCode").Interior.Color = xlNone
-    
-    sheetAP.Range(new_name & "_TaskId").Resize(1, 2).Locked = False
-    sheetAP.Range(new_name & "_TaskId").Interior.Color = xlNone
-    
-End Sub
+SKIP_FIELD_PREFIXES = (
+    "resultid",
+    "rowid",
+)
 
-Sub equipmentModelsRefreshAP()
+# OP: часть колонок в v23 вычисляется формулами или подтягивается из справочников.
+# Их не переносим даже если в старой форме они были значениями.
+OP_SKIP_FIELDS = {
+    "page",
+    "datetimesync",
+    "typesampler",
+    "volumesampler",
+    "numbersampler",
+    "regime",
+    "transferdate",
+    "psamplingmpa",
+    "tsampling",
+    "resultidop",
+    "popenmpa",
+    "pendmpa",
+    "bp_bpmpa",
+    "bp_deltapct",
+    "natureliq",
+    "deltapopenpct",
+    "popenmpat",
+    "typesample",
+    "столбец1",
+}
 
-    Dim sheetAP As Worksheet
-    Set sheetAP = ActiveWorkbook.Sheets("AP")
-    
-    Dim eq() As String
-    
-    eq = getEquipmentModels("", "Density")
-    Dim strEq As String
-    strEq = eq(1)
-    
-    Dim i As Long
-    
-    For i = 2 To UBound(eq)
-        strEq = strEq & "," & eq(i)
-    Next i
-    
-    Dim CellTS As Range
-    i = 1
-    
-    On Error Resume Next
-    Do While True
-        Set CellTS = Nothing
-        Set CellTS = sheetAP.Range("AP_" & i & "_apEquipment")
-        If CellTS Is Nothing Then Exit Do
-        
-        With CellTS.Validation
-            .Delete
-            .Add Type:=xlValidateList, AlertStyle:=xlValidAlertStop, Operator:= _
-            xlBetween, Formula1:=strEq
-            .IgnoreBlank = True
-            .InCellDropdown = True
-            .ShowInput = True
-            .ShowError = True
-        End With
-        i = i + 1
-    Loop
-    On Error GoTo 0
-    
-End Sub
+# В v20 часть полей называлась иначе. Словарь задаётся в формате:
+#   поле_v23 -> поле_v20
+NAMED_FIELD_SOURCE_MAP: dict[str, dict[str, str]] = {
+    "AP": {
+        "sampleCode": "Id",
+        "apEquipment": "apEquipment",
+        "apEquipmentNumber": "apEquipment",
+    },
+    "BP": {
+        "sampleCode": "Id",
+        "bpEquipment": "bpEquipment",
+        "bpEquipmentNumber": "bpEquipment",
+    },
+    "GC": {
+        "sampleCode": "Id",
+        "equipment": "equipment",
+        "equipmentNumber": "equipment",
+    },
+    "GOR": {
+        "sampleCode": "Id",
+        "smplTransfEq": "pvtCell",
+        "transfEqNumber": "pvtCell",
+        "gorEquipment": "gorEquipment",
+        "gorEquipmentNumber": "gorEquipment",
+        "bottle": "jar",
+    },
+    "SSF": {
+        "sampleCode": "Id",
+        "equipmentForTransfer": "pvtCell",
+        "equipForTransferNumber": "pvtCell",
+        "ssfEquipment": "ssfEquipment",
+        "ssfEquipmentNumber": "ssfEquipment",
+        "bottle": "jar",
+    },
+    "EMV": {
+        "sampleCode": "Id",
+        "emvEquipment": "emvEquipment",
+        "emvEquipmentNumber": "emvEquipment",
+    },
+}
 
-Public Function Validate_AP() As macroResult
-    Validate_AP = Save_AP("Валидировано")
-End Function
+# Изменения заголовков в табличной части форм.
+# Формат: поле_v23 -> поле_v20.
+SOURCE_TABLE_HEADER_MAP: dict[str, dict[str, str]] = {
+    "AP": {
+        "Активна": "График",
+    },
+    "BP": {
+        "Активна": "График",
+        "Строка": "Ранг",
+    },
+    "GC": {
+        "Активна": "График",
+    },
+    "EMV": {
+        "Активна": "График",
+        "Давление, psig": "Давление, psi",
+    },
+}
 
-Public Function Save_AP(Optional ByVal taskStatus As String = "") As macroResult
-    On Error GoTo ErrHandler
-    
-    Save_AP = MACRO_FAILED
-    
-    Dim wb As Workbook
-    Set wb = ActiveWorkbook
-    
-    Dim newHashResult As String
-    Dim oldHashResult As String
-    Dim lastWorkflowStage As String
-    
-    newHashResult = CalculateCurrentAPHash()
-    
-    oldHashResult = _
-        GetWorkbookMetadataProperty( _
-            wb, _
-            PROP_AP_DATA_HASH _
+# Соответствие старых наименований PVT-оборудования новой паре
+# "тип оборудования" + "номер". Для Stigma Pump v20 не содержала
+# конкретного номера единицы оборудования, поэтому номер определить нельзя.
+LEGACY_PVT_EQUIPMENT_MAP: dict[str, tuple[str, Any | None]] = {
+    "minipvt-1": ("miniPVT", 1),
+    "minipvt-2": ("miniPVT", 2),
+    "minipvt-3": ("miniPVT", 3),
+    "pvt-1000/1000": ("PVT", 1),
+    "pvt-400/1000": ("PVT", 2),
+    "pvt-250/1000": ("PVT", 3),
+    "pvt-250/1500": ("PVT", 3),
+    "pvt-400/1000-2": ("PVT", 4),
+    "pvt-nm": ("PVT", 5),
+    "dbr": ("PVT", 6),
+    "насос stigma pump": ("Pump", None),
+    "stigma pump": ("Pump", None),
+}
+
+
+logging.basicConfig(
+    filename=LOG_PATH,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    filemode="a",
+    encoding="utf-8",
+)
+
+
+# =============================================================================
+# Reports
+# =============================================================================
+
+@dataclass
+class ProjectMigrationReport:
+    project: str
+    ok: bool
+    message: str
+    folder: str | None = None
+    old_file: str | None = None
+    new_file: str | None = None
+    forms_copied: int = 0
+    named_values_copied: int = 0
+    table_values_copied: int = 0
+    warnings: list[str] | None = None
+    error_type: str | None = None
+
+
+@dataclass
+class MigrationReport:
+    ok: bool
+    message: str
+    projects: list[ProjectMigrationReport]
+
+
+# =============================================================================
+# Project parsing / search
+# =============================================================================
+
+def parse_project_input(text: str) -> list[str]:
+    text = text.strip()
+
+    if not text:
+        raise ValueError("Не указан проект или диапазон проектов")
+
+    text = re.sub(r"\s*\.{2,3}\s*", "...", text)
+    parts = re.split(r"[,\s;]+", text)
+
+    result: list[str] = []
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if "..." in part:
+            start, end = part.split("...", 1)
+            result.extend(expand_project_range(start, end))
+        else:
+            result.append(normalize_project_code(part))
+
+    # Убираем дубли, порядок сохраняем
+    seen = set()
+    unique: list[str] = []
+
+    for project in result:
+        if project not in seen:
+            unique.append(project)
+            seen.add(project)
+
+    return unique
+
+
+def normalize_project_code(value: str) -> str:
+    value = value.strip().upper()
+
+    if not re.fullmatch(r"\d{2}-F\d+", value):
+        raise ValueError(f"Некорректный формат проекта: {value}")
+
+    prefix, num = value.split("F", 1)
+    return f"{prefix}F{int(num):0{len(num)}d}"
+
+
+def expand_project_range(start: str, end: str) -> list[str]:
+    start = normalize_project_code(start)
+    end = normalize_project_code(end)
+
+    m1 = re.fullmatch(r"(\d{2}-F)(\d+)", start)
+    m2 = re.fullmatch(r"(\d{2}-F)(\d+)", end)
+
+    if not m1 or not m2:
+        raise ValueError(f"Некорректный диапазон проектов: {start}...{end}")
+
+    prefix1, n1_text = m1.groups()
+    prefix2, n2_text = m2.groups()
+
+    if prefix1 != prefix2:
+        raise ValueError(f"Диапазон проектов должен быть внутри одного года/префикса: {start}...{end}")
+
+    n1 = int(n1_text)
+    n2 = int(n2_text)
+    width = max(len(n1_text), len(n2_text))
+
+    if n2 < n1:
+        raise ValueError(f"Конец диапазона меньше начала: {start}...{end}")
+
+    return [f"{prefix1}{n:0{width}d}" for n in range(n1, n2 + 1)]
+
+
+def find_project_folder(base_dir: Path, project_code: str, recursive: bool = False) -> Path:
+    if not base_dir.exists():
+        raise FileNotFoundError(f"Основная папка проектов не найдена: {base_dir}")
+
+    candidates = []
+
+    iterator = base_dir.rglob("*") if recursive else base_dir.iterdir()
+
+    for path in iterator:
+        if path.is_dir() and path.name.upper().startswith(project_code.upper()):
+            candidates.append(path)
+
+    if not candidates:
+        raise FileNotFoundError(f"Не найдена папка проекта, начинающаяся на {project_code}")
+
+    candidates = sorted(candidates, key=lambda p: len(p.name))
+
+    if len(candidates) > 1:
+        logging.warning(
+            "Для проекта %s найдено несколько папок, беру первую: %s; все варианты: %s",
+            project_code,
+            candidates[0],
+            candidates,
         )
-    
-    lastWorkflowStage = _
-        GetWorkbookMetadataProperty( _
-            wb, _
-            PROP_AP_LAST_WORKFLOW_STAGE _
+
+    return candidates[0]
+
+
+def find_v20_file(project_folder: Path) -> Path:
+    folder_name = project_folder.name.lower()
+    files = []
+
+    for path in project_folder.iterdir():
+        if not path.is_file():
+            continue
+
+        if path.name.startswith("~$"):
+            continue
+
+        if path.suffix.lower() not in (".xlsx", ".xlsm"):
+            continue
+
+        name_lower = path.name.lower()
+
+        if name_lower.startswith(folder_name) and "_v20" in name_lower:
+            files.append(path)
+
+    if not files:
+        raise FileNotFoundError(
+            f"В папке '{project_folder}' не найден исходный файл v20 "
+            f"(имя должно начинаться с имени папки и содержать '_v20')"
         )
-    Dim needToSave As shouldSave
-    needToSave = ShouldSaveStudy(newHashResult, oldHashResult, lastWorkflowStage, taskStatus)
-    If needToSave = DATA_NO_CHANGES Then
-        Save_AP = MACRO_NO_CHANGES
-        Exit Function
-        
-    ElseIf needToSave = DATA_EMPTY Then
-        Call SetWorkbookMetadataProperty(wb, PROP_AP_DATA_HASH, newHashResult, False)
-        Call SetWorkbookMetadataProperty(wb, PROP_AP_LAST_WORKFLOW_STAGE, EffectiveWorkflowStage(taskStatus), False)
-        SetStudySyncStatus wb, PROP_AP_DATA_STATE, SYNC_STATUS_EMPTY, False
-        Exit Function
-    ElseIf needToSave = DATA_DELETED Then
-        SetStudySyncStatus wb, PROP_AP_DATA_STATE, SYNC_STATUS_ERROR, False
-        Exit Function
-    End If
-    
-    Dim sheetAP As Worksheet
-    Set sheetAP = wb.Worksheets("AP")
 
-    Dim sheetAPresults As Worksheet
-    Set sheetAPresults = wb.Worksheets("AP_results")
+    if len(files) > 1:
+        raise ValueError(
+            f"В папке '{project_folder}' найдено несколько v20-файлов: {files}"
+        )
 
-    Dim sheetAPSourceData As Worksheet
-    Set sheetAPSourceData = wb.Worksheets("AP_sourceData")
+    return files[0]
 
-    Dim APTable As ListObject
-    Set APTable = sheetAPresults.ListObjects("AP_results")
 
-    Dim APSourceDataTable As ListObject
-    Set APSourceDataTable = sheetAPSourceData.ListObjects("AP_sourceData")
+def make_v23_file(project_folder: Path, template_path: Path, overwrite: bool = False) -> Path:
+    new_path = project_folder / f"{project_folder.name}_v23.0.1.xlsx"
 
-    Dim parentRows As Collection
-    Set parentRows = New Collection
+    if new_path.exists():
+        if not overwrite:
+            raise FileExistsError(
+                f"Файл v23 уже существует: {new_path}. "
+                f"Для перезаписи запусти с --overwrite"
+            )
 
-    Dim childRows As Collection
-    Set childRows = New Collection
-    
-    Dim i As Long
-    Dim X As Long
+        new_path.unlink()
 
-    i = 1
-    
-    Dim formState As APFormState
-    Dim newResultIDs As Collection
-    Set newResultIDs = New Collection
+    shutil.copy2(template_path, new_path)
 
-    Do While NamedRangeExists(wb, "AP_" & i & "_sampleCode")
+    return new_path
 
-        formState = Get_AP_FormState(i)
-        
-        Select Case formState
 
-            Case AP_FORM_EMPTY
-                GoTo NextForm
-    
-            Case AP_FORM_RESERVED
-                GoTo NextForm
-    
-            Case AP_FORM_FILLED
-                
-        End Select
-        
-        If sheetAP.Range("AP_" & i & "_TaskId").Interior.ColorIndex = 3 Then
-            GoTo NextForm
-        End If
-        
-        If sheetAP.Range("AP_" & i & "_analyseNumber").value = "" Then
-            Call checkNumberAnalys2(sheetAP.Range("AP_" & i & "_sampleCode").value, "AP")
-        End If
-        
-        If Not Validate_AP_Form(i) Then
-            Exit Function
-        End If
+# =============================================================================
+# Excel helpers
+# =============================================================================
 
-        Dim resultIdValue As Variant
-        Dim parentKey As String
+def open_book(app: xw.App, path: Path, read_only: bool) -> xw.Book:
+    return app.books.open(
+        str(path),
+        read_only=read_only,
+        update_links=False,
+        ignore_read_only_recommended=True,
+    )
 
-        resultIdValue = sheetAP.Range("AP_" & i & "_resultIdAP").value
+def set_current_project_in_form(book: xw.Book, project_code: str) -> None:
+    sheet = book.sheets[PROJECT_CELL_SHEET]
+    sheet.range(PROJECT_CELL_ADDRESS).value = project_code
 
-        If Len(NormalizeKeyValue(resultIdValue)) = 0 Or NormalizeKeyValue(resultIdValue) = "0" Then
-            parentKey = "temp_" & i
-        Else
-            parentKey = NormalizeKeyValue(resultIdValue)
-        End If
+def unprotect_all_sheets(book: xw.Book) -> None:
+    for sheet in book.sheets:
+        for password in UNPROTECT_PASSWORDS:
+            try:
+                sheet.api.Unprotect(Password=password)
+                break
+            except Exception:
+                pass
 
-        Dim parentRow() As Variant
-        ReDim parentRow(1 To APTable.ListColumns.count)
+def protect_all_sheets(book: xw.Book) -> None:
+    for sheet in book.sheets:
+        try:
+            sheet.api.Protect(
+                Password=PROTECT_PASSWORD,
+                DrawingObjects=True,
+                Contents=True,
+                Scenarios=True,
+                UserInterfaceOnly=True,
+                AllowFiltering=True,
+            )
+        except Exception as exc:
+            logging.warning("Не удалось защитить лист %s: %s", sheet.name, exc)
 
-        Dim headerCell As Range
-        Dim headerName As String
-        Dim parentColIndex As Long
-        Dim formatValue As Variant
-        
-        For Each headerCell In APTable.HeaderRowRange.Cells
-            headerName = CStr(headerCell.value)
-            parentColIndex = APTable.ListColumns(headerName).index
+def get_named_range(book: xw.Book, name: str):
+    try:
+        return book.api.Names.Item(name).RefersToRange
+    except Exception:
+        try:
+            return book.names[name].refers_to_range.api
+        except Exception:
+            return None
 
-            If headerName = "dateTimeSync" Then
-                parentRow(parentColIndex) = Format$(Now, "yyyy-mm-dd hh:nn:ss")
-            ElseIf headerName = "resultIdAP" Then
-                parentRow(parentColIndex) = parentKey
-                If IsNumeric(parentKey) Then
-                    newResultIDs.Add parentKey
-                End If
-            Else
-                formatValue = FormatValueForSyncText( _
-                    headerName, _
-                    sheetAP.Range("AP_" & i & "_" & headerName).value _
+
+def named_range_exists(book: xw.Book, name: str) -> bool:
+    return get_named_range(book, name) is not None
+
+def progress(message: str) -> None:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+
+def get_list_object(book: xw.Book, sheet_name: str, table_name: str):
+    try:
+        sheet = book.sheets[sheet_name]
+    except Exception as exc:
+        raise ValueError(f"В книге '{book.name}' нет листа '{sheet_name}'") from exc
+
+    try:
+        return sheet.api.ListObjects.Item(table_name)
+    except Exception as exc:
+        raise ValueError(
+            f"На листе '{sheet_name}' нет умной таблицы '{table_name}'"
+        ) from exc
+
+
+def try_get_list_object(book: xw.Book, sheet_name: str, table_name: str):
+    try:
+        return get_list_object(book, sheet_name, table_name)
+    except Exception:
+        return None
+
+
+def list_object_exists(book: xw.Book, sheet_name: str, table_name: str) -> bool:
+    return try_get_list_object(book, sheet_name, table_name) is not None
+
+
+def read_table_headers(table) -> list[str]:
+    values = table.HeaderRowRange.Value
+
+    if values is None:
+        return []
+
+    if isinstance(values, tuple) and values and isinstance(values[0], tuple):
+        raw = values[0]
+    else:
+        raw = values
+
+    return [str(v).strip() if v is not None else "" for v in raw]
+
+
+def header_index_map(table) -> dict[str, int]:
+    headers = read_table_headers(table)
+    return {h: idx + 1 for idx, h in enumerate(headers) if h}
+
+
+def ensure_table_rows(table, row_count: int) -> None:
+    if row_count <= 0:
+        return
+
+    while table.ListRows.Count < row_count:
+        table.ListRows.Add()
+
+
+def cell_has_formula(cell) -> bool:
+    try:
+        if bool(cell.MergeCells):
+            top_left = cell.MergeArea.Cells(1, 1)
+            return bool(top_left.HasFormula)
+
+        return bool(cell.HasFormula)
+    except Exception:
+        return False
+
+
+def range_has_formula(rng) -> bool:
+    if rng is None:
+        return False
+
+    try:
+        if bool(rng.MergeCells):
+            return bool(rng.MergeArea.Cells(1, 1).HasFormula)
+
+        return bool(rng.Cells(1, 1).HasFormula)
+    except Exception:
+        return False
+
+
+def is_blank_value(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+
+def get_cell_value_from_range(rng):
+    if rng is None:
+        return None
+
+    try:
+        if bool(rng.MergeCells):
+            return rng.MergeArea.Cells(1, 1).Value
+
+        return rng.Cells(1, 1).Value
+    except Exception:
+        return rng.Value
+
+
+def write_value_to_range_if_not_formula(target_rng, value: Any) -> bool:
+    if target_rng is None or is_blank_value(value):
+        return False
+
+    try:
+        if bool(target_rng.MergeCells):
+            write_cell = target_rng.MergeArea.Cells(1, 1)
+        else:
+            write_cell = target_rng.Cells(1, 1)
+
+        if cell_has_formula(write_cell):
+            return False
+
+        write_cell.Value = value
+        return True
+
+    except Exception:
+        return False
+
+
+def copy_named_range_value(
+    old_book: xw.Book,
+    new_book: xw.Book,
+    old_range_name: str,
+    new_range_name: str,
+    *,
+    transform=None,
+) -> bool:
+    old_rng = get_named_range(old_book, old_range_name)
+    new_rng = get_named_range(new_book, new_range_name)
+
+    if old_rng is None or new_rng is None:
+        return False
+
+    # Главное правило мигратора: результаты старых формул не переносим.
+    if range_has_formula(old_rng):
+        return False
+
+    value = get_cell_value_from_range(old_rng)
+
+    if transform is not None:
+        value = transform(value)
+
+    return write_value_to_range_if_not_formula(new_rng, value)
+
+
+def should_skip_field(field_name: str) -> bool:
+    f = str(field_name).strip().lower()
+
+    if not f:
+        return True
+
+    if f in SKIP_RESULT_FIELDS:
+        return True
+
+    return any(f.startswith(prefix) for prefix in SKIP_FIELD_PREFIXES)
+
+
+def normalize_header(value: Any) -> str:
+    if value is None:
+        return ""
+
+    return re.sub(r"\s+", " ", str(value).strip())
+
+
+def legacy_graph_flag_to_active(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    if isinstance(value, str):
+        v = value.strip().lower()
+
+        if v in {"+", "1", "true", "истина", "да", "yes"}:
+            return True
+
+        if v in {"-", "0", "false", "ложь", "нет", "no"}:
+            return False
+
+    return value
+
+
+def split_legacy_pvt_equipment(value: Any) -> tuple[Any | None, Any | None]:
+    if is_blank_value(value):
+        return None, None
+
+    raw = str(value).strip()
+    key = raw.lower()
+
+    if key in LEGACY_PVT_EQUIPMENT_MAP:
+        return LEGACY_PVT_EQUIPMENT_MAP[key]
+
+    # AP-4 -> AP + 4
+    m = re.fullmatch(r"ap\s*[- ]?\s*(\d+)", raw, flags=re.IGNORECASE)
+    if m:
+        return "AP", int(m.group(1))
+
+    # EMV-A -> EMV + A
+    m = re.fullmatch(r"emv\s*[- ]?\s*([a-zа-я0-9]+)", raw, flags=re.IGNORECASE)
+    if m:
+        return "EMV", m.group(1).upper()
+
+    # miniPVT-2 и подобные варианты
+    m = re.fullmatch(r"minipvt\s*[- ]?\s*(\d+)", raw, flags=re.IGNORECASE)
+    if m:
+        return "miniPVT", int(m.group(1))
+
+    # Если старое значение явно говорит только о типе.
+    if "pump" in key or "насос" in key:
+        return "Pump", None
+
+    if "minipvt" in key:
+        return "miniPVT", None
+
+    if "pvt" in key or key == "dbr":
+        return "PVT", None
+
+    return None, None
+
+
+def warn_once(warnings: list[str], message: str) -> None:
+    if message not in warnings:
+        warnings.append(message)
+
+
+def transform_named_value(
+    *,
+    study: str,
+    target_field: str,
+    source_value: Any,
+    warnings: list[str],
+    form_index: int,
+) -> Any:
+    if is_blank_value(source_value):
+        return None
+
+    # Поля оборудования в v23 разделены на тип + номер.
+    equipment_field_pairs = {
+        "AP": ("apEquipment", "apEquipmentNumber"),
+        "BP": ("bpEquipment", "bpEquipmentNumber"),
+        "GC": ("equipment", "equipmentNumber"),
+        "GOR": ("smplTransfEq", "transfEqNumber"),
+        "SSF": ("equipmentForTransfer", "equipForTransferNumber"),
+        "EMV": ("emvEquipment", "emvEquipmentNumber"),
+    }
+
+    if study in equipment_field_pairs:
+        type_field, number_field = equipment_field_pairs[study]
+
+        if target_field in (type_field, number_field):
+            eq_type, eq_number = split_legacy_pvt_equipment(source_value)
+
+            if target_field == type_field:
+                if eq_type is None:
+                    warn_once(
+                        warnings,
+                        f"{study}_{form_index}: не удалось определить новый тип оборудования "
+                        f"из старого значения '{source_value}'",
+                    )
+                return eq_type
+
+            if eq_number is None and eq_type is not None:
+                warn_once(
+                    warnings,
+                    f"{study}_{form_index}: для оборудования '{source_value}' в v20 нет "
+                    f"однозначного номера единицы оборудования; номер в v23 оставлен пустым",
                 )
-                parentRow(parentColIndex) = formatValue
-            End If
 
-        Next headerCell
+            return eq_number
 
-        parentRows.Add parentRow
+    # Газометр в GOR: v20 хранила только номер, v23 хранит GOR + номер.
+    if study == "GOR" and target_field in ("gorEquipment", "gorEquipmentNumber"):
+        if target_field == "gorEquipment":
+            return "GOR"
 
-        Dim srcTable As ListObject
-        Set srcTable = sheetAP.ListObjects("AP_source_" & i)
-        
-        If SourceTableNeedsCompact( _
-            srcTable, _
-            Array(COL_PRESSURE_FORM, COL_DENSITY_FORM), _
-            Array("AND") _
-        ) Then
-            Call CompactSourceTable( _
-                srcTable, _
-                Array(COL_PRESSURE_FORM, COL_DENSITY_FORM), _
-                Array(COL_PRESSURE_FORM, COL_TEMPERATURE_FORM, _
-                    COL_DENSITY_FORM, COL_ACTIVE_FORM, COL_ROW_ID_DB), _
-                COL_ROW_ID_DB _
+        return source_value
+
+    # Газометр / газовый счётчик в SSF.
+    if study == "SSF" and target_field in ("ssfEquipment", "ssfEquipmentNumber"):
+        s = str(source_value).strip().lower()
+
+        if target_field == "ssfEquipment":
+            if "счетчик" in s or "счётчик" in s or "gfm" in s:
+                return "GFM"
+
+            return "GOR"
+
+        if "счетчик" in s or "счётчик" in s or "gfm" in s:
+            warn_once(
+                warnings,
+                f"SSF_{form_index}: в v20 указано '{source_value}', но конкретного номера "
+                f"газового счётчика нет; номер в v23 оставлен пустым",
             )
-        End If
+            return None
 
-        Dim pressureCol As Long
-        Dim temperatureCol As Long
-        Dim densityCol As Long
-        Dim activeCol As Long
+        return source_value
 
-        pressureCol = srcTable.ListColumns(COL_PRESSURE_FORM).index
-        temperatureCol = srcTable.ListColumns(COL_TEMPERATURE_FORM).index
-        densityCol = srcTable.ListColumns(COL_DENSITY_FORM).index
-        activeCol = srcTable.ListColumns(COL_ACTIVE_FORM).index
+    return source_value
 
-        For X = 1 To srcTable.ListRows.count
 
-            Dim hasSourceData As Boolean
-            Dim oldRowIdAP As String
-        
-            hasSourceData = SourceRowHasData( _
-                srcTable, _
-                X, _
-                Array(COL_PRESSURE_FORM, COL_DENSITY_FORM), _
-                Array("AND") _
+def transform_source_table_value(study: str, target_header: str, value: Any) -> Any:
+    if target_header == "Активна":
+        return legacy_graph_flag_to_active(value)
+
+    return value
+
+
+def copy_table_values_by_common_columns(
+    old_table,
+    new_table,
+    *,
+    study: str | None = None,
+    skip_fields: set[str] | None = None,
+    source_header_map: dict[str, str] | None = None,
+    value_transform=None,
+) -> int:
+    if skip_fields is None:
+        skip_fields = set()
+
+    if source_header_map is None:
+        source_header_map = {}
+
+    skip_fields_normalized = {str(x).strip().lower() for x in skip_fields}
+
+    old_map_raw = header_index_map(old_table)
+    new_map_raw = header_index_map(new_table)
+
+    old_map = {normalize_header(h): idx for h, idx in old_map_raw.items()}
+    new_map = {normalize_header(h): idx for h, idx in new_map_raw.items()}
+
+    source_header_map_normalized = {
+        normalize_header(target): normalize_header(source)
+        for target, source in source_header_map.items()
+    }
+
+    column_pairs: list[tuple[str, int, int]] = []
+
+    for target_header, new_col in new_map.items():
+        if not target_header:
+            continue
+
+        if target_header.lower() in skip_fields_normalized:
+            continue
+
+        if should_skip_field(target_header):
+            continue
+
+        source_header = source_header_map_normalized.get(target_header, target_header)
+
+        if source_header not in old_map:
+            continue
+
+        column_pairs.append((target_header, old_map[source_header], new_col))
+
+    if not column_pairs:
+        return 0
+
+    old_rows_count = old_table.ListRows.Count
+
+    if old_rows_count == 0:
+        return 0
+
+    ensure_table_rows(new_table, old_rows_count)
+
+    old_body = old_table.DataBodyRange
+    new_body = new_table.DataBodyRange
+
+    if old_body is None or new_body is None:
+        return 0
+
+    copied = 0
+
+    for row_idx in range(1, old_rows_count + 1):
+        for target_header, old_col, new_col in column_pairs:
+            src_cell = old_body.Cells(row_idx, old_col)
+            dst_cell = new_body.Cells(row_idx, new_col)
+
+            # Не копируем ни формулы старой формы, ни поверх формул новой формы.
+            if cell_has_formula(src_cell) or cell_has_formula(dst_cell):
+                continue
+
+            value = src_cell.Value
+
+            if value_transform is not None:
+                value = value_transform(target_header, value)
+            elif study is not None:
+                value = transform_source_table_value(study, target_header, value)
+
+            if is_blank_value(value):
+                continue
+
+            dst_cell.Value = value
+            copied += 1
+
+    return copied
+
+
+def parse_legacy_liq_phase(value: Any) -> tuple[Any | None, Any | None]:
+    """
+    v20: VLiqPhase могла содержать число или '-'.
+    v23: число хранится в VLiqPhase, пояснение отдельно в LiqPhaseQualifier.
+    """
+    if is_blank_value(value):
+        return None, None
+
+    if isinstance(value, bool):
+        return int(value), None
+
+    if isinstance(value, (int, float)):
+        return value, None
+
+    s = str(value).strip()
+    sl = s.lower()
+
+    if s == "-" or "не выполня" in sl:
+        return None, "Не выполнялось"
+
+    if "менее" in sl:
+        return None, "Менее 1 мл"
+
+    if s.startswith("<"):
+        return None, "Менее 1 мл"
+
+    try:
+        number = float(s.replace(",", "."))
+        if number.is_integer():
+            number = int(number)
+        return number, None
+    except Exception:
+        return None, None
+
+
+# =============================================================================
+# Study migration
+# =============================================================================
+
+def old_source_form_table_name(study: str, form_index: int) -> str:
+    # В v20 AP/BP/GC/EMV назывались <study>_<n>.
+    # У GOR/SSF дочерние шифры фаз были отдельными именованными диапазонами,
+    # а не таблицами.
+    return f"{study}_{form_index}"
+
+
+def new_source_form_table_name(study: str, form_index: int) -> str:
+    return f"{study}_source_{form_index}"
+
+
+def old_form_exists(old_book: xw.Book, study: str, form_index: int) -> bool:
+    return (
+        named_range_exists(old_book, f"{study}_{form_index}_Id")
+        or named_range_exists(old_book, f"{study}_{form_index}_sampleCode")
+    )
+
+
+def source_field_for_target(study: str, target_field: str) -> str:
+    return NAMED_FIELD_SOURCE_MAP.get(study, {}).get(target_field, target_field)
+
+
+def migrate_legacy_phase_links(
+    *,
+    old_book: xw.Book,
+    new_book: xw.Book,
+    study: str,
+    form_index: int,
+) -> int:
+    """
+    GOR/SSF v20:
+        IdLPh, IdGPh
+    GOR/SSF v23:
+        таблица <study>_source_<n> с колонками sampleCode / TypePh.
+
+    Технические rowId/resultId не заполняются.
+    """
+    if study not in ("GOR", "SSF"):
+        return 0
+
+    new_table = try_get_list_object(
+        new_book,
+        study,
+        new_source_form_table_name(study, form_index),
+    )
+
+    if new_table is None:
+        return 0
+
+    new_map = header_index_map(new_table)
+
+    if "sampleCode" not in new_map or "TypePh" not in new_map:
+        return 0
+
+    phase_values = [
+        ("IdLPh", "LPh"),
+        ("IdGPh", "GPh"),
+    ]
+
+    values_to_write: list[tuple[Any, str]] = []
+
+    for old_field, phase_type in phase_values:
+        old_rng = get_named_range(old_book, f"{study}_{form_index}_{old_field}")
+
+        if old_rng is None or range_has_formula(old_rng):
+            continue
+
+        value = get_cell_value_from_range(old_rng)
+
+        if is_blank_value(value):
+            continue
+
+        values_to_write.append((value, phase_type))
+
+    if not values_to_write:
+        return 0
+
+    ensure_table_rows(new_table, len(values_to_write))
+    body = new_table.DataBodyRange
+
+    if body is None:
+        return 0
+
+    copied = 0
+
+    for row_idx, (sample_code, phase_type) in enumerate(values_to_write, start=1):
+        sample_cell = body.Cells(row_idx, new_map["sampleCode"])
+        type_cell = body.Cells(row_idx, new_map["TypePh"])
+
+        if not cell_has_formula(sample_cell):
+            sample_cell.Value = sample_code
+            copied += 1
+
+        if not cell_has_formula(type_cell):
+            type_cell.Value = phase_type
+            copied += 1
+
+    return copied
+
+
+def migrate_named_range_study(
+    *,
+    old_book: xw.Book,
+    new_book: xw.Book,
+    study: str,
+    warnings: list[str],
+) -> tuple[int, int, int]:
+    """
+    Перенос обычных форм v20 -> v23:
+    AP, BP, GC, GOR, SSF, EMV.
+
+    - технические resultId/rowId и analyseNumber пропускаются;
+    - sampleCode берётся из старого Id;
+    - формулы старой формы не копируются;
+    - формулы новой формы не затираются;
+    - табличная часть переносится по общим/переименованным колонкам;
+    - старое '+'/'-' в колонке "График" превращается в True/False "Активна";
+    - оборудование преобразуется в новый формат "тип + номер";
+    - IdLPh/IdGPh для GOR/SSF перекладываются в source-таблицу.
+    """
+    forms_copied = 0
+    named_values_copied = 0
+    table_values_copied = 0
+
+    result_table = try_get_list_object(
+        new_book,
+        f"{study}_results",
+        f"{study}_results",
+    )
+
+    if result_table is None:
+        warnings.append(f"{study}: не найдена новая таблица {study}_results, пропускаю")
+        return 0, 0, 0
+
+    result_fields = read_table_headers(result_table)
+    form_index = 1
+
+    while old_form_exists(old_book, study, form_index):
+        if not named_range_exists(new_book, f"{study}_{form_index}_sampleCode"):
+            warnings.append(
+                f"{study}_{form_index}: в новой форме нет формы с таким индексом; "
+                f"данные этой формы v20 пропущены"
             )
-            oldRowIdAP = NormalizeKeyValue( _
-                srcTable.DataBodyRange.Cells(X, srcTable.ListColumns(COL_ROW_ID_DB).index).value _
+            form_index += 1
+            continue
+
+        form_has_any_data = False
+
+        for target_field in result_fields:
+            if should_skip_field(target_field):
+                continue
+
+            source_field = source_field_for_target(study, target_field)
+
+            old_range_name = f"{study}_{form_index}_{source_field}"
+            new_range_name = f"{study}_{form_index}_{target_field}"
+
+            if not named_range_exists(old_book, old_range_name):
+                continue
+
+            if not named_range_exists(new_book, new_range_name):
+                continue
+
+            old_rng = get_named_range(old_book, old_range_name)
+
+            if old_rng is None or range_has_formula(old_rng):
+                continue
+
+            source_value = get_cell_value_from_range(old_rng)
+
+            value = transform_named_value(
+                study=study,
+                target_field=target_field,
+                source_value=source_value,
+                warnings=warnings,
+                form_index=form_index,
             )
-            
-            If hasSourceData Or Len(oldRowIdAP) > 0 Then
-                
-                Dim childRow() As Variant
-                ReDim childRow(1 To APSourceDataTable.ListColumns.count)
-        
-                childRow(APSourceDataTable.ListColumns(COL_ROW_ID_DB).index) = oldRowIdAP
-                childRow(APSourceDataTable.ListColumns(COL_RESULT_ID_DB).index) = parentKey
-                
-                If hasSourceData Then
-                    formatValue = FormatValueForSyncText(COL_PRESSURE_DB, srcTable.DataBodyRange.Cells(X, pressureCol).value)
-                    childRow(APSourceDataTable.ListColumns(COL_PRESSURE_DB).index) = formatValue
 
-                    formatValue = FormatValueForSyncText(COL_TEMPERATURE_DB, srcTable.DataBodyRange.Cells(X, temperatureCol).value)
-                    childRow(APSourceDataTable.ListColumns(COL_TEMPERATURE_DB).index) = formatValue
+            new_rng = get_named_range(new_book, new_range_name)
 
-                    formatValue = FormatValueForSyncText(COL_DENSITY_DB, srcTable.DataBodyRange.Cells(X, densityCol).value)
-                    childRow(APSourceDataTable.ListColumns(COL_DENSITY_DB).index) = formatValue
+            if write_value_to_range_if_not_formula(new_rng, value):
+                named_values_copied += 1
+                form_has_any_data = True
 
-                    formatValue = FormatValueForSyncText(COL_ACTIVE_DB, srcTable.DataBodyRange.Cells(X, activeCol).value)
-                    childRow(APSourceDataTable.ListColumns(COL_ACTIVE_DB).index) = formatValue
+        old_src_table_name = old_source_form_table_name(study, form_index)
+        new_src_table_name = new_source_form_table_name(study, form_index)
 
-                End If
+        old_src_table = try_get_list_object(old_book, study, old_src_table_name)
+        new_src_table = try_get_list_object(new_book, study, new_src_table_name)
 
-                childRows.Add childRow
+        if old_src_table is not None and new_src_table is not None:
+            copied = copy_table_values_by_common_columns(
+                old_src_table,
+                new_src_table,
+                study=study,
+                skip_fields={"page"},
+                source_header_map=SOURCE_TABLE_HEADER_MAP.get(study, {}),
+            )
+            table_values_copied += copied
 
-            End If
-        
-        Next X
+            if copied > 0:
+                form_has_any_data = True
 
-NextForm:
-        i = i + 1
-    Loop
+        elif old_src_table is not None and new_src_table is None:
+            warnings.append(
+                f"{study}_{form_index}: в старой форме есть таблица {old_src_table_name}, "
+                f"а в новой не найдена {new_src_table_name}"
+            )
 
-    Dim cellID As Range
-    Dim oldResultID As String
-
-    If Not APTable.DataBodyRange Is Nothing Then
-
-        For Each cellID In _
-            APTable.ListColumns(COL_RESULT_ID_DB).DataBodyRange.Cells
-
-            If Not IsError(cellID.value) Then
-
-                oldResultID = NormalizeKeyValue(cellID.value)
-
-                ' Проверяем только реальные ID из БД.
-                If IsNumeric(oldResultID) And oldResultID <> "0" Then
-
-                    If Not CollectionContains( _
-                        newResultIDs, _
-                        oldResultID _
-                    ) Then
-
-                        MsgBox _
-                            "Удалены данные синхронизированной формы AP. " & _
-                            "Синхронизация невозможна. " & _
-                            "Вызовите загрузку данных из БД.", _
-                            vbExclamation
-
-                        Save_AP = MACRO_FAILED
-                        Exit Function
-
-                    End If
-
-                End If
-
-            End If
-
-        Next cellID
-
-    End If
-    
-    WriteCollectionToListObject APTable, parentRows
-    WriteCollectionToListObject APSourceDataTable, childRows
-    
-    Dim syncResult As String
-    syncResult = RunStudySync("save", studies:="AP", taskStatus:=taskStatus)
-
-    If InStr(1, syncResult, """ok"": true", vbTextCompare) > 0 Then
-        Call DeleteEmptyRowsByColumns( _
-            APSourceDataTable, _
-            COL_ROW_ID_DB, _
-            Array(COL_PRESSURE_DB, COL_DENSITY_DB) _
+        # Отдельная миграция шифров полученных фаз GOR/SSF.
+        phase_copied = migrate_legacy_phase_links(
+            old_book=old_book,
+            new_book=new_book,
+            study=study,
+            form_index=form_index,
         )
-        Call Load_AP_results_to_forms("by_key", Array(COL_RESULT_ID_DB, COL_ROW_ID_DB))
-        
-        newHashResult = CalculateCurrentAPHash()
-        
-        Call SetWorkbookMetadataProperty(wb, PROP_AP_DATA_HASH, newHashResult, False)
-        Call SetWorkbookMetadataProperty(wb, PROP_AP_LAST_WORKFLOW_STAGE, EffectiveWorkflowStage(taskStatus), False)
-        
-        SetStudySyncStatus _
-            wb, _
-            PROP_AP_DATA_STATE, _
-            SYNC_STATUS_SYNCED, _
-            False
 
-        ClearStudyHashCheck wb, "AP"
-    Else
-        MsgBox "Python-синхронизация AP не подтвердила успешное сохранение." & vbCrLf & vbCrLf & _
-                syncResult, vbExclamation
-        Exit Function
-    End If
-    
-    Save_AP = MACRO_CHANGED
-    Exit Function
+        table_values_copied += phase_copied
 
-ErrHandler:
-    Debug.Print Err.Number & ": " & Err.Description
-    Save_AP = MACRO_FAILED
-End Function
+        if phase_copied > 0:
+            form_has_any_data = True
 
-Public Function CalculateCurrentAPHash() As String
+        if form_has_any_data:
+            forms_copied += 1
 
-    Dim wb As Workbook
-    Set wb = ActiveWorkbook
+        form_index += 1
 
-    Dim Data As Object
-    Set Data = Build_AP_HashData(wb)
+    return forms_copied, named_values_copied, table_values_copied
 
-    CalculateCurrentAPHash = _
-        CalculateDataHash(Data)
 
-End Function
+def migrate_op_table(
+    *,
+    old_book: xw.Book,
+    new_book: xw.Book,
+    warnings: list[str],
+) -> tuple[int, int]:
+    """
+    OP — особый случай: форма OP сама является умной таблицей.
+    v20.Id -> v23.sampleCode.
+    VLiqPhase '-' -> LiqPhaseQualifier='Не выполнялось'.
+    """
+    old_table = try_get_list_object(old_book, "OP", "OP")
+    new_table = try_get_list_object(new_book, "OP", "OP")
 
-Private Function Build_AP_HashData( _
-    ByVal wb As Workbook _
-) As Object
+    if old_table is None:
+        warnings.append("OP: в старой книге не найдена таблица OP")
+        return 0, 0
 
-    Dim Data As Object
-    Set Data = CreateObject("Scripting.Dictionary")
+    if new_table is None:
+        warnings.append("OP: в новой книге не найдена таблица OP")
+        return 0, 0
 
-    Dim sheetAP As Worksheet
-    Set sheetAP = wb.Worksheets("AP")
+    def op_transform(target_header: str, value: Any) -> Any:
+        if target_header == "VLiqPhase":
+            amount, _qualifier = parse_legacy_liq_phase(value)
+            return amount
 
-    Dim APTable As ListObject
-    Set APTable = _
-        wb.Worksheets("AP_results") _
-          .ListObjects("AP_results")
+        if target_header == "LiqPhaseQualifier":
+            _amount, qualifier = parse_legacy_liq_phase(value)
+            return qualifier
 
-    Dim i As Long
-    Dim formIndex As Long
+        return value
 
-    i = 1
-    formIndex = 0
-
-    Do While NamedRangeExists( _
-        wb, _
-        "AP_" & i & "_sampleCode" _
+    copied = copy_table_values_by_common_columns(
+        old_table,
+        new_table,
+        study="OP",
+        skip_fields=OP_SKIP_FIELDS,
+        source_header_map={
+            "sampleCode": "Id",
+            "LiqPhaseQualifier": "VLiqPhase",
+        },
+        value_transform=op_transform,
     )
 
-        Dim formState As APFormState
-        formState = Get_AP_FormState(i)
+    forms_copied = old_table.ListRows.Count if copied > 0 else 0
 
-        Select Case formState
+    return forms_copied, copied
 
-            Case AP_FORM_EMPTY, _
-                 AP_FORM_RESERVED
 
-                GoTo NextForm
+def migrate_workbook_data(
+    *,
+    old_book: xw.Book,
+    new_book: xw.Book,
+) -> tuple[int, int, int, list[str]]:
+    warnings: list[str] = []
 
-            Case AP_FORM_FILLED
+    total_forms = 0
+    total_named = 0
+    total_table_values = 0
 
-                ' идём дальше
+    unprotect_all_sheets(new_book)
 
-        End Select
+    for study in STUDIES:
+        logging.info("Миграция исследования %s", study)
 
-        ' Если такие формы принципиально не участвуют
-        ' в сохранении — не включаем их и в хеш.
-        If sheetAP.Range( _
-            "AP_" & i & "_TaskId" _
-        ).Interior.ColorIndex = 3 Then
-
-            GoTo NextForm
-
-        End If
-
-        formIndex = formIndex + 1
-
-        ' =========================================================
-        ' РОДИТЕЛЬСКИЕ ПОЛЯ
-        ' =========================================================
-
-        Dim headerCell As Range
-        Dim headerName As String
-        Dim formatValue As Variant
-
-        For Each headerCell _
-            In APTable.HeaderRowRange.Cells
-
-            headerName = CStr(headerCell.value)
-
-            Select Case headerName
-
-                Case "dateTimeSync", _
-                     "resultIdAP"
-
-                    ' Эти поля не влияют на пользовательские данные.
-
-                Case Else
-
-                    formatValue = _
-                        FormatValueForSyncText( _
-                            headerName, _
-                            sheetAP.Range( _
-                                "AP_" & i & "_" & headerName _
-                            ).value _
-                        )
-
-                    Data.Add _
-                        formIndex & "." & headerName, _
-                        formatValue
-
-            End Select
-
-        Next headerCell
-
-        ' =========================================================
-        ' ДОЧЕРНЯЯ ТАБЛИЦА
-        ' =========================================================
-
-        Dim srcTable As ListObject
-        Set srcTable = _
-            sheetAP.ListObjects( _
-                "AP_source_" & i _
+        if study == "OP":
+            forms, table_values = migrate_op_table(
+                old_book=old_book,
+                new_book=new_book,
+                warnings=warnings,
             )
 
-        Dim pressureCol As Long
-        Dim temperatureCol As Long
-        Dim densityCol As Long
-        Dim activeCol As Long
+            total_forms += forms
+            total_table_values += table_values
+            continue
 
-        pressureCol = _
-            srcTable.ListColumns( _
-                COL_PRESSURE_FORM _
-            ).index
+        forms, named_values, table_values = migrate_named_range_study(
+            old_book=old_book,
+            new_book=new_book,
+            study=study,
+            warnings=warnings,
+        )
 
-        temperatureCol = _
-            srcTable.ListColumns( _
-                COL_TEMPERATURE_FORM _
-            ).index
+        total_forms += forms
+        total_named += named_values
+        total_table_values += table_values
 
-        densityCol = _
-            srcTable.ListColumns( _
-                COL_DENSITY_FORM _
-            ).index
-
-        activeCol = _
-            srcTable.ListColumns( _
-                COL_ACTIVE_FORM _
-            ).index
-
-        Dim X As Long
-        Dim sourceIndex As Long
-
-        sourceIndex = 0
-
-        For X = 1 To srcTable.ListRows.count
-
-            If SourceRowHasData( _
-                srcTable, _
-                X, _
-                Array( _
-                    COL_PRESSURE_FORM, _
-                    COL_DENSITY_FORM _
-                ), _
-                Array("AND") _
-            ) Then
-
-                sourceIndex = sourceIndex + 1
-
-                formatValue = _
-                    FormatValueForSyncText( _
-                        COL_PRESSURE_DB, _
-                        srcTable.DataBodyRange.Cells( _
-                            X, _
-                            pressureCol _
-                        ).value _
-                    )
-
-                Data.Add _
-                    formIndex & "." & _
-                    COL_PRESSURE_DB & "." & sourceIndex, _
-                    formatValue
+    return total_forms, total_named, total_table_values, warnings
 
 
-                formatValue = _
-                    FormatValueForSyncText( _
-                        COL_TEMPERATURE_DB, _
-                        srcTable.DataBodyRange.Cells( _
-                            X, _
-                            temperatureCol _
-                        ).value _
-                    )
+# =============================================================================
+# Project processing
+# =============================================================================
 
-                Data.Add _
-                    formIndex & "." & _
-                    COL_TEMPERATURE_DB & "." & sourceIndex, _
-                    formatValue
+def migrate_one_project(
+    *,
+    app: xw.App,
+    project_code: str,
+    base_dir: Path,
+    template_path: Path,
+    recursive: bool,
+    overwrite: bool,
+) -> ProjectMigrationReport:
+    project_start = time.perf_counter()
+    progress(f"{project_code}: начинаю перенос")
+    warnings: list[str] = []
 
+    old_book = None
+    new_book = None
 
-                formatValue = _
-                    FormatValueForSyncText( _
-                        COL_DENSITY_DB, _
-                        srcTable.DataBodyRange.Cells( _
-                            X, _
-                            densityCol _
-                        ).value _
-                    )
+    try:
+        folder = find_project_folder(base_dir, project_code, recursive=recursive)
+        old_file = find_v20_file(folder)
+        new_file = make_v23_file(folder, template_path, overwrite=overwrite)
 
-                Data.Add _
-                    formIndex & "." & _
-                    COL_DENSITY_DB & "." & sourceIndex, _
-                    formatValue
+        logging.info("Проект %s: folder=%s", project_code, folder)
+        logging.info("Проект %s: old=%s", project_code, old_file)
+        logging.info("Проект %s: new=%s", project_code, new_file)
 
+        old_book = open_book(app, old_file, read_only=True)
+        new_book = open_book(app, new_file, read_only=False)
 
-                formatValue = _
-                    FormatValueForSyncText( _
-                        COL_ACTIVE_DB, _
-                        srcTable.DataBodyRange.Cells( _
-                            X, _
-                            activeCol _
-                        ).value _
-                    )
+        unprotect_all_sheets(new_book)
 
-                Data.Add _
-                    formIndex & "." & _
-                    COL_ACTIVE_DB & "." & sourceIndex, _
-                    formatValue
+        set_current_project_in_form(new_book, project_code)
 
-            End If
+        forms, named_values, table_values, warnings = migrate_workbook_data(
+            old_book=old_book,
+            new_book=new_book,
+        )
 
-        Next X
+        #protect_all_sheets(new_book)
 
-NextForm:
-        i = i + 1
+        new_book.save()
 
-    Loop
+        elapsed = time.perf_counter() - project_start
+        progress(f"{project_code}: перенос завершён за {elapsed:.2f} сек")
 
-    Set Build_AP_HashData = Data
+        return ProjectMigrationReport(
+            project=project_code,
+            ok=True,
+            message="Миграция выполнена",
+            folder=str(folder),
+            old_file=str(old_file),
+            new_file=str(new_file),
+            forms_copied=forms,
+            named_values_copied=named_values,
+            table_values_copied=table_values,
+            warnings=warnings,
+        )
 
-End Function
+    except Exception as exc:
+        logging.exception("Ошибка миграции проекта %s", project_code)
 
-Private Function CheckAPTask( _
-    ByVal taskId As Long, _
-    ByVal sampleCode As String, _
-    ByVal temperature As Variant, _
-    ByVal pageNumber As Long _
-) As String
+        elapsed = time.perf_counter() - project_start
+        progress(f"{project_code}: ошибка переноса через {elapsed:.2f} сек")
 
-    Dim tasks As ListObject
-    Set tasks = ActiveWorkbook.Worksheets("Task").ListObjects(1)
+        return ProjectMigrationReport(
+            project=project_code,
+            ok=False,
+            message=str(exc),
+            warnings=warnings,
+            error_type=type(exc).__name__,
+        )
 
-    Dim taskCheck As Range
-    Set taskCheck = tasks.ListColumns("Номер задания").DataBodyRange.Find( _
-        What:=taskId, _
-        LookAt:=xlWhole, _
-        SearchOrder:=xlByColumns _
-    )
+    finally:
+        if old_book is not None:
+            try:
+                old_book.close()
+            except Exception:
+                pass
 
-    If taskCheck Is Nothing Then
-        CheckAPTask = "Указан неизвестный номер анализа " & taskId & _
-               " на странице " & pageNumber & _
-               ". Попробуйте обновить данные проекта или исправьте значение."
-        Exit Function
-    End If
-
-    Dim taskRowIndex As Long
-    taskRowIndex = taskCheck.row - tasks.DataBodyRange.row + 1
-
-    If CStr(tasks.ListColumns("Код проекта").DataBodyRange.Cells(taskRowIndex, 1).value) <> sampleCode Then
-        CheckAPTask = "Указан неверный номер анализа " & taskId & _
-               " на странице " & pageNumber & _
-               ". Шифр пробы в задании отличается от шифра пробы в исследовании. " & _
-               "Исправьте номер задания или выберите верную форму для внесения."
-        Exit Function
-    Else
-        If IsNumeric(tasks.ListColumns("Тэкс, °C").DataBodyRange.Cells(taskRowIndex, 1).value) And _
-                IsNumeric(temperature) Then
-            If Abs(CDbl(tasks.ListColumns("Тэкс, °C").DataBodyRange.Cells(taskRowIndex, 1).value) - temperature) > 0.5 Then
-                CheckAPTask = "Температура исследования в задании " & taskId & _
-                    " на странице " & pageNumber & _
-                    " отличается от фактической более чем на 0,5 C. " & _
-                    "Исправьте номер задания или выберите верную форму для внесения."
-                Exit Function
-            End If
-        End If
-    End If
-
-    CheckAPTask = "OK"
-
-End Function
+        if new_book is not None:
+            try:
+                new_book.close()
+            except Exception:
+                pass
 
 
-Public Function Load_AP_results_to_forms( _
-    Optional ByVal mode As String = "by_key", _
-    Optional ByVal fields As Variant, _
-    Optional ByVal silence As Boolean = False _
-) As String
-    
-    On Error GoTo CleanFail
-    
-    Dim wb As Workbook
-    Set wb = ActiveWorkbook
+def run_migration(
+    *,
+    projects_text: str,
+    base_dir: str = BASE_PROJECTS_DIR,
+    template_path: str = CLEAN_V23_TEMPLATE,
+    recursive: bool = False,
+    overwrite: bool = False,
+) -> MigrationReport:
+    projects = parse_project_input(projects_text)
 
-    Dim sheetAP As Worksheet
-    Set sheetAP = wb.Worksheets("AP")
+    base_path = Path(base_dir)
+    template = Path(template_path)
 
-    Dim resultTable As ListObject
-    Set resultTable = wb.Worksheets("AP_results").ListObjects("AP_results")
+    if not template.exists():
+        raise FileNotFoundError(f"Чистая форма v23 не найдена: {template}")
 
-    Dim sourceTable As ListObject
-    Set sourceTable = wb.Worksheets("AP_sourceData").ListObjects("AP_sourceData")
+    app = xw.App(visible=False, add_book=False)
 
-    Dim fieldFilter As Object
-    Set fieldFilter = BuildFieldFilter(fields)
-    
-    Dim text As String
-    Dim warnText As String
-    
-    mode = LCase$(Trim$(mode))
+    try:
+        app.display_alerts = False
+        app.screen_updating = False
 
-    If mode <> "by_key" And mode <> "sequential" Then
-        text = "ERROR|mode должен быть 'by_key' или 'sequential'"
-        Load_AP_results_to_forms = text
-        If Not silence Then
-            MsgBox text, vbExclamation
-        End If
-        Exit Function
-    End If
+        reports: list[ProjectMigrationReport] = []
 
-    If resultTable.DataBodyRange Is Nothing Or _
-            Application.WorksheetFunction.CountA(resultTable.DataBodyRange) = 0 Then
-        text = "OK|Таблица AP_results пустая."
-        Load_AP_results_to_forms = text
-        If Not silence Then
-            'MsgBox text, vbInformation
-        End If
-        Exit Function
-    End If
-
-    Dim resultRowIndex As Long
-    Dim formIndex As Long
-    Dim notFoundCount As Long
-
-    For resultRowIndex = 1 To resultTable.ListRows.count
-
-        If mode = "sequential" Then
-            formIndex = resultRowIndex
-            EnsureAPFormExists wb, formIndex
-        Else
-            formIndex = FindFormIndexForResultRow( _
-                wb, _
-                sheetAP, _
-                resultTable, _
-                resultRowIndex, _
-                "AP", _
-                Array("sampleCode", "analyseNumber") _
+        for project_code in projects:
+            report = migrate_one_project(
+                app=app,
+                project_code=project_code,
+                base_dir=base_path,
+                template_path=template,
+                recursive=recursive,
+                overwrite=overwrite,
             )
-        End If
+            reports.append(report)
 
-        If formIndex = 0 Or Not NamedRangeExists(wb, "AP_" & formIndex & "_sampleCode") Then
-            notFoundCount = notFoundCount + 1
-            warnText = warnText & "Не найдена форма для строки AP_results #" & resultRowIndex & vbCrLf & _
-                   "sampleCode = " & GetTableValue(resultTable, resultRowIndex, "sampleCode") & vbCrLf & _
-                   "TaskId = " & GetTableValue(resultTable, resultRowIndex, "TaskId") & vbCrLf & _
-                   "analyseNumber = " & GetTableValue(resultTable, resultRowIndex, "analyseNumber") & vbCrLf & vbCrLf
-            GoTo NextResultRow
-        End If
+        ok = all(r.ok for r in reports)
 
-        FillOneAPFormFromResultRow _
-            wb, _
-            sheetAP, _
-            resultTable, _
-            sourceTable, _
-            resultRowIndex, _
-            formIndex, _
-            fieldFilter
+        return MigrationReport(
+            ok=ok,
+            message="Миграция завершена" if ok else "Миграция завершена с ошибками",
+            projects=reports,
+        )
 
-NextResultRow:
-    Next resultRowIndex
 
-    If notFoundCount = 0 Then
-        Load_AP_results_to_forms = "OK|Данные AP перенесены в формы."
-    Else
-        text = "WARN|Данные AP перенесены частично. Не найдено форм: " & notFoundCount & vbCrLf & warnText
-        Load_AP_results_to_forms = text
-        If Not silence Then
-            MsgBox text, vbExclamation
-        End If
-    End If
-    
-    Exit Function
-    
-CleanFail:
-    text = _
-        "ERROR|" & _
-        CStr(Err.Number) & "|" & _
-        Err.Description
+    finally:
+        try:
+            app.quit()
+        except Exception:
+            pass
+        finally:
+            app = None
+            gc.collect()
 
-    Load_AP_results_to_forms = text
 
-    If Not silence Then
-        MsgBox text, vbCritical
-    End If
-End Function
+# =============================================================================
+# CLI / JSON
+# =============================================================================
 
-Private Sub EnsureAPFormExists( _
-    ByVal wb As Workbook, _
-    ByVal formIndex As Long _
-)
-    Do While Not NamedRangeExists(wb, "AP_" & formIndex & "_sampleCode")
-        Call AddFormAP
-    Loop
-End Sub
+def run_json(
+    *,
+    projects_text: str,
+    base_dir: str = BASE_PROJECTS_DIR,
+    template_path: str = CLEAN_V23_TEMPLATE,
+    recursive: bool = False,
+    overwrite: bool = False,
+) -> str:
+    try:
+        report = run_migration(
+            projects_text=projects_text,
+            base_dir=base_dir,
+            template_path=template_path,
+            recursive=recursive,
+            overwrite=overwrite,
+        )
 
-Private Sub FillOneAPFormFromResultRow( _
-    ByVal wb As Workbook, _
-    ByVal sheetAP As Worksheet, _
-    ByVal resultTable As ListObject, _
-    ByVal sourceTable As ListObject, _
-    ByVal resultRowIndex As Long, _
-    ByVal formIndex As Long, _
-    ByVal fieldFilter As Object _
-)
-    Dim resultId As Variant
-    resultId = GetTableValue(resultTable, resultRowIndex, COL_RESULT_ID_DB)
+        return json.dumps(asdict(report), ensure_ascii=False, indent=2)
 
-    Call CopyTableRowToNamedRanges( _
-        wb, _
-        sheetAP, _
-        resultTable, _
-        resultRowIndex, _
-        "AP", _
-        formIndex, _
-        fieldFilter _
+    except Exception as exc:
+        logging.exception("Критическая ошибка миграции")
+
+        report = MigrationReport(
+            ok=False,
+            message=f"{type(exc).__name__}: {exc}. Подробности в логе: {LOG_PATH}",
+            projects=[],
+        )
+
+        return json.dumps(asdict(report), ensure_ascii=False, indent=2)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Миграция данных из формы v20 в новую чистую форму v23"
     )
 
-    If Len(Trim$(CStr(resultId))) > 0 Then
-        FillAPSourceTableFromSourceData sheetAP, sourceTable, formIndex, resultId, fieldFilter
-    End If
-End Sub
-
-
-Private Sub FillAPSourceTableFromSourceData( _
-    ByVal sheetAP As Worksheet, _
-    ByVal sourceTable As ListObject, _
-    ByVal formIndex As Long, _
-    ByVal resultId As Variant, _
-    ByVal fieldFilter As Object _
-)
-    Dim formSourceTable As ListObject
-    Set formSourceTable = sheetAP.ListObjects("AP_source_" & formIndex)
-
-    If formSourceTable.DataBodyRange Is Nothing Then
-        Exit Sub
-    End If
-
-    Call ClearMappedColumnsInTable( _
-        formSourceTable, _
-        APSourceLoadMappings(), _
-        fieldFilter _
+    parser.add_argument(
+        "--projects",
+        default=None,
+        help="Проект или диапазон проектов. Например: 26-F001 или 26-F001...26-F015",
     )
 
-    Call CopyMatchingTableRowsToTableRows( _
-        sourceTable, _
-        formSourceTable, _
-        COL_RESULT_ID_DB, _
-        resultId, _
-        APSourceLoadMappings(), _
-        fieldFilter _
-    )
-End Sub
-
-
-Private Function APSourceMappings() As Variant
-    APSourceMappings = Array( _
-        Array(COL_PRESSURE_DB, COL_PRESSURE_FORM), _
-        Array(COL_TEMPERATURE_DB, COL_TEMPERATURE_FORM), _
-        Array(COL_DENSITY_DB, COL_DENSITY_FORM), _
-        Array(COL_ACTIVE_DB, COL_ACTIVE_FORM) _
-    )
-End Function
-
-Private Function APSourceLoadMappings() As Variant
-
-    APSourceLoadMappings = Array( _
-        Array(COL_ROW_ID_DB, COL_ROW_ID_DB), _
-        Array(COL_PRESSURE_DB, COL_PRESSURE_FORM), _
-        Array(COL_TEMPERATURE_DB, COL_TEMPERATURE_FORM), _
-        Array(COL_DENSITY_DB, COL_DENSITY_FORM), _
-        Array(COL_ACTIVE_DB, COL_ACTIVE_FORM) _
+    parser.add_argument(
+        "--base-dir",
+        default=BASE_PROJECTS_DIR,
+        help="Папка, внутри которой искать папки проектов",
     )
 
-End Function
-
-Private Function Validate_AP_Form(ByVal formIndex As Long) As Boolean
-
-    Validate_AP_Form = False
-
-    Dim wb As Workbook
-    Set wb = ActiveWorkbook
-
-    Dim sheetAP As Worksheet
-    Set sheetAP = wb.Worksheets("AP")
-
-    Dim APTable As ListObject
-    Set APTable = wb.Worksheets("AP_results").ListObjects("AP_results")
-
-    Dim errors As String
-    Dim errorCount As Long
-
-    If formIndex <= 0 Then
-        MsgBox "Некорректный номер формы AP: " & formIndex, vbExclamation
-        Exit Function
-    End If
-
-    If Not NamedRangeExists(wb, "AP_" & formIndex & "_sampleCode") _
-       Or Not ListObjectExists(sheetAP, "AP_source_" & formIndex) Then
-
-        MsgBox "Форма AP_" & formIndex & " не найдена.", vbExclamation
-        Exit Function
-
-    End If
-
-    Dim headerCell As Range
-    Dim fieldName As String
-    Dim rangeName As String
-
-    Dim rng As Range
-    Dim valueCell As Range
-
-    Dim fieldValue As Variant
-    Dim fieldText As String
-    
-    For Each headerCell In APTable.HeaderRowRange.Cells
-
-        fieldName = CStr(headerCell.value)
-
-        If fieldName = "dateTimeSync" Then
-            GoTo next_header
-        End If
-
-        rangeName = "AP_" & formIndex & "_" & fieldName
-
-        If Not NamedRangeExists(wb, rangeName) Then
-
-            AddValidationError _
-                errors, _
-                errorCount, _
-                "Не найден именованный диапазон: " & rangeName
-
-            GoTo next_header
-
-        End If
-
-        Set rng = sheetAP.Range(rangeName)
-        Set valueCell = rng.Cells(1, 1)
-
-        ' Снимаем старую подсветку перед новой проверкой.
-        ClearValidationFill rng
-
-        fieldValue = valueCell.value
-
-        If IsError(fieldValue) Then
-
-            AddValidationError _
-                errors, _
-                errorCount, _
-                rangeName & _
-                " содержит ошибку Excel: " & valueCell.text & _
-                " (" & valueCell.Worksheet.name & _
-                "!" & valueCell.Address(False, False) & ")", _
-                rng
-
-            GoTo next_header
-
-        End If
-
-        fieldText = Trim$(CStr(fieldValue))
-
-        ' =========================================================
-        ' ГРУППА 1. Поля, которые должны содержать число,
-        ' если они заполнены.
-        ' =========================================================
-
-        Select Case fieldName
-            Case "TaskId"
-
-                If fieldText <> "" Then
-
-                    If Not IsNumeric(fieldValue) Then
-
-                        AddValidationError _
-                            errors, _
-                            errorCount, _
-                            "В поле """ & AP_FieldCaption(fieldName) & _
-                            """ должно быть указано число: " & rangeName, _
-                            rng
-                    ElseIf CDbl(fieldValue) <> Fix(CDbl(fieldValue)) Then
-
-                        AddValidationError _
-                            errors, _
-                            errorCount, _
-                            "В поле """ & AP_FieldCaption(fieldName) & _
-                            """ должно быть указано целое число: " & rangeName, _
-                            rng
-                    ElseIf fieldValue <= 0 Then
-                        AddValidationError _
-                            errors, _
-                            errorCount, _
-                            "В поле """ & AP_FieldCaption(fieldName) & _
-                            """ должно быть указано положительное целое число: " & rangeName, _
-                            rng
-                    Else
-                        Dim result As String
-
-                        result = CheckAPTask( _
-                            CLng(fieldValue), _
-                            CStr(sheetAP.Range( _
-                                "AP_" & formIndex & "_sampleCode" _
-                            ).value), _
-                            sheetAP.Range( _
-                                "AP_" & formIndex & "_Tfact" _
-                            ).value, _
-                            formIndex _
-                        )
-
-                        If result <> "OK" Then
-
-                            AddValidationError _
-                                errors, _
-                                errorCount, _
-                                result, _
-                                rng
-
-                        End If
-                    End If
-                End If
-
-            Case "Tfact", _
-                 "ka", _
-                 "kb", _
-                 "kc"
-
-                If fieldText <> "" Then
-
-                    If Not IsNumeric(fieldValue) Then
-
-                        AddValidationError _
-                            errors, _
-                            errorCount, _
-                            "В поле """ & AP_FieldCaption(fieldName) & _
-                            """ должно быть указано число: " & rangeName, _
-                            rng
-
-                    End If
-
-                End If
-
-        End Select
-
-        ' =========================================================
-        ' ГРУППА 2. Обязательные непустые поля.
-        ' =========================================================
-
-        Select Case fieldName
-
-            Case "sampleCode", _
-                 "analyseNumber", _
-                 "apEquipment", _
-                 "apEquipmentNumber"
-
-                If fieldText = "" Then
-
-                    AddValidationError _
-                        errors, _
-                        errorCount, _
-                        "Не заполнено обязательное поле """ & _
-                        AP_FieldCaption(fieldName) & _
-                        """: " & rangeName, _
-                        rng
-
-                End If
-
-        End Select
-
-        ' =========================================================
-        ' ГРУППА 3. Поля ввода исполнителя.
-        ' =========================================================
-
-        Select Case fieldName
-
-            Case "operator"
-
-                If fieldText = "" Then
-
-                    AddValidationError _
-                        errors, _
-                        errorCount, _
-                        "Не указан исполнитель: " & rangeName, _
-                        rng
-
-                ElseIf Not IsValidExecutor(fieldValue) Then
-
-                    AddValidationError _
-                        errors, _
-                        errorCount, _
-                        "Неверно указан исполнитель: " & rangeName, _
-                        rng
-
-                End If
-
-        End Select
-
-        ' =========================================================
-        ' ГРУППА 4. Поля с датой.
-        ' =========================================================
-
-        Select Case fieldName
-
-            Case "date"
-
-                If fieldText = "" Then
-
-                    AddValidationError _
-                        errors, _
-                        errorCount, _
-                        "Не заполнена дата выполнения: " & rangeName, _
-                        rng
-
-                ElseIf Not IsDate(fieldValue) Then
-
-                    AddValidationError _
-                        errors, _
-                        errorCount, _
-                        "Введённое значение невозможно преобразовать " & _
-                        "в дату: " & rangeName, _
-                        rng
-
-                End If
-
-        End Select
-
-        ' =========================================================
-        ' ГРУППА 5. Дополнительные ограничения для числовых полей.
-        ' Сюда попадаем только после проверки IsNumeric.
-        ' =========================================================
-
-        Select Case fieldName
-
-            Case "TaskId"
-
-                If fieldText <> "" And IsNumeric(fieldValue) Then
-
-                    If CDbl(fieldValue) < 0 Then
-
-                        AddValidationError _
-                            errors, _
-                            errorCount, _
-                            "Номер задания не может быть отрицательным: " & _
-                            rangeName, _
-                            rng
-
-                    End If
-
-                End If
-
-        End Select
-
-next_header:
-    Next headerCell
-
-    ' =============================================================
-    ' ПРОВЕРКА ТАБЛИЦЫ ИСХОДНЫХ ДАННЫХ
-    ' =============================================================
-
-    Dim sourceTable As ListObject
-    Set sourceTable = sheetAP.ListObjects("AP_source_" & formIndex)
-
-    If Not ListColumnExists(sourceTable, COL_ROW_ID_DB) _
-            Or Not ListColumnExists(sourceTable, COL_PRESSURE_FORM) _
-            Or Not ListColumnExists(sourceTable, COL_TEMPERATURE_FORM) _
-            Or Not ListColumnExists(sourceTable, COL_DENSITY_FORM) _
-            Or Not ListColumnExists(sourceTable, COL_ACTIVE_FORM) Then
-
-        AddValidationError _
-            errors, _
-            errorCount, _
-            "В таблице AP_source_" & formIndex & _
-            " не найдены обязательные столбцы."
-
-        GoTo after_source_validation
-
-    End If
-
-    If sourceTable.DataBodyRange Is Nothing Then
-
-        AddValidationError _
-            errors, _
-            errorCount, _
-            "Таблица AP_source_" & formIndex & _
-            " не содержит строк."
-
-        GoTo after_source_validation
-
-    End If
-
-    Dim pressureCol As Long
-    Dim temperatureCol As Long
-    Dim densityCol As Long
-    Dim activeCol As Long
-
-    pressureCol = sourceTable.ListColumns(COL_PRESSURE_FORM).index
-    temperatureCol = sourceTable.ListColumns(COL_TEMPERATURE_FORM).index
-    densityCol = sourceTable.ListColumns(COL_DENSITY_FORM).index
-    activeCol = sourceTable.ListColumns(COL_ACTIVE_FORM).index
-
-    Dim rowIndex As Long
-
-    Dim pressureCell As Range
-    Dim temperatureCell As Range
-    Dim densityCell As Range
-    Dim activeCell As Range
-
-    Dim pressureValue As Variant
-    Dim temperatureValue As Variant
-    Dim densityValue As Variant
-    Dim activeValue As Variant
-
-    Dim pressureText As String
-    Dim temperatureText As String
-    Dim densityText As String
-
-    Dim validRowsCount As Long
-    Dim activeRowsCount As Long
-    Dim isActive As Boolean
-
-    For rowIndex = 1 To sourceTable.ListRows.count
-
-        Set pressureCell = _
-            sourceTable.DataBodyRange.Cells(rowIndex, pressureCol)
-
-        Set temperatureCell = _
-            sourceTable.DataBodyRange.Cells(rowIndex, temperatureCol)
-
-        Set densityCell = _
-            sourceTable.DataBodyRange.Cells(rowIndex, densityCol)
-
-        Set activeCell = _
-            sourceTable.DataBodyRange.Cells(rowIndex, activeCol)
-
-        ' Сначала снимаем прежнюю подсветку проверяемых ячеек строки.
-        ClearValidationFill pressureCell
-        ClearValidationFill temperatureCell
-        ClearValidationFill densityCell
-        ClearValidationFill activeCell
-
-        pressureValue = pressureCell.value
-        temperatureValue = temperatureCell.value
-        densityValue = densityCell.value
-        activeValue = activeCell.value
-
-        ' ---------------------------------------------------------
-        ' Ошибки Excel в давлении и плотности.
-        ' ---------------------------------------------------------
-
-        If IsError(pressureValue) Then
-
-            AddValidationError _
-                errors, _
-                errorCount, _
-                "AP_source_" & formIndex & _
-                ", строка " & rowIndex & _
-                ": давление содержит ошибку Excel: " & _
-                pressureCell.text, _
-                pressureCell
-
-            GoTo next_source_row
-
-        End If
-
-        If IsError(densityValue) Then
-
-            AddValidationError _
-                errors, _
-                errorCount, _
-                "AP_source_" & formIndex & _
-                ", строка " & rowIndex & _
-                ": плотность содержит ошибку Excel: " & _
-                densityCell.text, _
-                densityCell
-
-            GoTo next_source_row
-
-        End If
-
-        pressureText = Trim$(CStr(pressureValue))
-        densityText = Trim$(CStr(densityValue))
-
-        ' Если давление или плотность не указаны,
-        ' строку не считаем заполненной и дальше не проверяем.
-        If pressureText = "" Or densityText = "" Then
-            GoTo next_source_row
-        End If
-
-        validRowsCount = validRowsCount + 1
-
-        ' ---------------------------------------------------------
-        ' Давление.
-        ' ---------------------------------------------------------
-
-        If Not IsNumeric(pressureValue) Then
-
-            AddValidationError _
-                errors, _
-                errorCount, _
-                "AP_source_" & formIndex & _
-                ", строка " & rowIndex & _
-                ": давление должно быть числом.", _
-                pressureCell
-
-        ElseIf CDbl(pressureValue) <= 0 _
-            Or CDbl(pressureValue) >= 14000 Then
-
-            AddValidationError _
-                errors, _
-                errorCount, _
-                "AP_source_" & formIndex & _
-                ", строка " & rowIndex & _
-                ": давление должно быть > 0 и < 14000 psig.", _
-                pressureCell
-
-        End If
-
-        ' ---------------------------------------------------------
-        ' Плотность.
-        ' ---------------------------------------------------------
-
-        If Not IsNumeric(densityValue) Then
-
-            AddValidationError _
-                errors, _
-                errorCount, _
-                "AP_source_" & formIndex & _
-                ", строка " & rowIndex & _
-                ": плотность должна быть числом.", _
-                densityCell
-
-        ElseIf CDbl(densityValue) <= 0 _
-            Or CDbl(densityValue) >= 1 Then
-
-            AddValidationError _
-                errors, _
-                errorCount, _
-                "AP_source_" & formIndex & _
-                ", строка " & rowIndex & _
-                ": плотность должна быть > 0 и < 1 г/см3.", _
-                densityCell
-
-        End If
-
-        ' ---------------------------------------------------------
-        ' Температура.
-        ' ---------------------------------------------------------
-
-        If IsError(temperatureValue) Then
-
-            AddValidationError _
-                errors, _
-                errorCount, _
-                "AP_source_" & formIndex & _
-                ", строка " & rowIndex & _
-                ": температура содержит ошибку Excel: " & _
-                temperatureCell.text, _
-                temperatureCell
-
-        Else
-
-            temperatureText = Trim$(CStr(temperatureValue))
-
-            If temperatureText = "" Then
-
-                AddValidationError _
-                    errors, _
-                    errorCount, _
-                    "AP_source_" & formIndex & _
-                    ", строка " & rowIndex & _
-                    ": не указана температура.", _
-                    temperatureCell
-
-            ElseIf Not IsNumeric(temperatureValue) Then
-
-                AddValidationError _
-                    errors, _
-                    errorCount, _
-                    "AP_source_" & formIndex & _
-                    ", строка " & rowIndex & _
-                    ": температура должна быть числом.", _
-                    temperatureCell
-
-            ElseIf CDbl(temperatureValue) < -20 _
-                Or CDbl(temperatureValue) > 140 Then
-
-                AddValidationError _
-                    errors, _
-                    errorCount, _
-                    "AP_source_" & formIndex & _
-                    ", строка " & rowIndex & _
-                    ": температура должна быть в диапазоне " & _
-                    "от -20 до 140 °C.", _
-                    temperatureCell
-
-            End If
-
-        End If
-
-        ' ---------------------------------------------------------
-        ' Поле Active.
-        ' ---------------------------------------------------------
-
-        If IsError(activeValue) Then
-
-            AddValidationError _
-                errors, _
-                errorCount, _
-                "AP_source_" & formIndex & _
-                ", строка " & rowIndex & _
-                ": поле «Активна» содержит ошибку Excel: " & _
-                activeCell.text, _
-                activeCell
-
-        Else
-
-            isActive = False
-
-            Select Case LCase$(Trim$(CStr(activeValue)))
-
-                Case "true", _
-                     "истина", _
-                     "1", _
-                     "yes", _
-                     "да", _
-                     "+"
-
-                    isActive = True
-
-            End Select
-
-            If isActive Then
-                activeRowsCount = activeRowsCount + 1
-            End If
-
-        End If
-
-next_source_row:
-    Next rowIndex
-
-    ' =============================================================
-    ' ОБЩИЕ ПРОВЕРКИ ТАБЛИЦЫ
-    ' =============================================================
-
-    If validRowsCount = 0 Then
-
-        AddValidationError _
-            errors, _
-            errorCount, _
-            "В AP_source_" & formIndex & _
-            " нет ни одной строки с заполненными " & _
-            "давлением и плотностью.", _
-            sourceTable.ListColumns(COL_PRESSURE_FORM).DataBodyRange
-
-        SetValidationErrorFill _
-            sourceTable.ListColumns(COL_DENSITY_FORM).DataBodyRange
-
-    End If
-
-    If activeRowsCount = 0 Then
-
-        AddValidationError _
-            errors, _
-            errorCount, _
-            "В AP_source_" & formIndex & _
-            " нет ни одной заполненной строки с «Активна» = True.", _
-            sourceTable.ListColumns(COL_ACTIVE_FORM).DataBodyRange
-
-    End If
-
-after_source_validation:
-
-    If errorCount > 0 Then
-
-        MsgBox _
-            "AP_" & formIndex & _
-            " не сохранена. Исправьте ошибки:" & _
-            vbCrLf & vbCrLf & errors, _
-            vbExclamation
-
-        Exit Function
-
-    End If
-
-    Validate_AP_Form = True
-
-End Function
-
-' ================================================================
-' ПОНЯТНЫЕ НАЗВАНИЯ ПОЛЕЙ ДЛЯ ТЕКСТА ОШИБОК
-' ================================================================
-
-Private Function AP_FieldCaption(ByVal fieldName As String) As String
-
-    Select Case fieldName
-
-        Case "TaskId"
-            AP_FieldCaption = "Номер задания"
-
-        Case "sampleCode"
-            AP_FieldCaption = "Шифр пробы"
-
-        Case "analyseNumber"
-            AP_FieldCaption = "Номер анализа"
-
-        Case "apEquipment"
-            AP_FieldCaption = "Оборудование"
-
-        Case "apEquipmentNumber"
-            AP_FieldCaption = "Номер оборудования"
-
-        Case "Tfact"
-            AP_FieldCaption = "Температура"
-
-        Case "ka"
-            AP_FieldCaption = "Коэффициент ka"
-
-        Case "kb"
-            AP_FieldCaption = "Коэффициент kb"
-
-        Case "kc"
-            AP_FieldCaption = "Коэффициент kc"
-
-        Case "operator"
-            AP_FieldCaption = "Исполнитель"
-
-        Case "date"
-            AP_FieldCaption = "Дата выполнения"
-
-        Case Else
-            AP_FieldCaption = fieldName
-
-    End Select
-
-End Function
-
-Public Function FindEmptyFormAP() As Long
-
-    Dim wb As Workbook
-    Set wb = ActiveWorkbook
-
-    Dim sheetAP As Worksheet
-    Set sheetAP = wb.Worksheets("AP")
-
-    Dim formIndex As Long
-    formIndex = 1
-
-    Do While NamedRangeExists(wb, "AP_" & formIndex & "_sampleCode")
-
-        If Get_AP_FormState(formIndex) = AP_FORM_EMPTY Then
-            FindEmptyFormAP = formIndex
-            Exit Function
-        End If
-
-        formIndex = formIndex + 1
-
-    Loop
-
-    Call AddFormAP
-
-    FindEmptyFormAP = formIndex
-
-End Function
-
-Private Function Get_AP_FormState(ByVal formIndex As Long) As APFormState
-
-    Dim sheetAP As Worksheet
-    Set sheetAP = ActiveWorkbook.Worksheets("AP")
-
-    Dim sampleCode As String
-    Dim taskId As String
-
-    sampleCode = Trim$(CStr(sheetAP.Range("AP_" & formIndex & "_sampleCode").value))
-    taskId = Trim$(CStr(sheetAP.Range("AP_" & formIndex & "_TaskId").value))
-
-    Dim ka As Variant
-    Dim kb As Variant
-    Dim kc As Variant
-
-    ka = sheetAP.Range("AP_" & formIndex & "_ka").value
-    kb = sheetAP.Range("AP_" & formIndex & "_kb").value
-    kc = sheetAP.Range("AP_" & formIndex & "_kc").value
-
-    ' Если в коэффициентах ошибка Excel — считаем форму начатой
-    Dim coeffsHaveError As Boolean
-    coeffsHaveError = IsError(ka) Or IsError(kb) Or IsError(kc)
-
-    Dim coeffsAreZero As Boolean
-
-    If coeffsHaveError Then
-        coeffsAreZero = False
-    Else
-        coeffsAreZero = (val(ka) = 0 And val(kb) = 0 And val(kc) = 0)
-    End If
-
-    Dim hasSampleCode As Boolean
-    Dim hasTaskId As Boolean
-    Dim hasCoeffs As Boolean
-
-    hasSampleCode = (sampleCode <> "")
-    hasTaskId = (taskId <> "")
-    hasCoeffs = Not coeffsAreZero
-
-    ' Форма вообще пустая и не нужна
-    If Not hasSampleCode And Not hasCoeffs Then
-        Get_AP_FormState = AP_FORM_EMPTY
-        Exit Function
-    End If
-
-    ' Форма заполнена
-    If hasSampleCode And hasCoeffs Then
-        Get_AP_FormState = AP_FORM_FILLED
-        Exit Function
-    End If
-
-    ' остальное считаем зарезервированным / пока не сохраняем.
-    Get_AP_FormState = AP_FORM_RESERVED
-
-End Function
-
-Public Sub Load_AP()
-    LoadResearchesFromDB "AP"
-End Sub
-
---______________________________________________________________________________________________________
-
-
-Option Explicit
-
-Private Const EMPTY_DATA_HASH As String = "00000000-0-0"
-
-Public Enum shouldSave
-    
-    DATA_EMPTY = 0
-    DATA_NO_CHANGES = 1
-    DATA_NEED_TO_SAVE = 2
-    DATA_DELETED = 3
-
-End Enum
-
-' ============================================================
-' ВЕРСИИ КОМПОНЕНТОВ
-' ============================================================
-
-Public Const PROP_FORM_VERSION As String = _
-    "PVTFormVersion"
-
-Public Const PROP_ADDIN_VERSION As String = _
-    "PVTAddinVersion"
-
-Public Const PROP_DOWNHOLE_QUALITY_ACT_VERSION As String = _
-    "DownholeSampleQualityActVersion"
-
-Public Const PROP_SURFACE_QUALITY_ACT_VERSION As String = _
-    "SurfaceSampleQualityActVersion"
-
-
-' ============================================================
-' ХЕШ-СУММЫ ИССЛЕДОВАНИЙ
-' ============================================================
-
-Public Const PROP_OP_DATA_HASH As String = _
-    "OPDataHash"
-
-Public Const PROP_OPOH_DATA_HASH As String = _
-    "OPOHDataHash"
-
-Public Const PROP_AP_DATA_HASH As String = _
-    "APDataHash"
-
-Public Const PROP_BP_DATA_HASH As String = _
-    "BPDataHash"
-
-Public Const PROP_GC_DATA_HASH As String = _
-    "GCDataHash"
-
-Public Const PROP_EMV_DATA_HASH As String = _
-    "EMVDataHash"
-
-Public Const PROP_GOR_DATA_HASH As String = _
-    "GORDataHash"
-
-Public Const PROP_SSF_DATA_HASH As String = _
-    "SSFDataHash"
-
-Public Const PROP_CCE_DATA_HASH As String = _
-    "CCEDataHash"
-
-Public Const PROP_CVD_DATA_HASH As String = _
-    "CVDDataHash"
-
-Public Const PROP_REC_DATA_HASH As String = _
-    "RECDataHash"
-
-Public Const PROP_JOIN_DATA_HASH As String = _
-    "JOINDataHash"
-
-
-' ============================================================
-' СТАТУСЫ СИНХРОНИЗАЦИИ ИССЛЕДОВАНИЙ
-' ============================================================
-
-Public Const PROP_OP_DATA_STATE As String = _
-    "OPDataState"
-
-Public Const PROP_OPOH_DATA_STATE As String = _
-    "OPOHDataState"
-
-Public Const PROP_AP_DATA_STATE As String = _
-    "APDataState"
-
-Public Const PROP_BP_DATA_STATE As String = _
-    "BPDataState"
-
-Public Const PROP_GC_DATA_STATE As String = _
-    "GCDataState"
-
-Public Const PROP_EMV_DATA_STATE As String = _
-    "EMVDataState"
-
-Public Const PROP_GOR_DATA_STATE As String = _
-    "GORDataState"
-
-Public Const PROP_SSF_DATA_STATE As String = _
-    "SSFDataState"
-
-Public Const PROP_CCE_DATA_STATE As String = _
-    "CCEDataState"
-
-Public Const PROP_CVD_DATA_STATE As String = _
-    "CVDDataState"
-
-Public Const PROP_REC_DATA_STATE As String = _
-    "RECDataState"
-
-Public Const PROP_JOIN_DATA_STATE As String = _
-    "JOINDataState"
-    
-' ============================================================
-' ПОСЛЕДНИЙ ПОДТВЕРЖДЁННЫЙ ЭТАП ОБРАБОТКИ ИССЛЕДОВАНИЙ (ЗАВЕРШЕНО / ВАЛИДИРОВАНО)
-' ============================================================
-
-Public Const PROP_OP_LAST_WORKFLOW_STAGE As String = "OPLastWorkflowStage"
-Public Const PROP_OPOH_LAST_WORKFLOW_STAGE As String = "OPOHLastWorkflowStage"
-Public Const PROP_AP_LAST_WORKFLOW_STAGE As String = "APLastWorkflowStage"
-Public Const PROP_BP_LAST_WORKFLOW_STAGE As String = "BPLastWorkflowStage"
-Public Const PROP_GC_LAST_WORKFLOW_STAGE As String = "GCLastWorkflowStage"
-Public Const PROP_EMV_LAST_WORKFLOW_STAGE As String = "EMVLastWorkflowStage"
-Public Const PROP_GOR_LAST_WORKFLOW_STAGE As String = "GORLastWorkflowStage"
-Public Const PROP_SSF_LAST_WORKFLOW_STAGE As String = "SSFLastWorkflowStage"
-Public Const PROP_CCE_LAST_WORKFLOW_STAGE As String = "CCELastWorkflowStage"
-Public Const PROP_CVD_LAST_WORKFLOW_STAGE As String = "CVDLastWorkflowStage"
-Public Const PROP_REC_LAST_WORKFLOW_STAGE As String = "RECLastWorkflowStage"
-Public Const PROP_JOIN_LAST_WORKFLOW_STAGE As String = "JOINLastWorkflowStage"
-
-' ============================================================
-' СТАТУС СИНХРОНИЗАЦИИ
-' ============================================================
-
-Public Enum StudySyncStatus
-
-    ' Статус ещё не определён или свойство отсутствует.
-    SYNC_STATUS_UNKNOWN = 0
-
-    ' В исследовании нет данных, требующих сохранения.
-    SYNC_STATUS_EMPTY = 1
-
-    ' Данные заполнены, но ещё ни разу не сохранялись в БД.
-    SYNC_STATUS_UNSAVED = 2
-
-    ' Данные ранее сохранялись, но текущий хеш отличается.
-    SYNC_STATUS_DIRTY = 3
-
-    ' Текущий хеш совпадает с хешем после сохранения.
-    SYNC_STATUS_SYNCED = 4
-
-    ' При определении состояния произошла ошибка.
-    SYNC_STATUS_ERROR = 5
-
-End Enum
-
-
-' ============================================================
-' ЗАПИСЬ СВОЙСТВА
-' ============================================================
-
-Public Sub SetWorkbookMetadataProperty( _
-    ByVal wb As Workbook, _
-    ByVal propertyName As String, _
-    ByVal propertyValue As String, _
-    Optional ByVal saveWorkbook As Boolean = False _
-)
-
-    Dim documentProperty As Object
-
-    If wb Is Nothing Then
-        Err.Raise _
-            vbObjectError + 2100, _
-            "SetWorkbookMetadataProperty", _
-            "Книга не указана."
-    End If
-
-    propertyName = Trim$(propertyName)
-
-    If propertyName = "" Then
-        Err.Raise _
-            vbObjectError + 2101, _
-            "SetWorkbookMetadataProperty", _
-            "Название свойства не указано."
-    End If
-
-    On Error Resume Next
-
-    Set documentProperty = _
-        wb.CustomDocumentProperties(propertyName)
-
-    On Error GoTo ErrorHandler
-
-    If documentProperty Is Nothing Then
-
-        wb.CustomDocumentProperties.Add _
-            name:=propertyName, _
-            LinkToContent:=False, _
-            Type:=msoPropertyTypeString, _
-            value:=propertyValue
-
-    Else
-
-        documentProperty.value = propertyValue
-
-    End If
-
-    If saveWorkbook Then
-        wb.Save
-    End If
-
-    Exit Sub
-
-ErrorHandler:
-
-    Err.Raise _
-        vbObjectError + 2102, _
-        "SetWorkbookMetadataProperty", _
-        "Не удалось записать свойство '" & _
-        propertyName & "' в книгу '" & _
-        wb.name & "'." & vbCrLf & _
-        Err.Description
-
-End Sub
-
-
-' ============================================================
-' ЧТЕНИЕ СВОЙСТВА
-' ============================================================
-
-Public Function GetWorkbookMetadataProperty( _
-    ByVal wb As Workbook, _
-    ByVal propertyName As String, _
-    Optional ByVal defaultValue As String = "" _
-) As String
-
-    Dim documentProperty As Object
-
-    If wb Is Nothing Then
-        Err.Raise _
-            vbObjectError + 2110, _
-            "GetWorkbookMetadataProperty", _
-            "Книга не указана."
-    End If
-
-    propertyName = Trim$(propertyName)
-
-    If propertyName = "" Then
-        Err.Raise _
-            vbObjectError + 2111, _
-            "GetWorkbookMetadataProperty", _
-            "Название свойства не указано."
-    End If
-
-    On Error Resume Next
-
-    Set documentProperty = _
-        wb.CustomDocumentProperties(propertyName)
-
-    On Error GoTo ErrorHandler
-
-    If documentProperty Is Nothing Then
-
-        GetWorkbookMetadataProperty = defaultValue
-
-    ElseIf IsNull(documentProperty.value) Then
-
-        GetWorkbookMetadataProperty = defaultValue
-
-    Else
-
-        GetWorkbookMetadataProperty = _
-            CStr(documentProperty.value)
-
-    End If
-
-    Exit Function
-
-ErrorHandler:
-
-    Err.Raise _
-        vbObjectError + 2112, _
-        "GetWorkbookMetadataProperty", _
-        "Не удалось прочитать свойство '" & _
-        propertyName & "' из книги '" & _
-        wb.name & "'." & vbCrLf & _
-        Err.Description
-
-End Function
-
-
-' ============================================================
-' ПРОВЕРКА НАЛИЧИЯ СВОЙСТВА
-' ============================================================
-
-Public Function WorkbookMetadataPropertyExists( _
-    ByVal wb As Workbook, _
-    ByVal propertyName As String _
-) As Boolean
-
-    Dim documentProperty As Object
-
-    If wb Is Nothing Then
-        Exit Function
-    End If
-
-    propertyName = Trim$(propertyName)
-
-    If propertyName = "" Then
-        Exit Function
-    End If
-
-    On Error Resume Next
-
-    Set documentProperty = _
-        wb.CustomDocumentProperties(propertyName)
-
-    On Error GoTo 0
-
-    WorkbookMetadataPropertyExists = _
-        Not documentProperty Is Nothing
-
-End Function
-
-
-' ============================================================
-' ПРЕОБРАЗОВАНИЕ ENUM В СТРОКУ ДЛЯ МЕТАДАННЫХ
-' ============================================================
-
-Public Function StudySyncStatusToString( _
-    ByVal status As StudySyncStatus _
-) As String
-
-    Select Case status
-
-        Case SYNC_STATUS_EMPTY
-            StudySyncStatusToString = "empty"
-
-        Case SYNC_STATUS_UNSAVED
-            StudySyncStatusToString = "unsaved"
-
-        Case SYNC_STATUS_DIRTY
-            StudySyncStatusToString = "dirty"
-
-        Case SYNC_STATUS_SYNCED
-            StudySyncStatusToString = "synced"
-
-        Case SYNC_STATUS_ERROR
-            StudySyncStatusToString = "error"
-
-        Case Else
-            StudySyncStatusToString = "unknown"
-
-    End Select
-
-End Function
-
-
-' ============================================================
-' ПРЕОБРАЗОВАНИЕ СТРОКИ ИЗ МЕТАДАННЫХ В ENUM
-' ============================================================
-
-Public Function StringToStudySyncStatus( _
-    ByVal value As String _
-) As StudySyncStatus
-
-    Select Case LCase$(Trim$(value))
-
-        Case "empty"
-            StringToStudySyncStatus = _
-                SYNC_STATUS_EMPTY
-
-        Case "unsaved"
-            StringToStudySyncStatus = _
-                SYNC_STATUS_UNSAVED
-
-        Case "dirty"
-            StringToStudySyncStatus = _
-                SYNC_STATUS_DIRTY
-
-        Case "synced"
-            StringToStudySyncStatus = _
-                SYNC_STATUS_SYNCED
-
-        Case "error"
-            StringToStudySyncStatus = _
-                SYNC_STATUS_ERROR
-
-        Case Else
-            StringToStudySyncStatus = _
-                SYNC_STATUS_UNKNOWN
-
-    End Select
-
-End Function
-
-
-' ============================================================
-' УДОБНЫЕ ОБЁРТКИ ДЛЯ СТАТУСА
-' ============================================================
-
-Public Sub SetStudySyncStatus( _
-    ByVal wb As Workbook, _
-    ByVal propertyName As String, _
-    ByVal status As StudySyncStatus, _
-    Optional ByVal saveWorkbook As Boolean = False _
-)
-
-    SetWorkbookMetadataProperty _
-        wb:=wb, _
-        propertyName:=propertyName, _
-        propertyValue:=StudySyncStatusToString(status), _
-        saveWorkbook:=saveWorkbook
-
-End Sub
-
-
-Public Function GetStudySyncStatus( _
-    ByVal wb As Workbook, _
-    ByVal propertyName As String _
-) As StudySyncStatus
-
-    Dim storedValue As String
-
-    storedValue = GetWorkbookMetadataProperty( _
-        wb:=wb, _
-        propertyName:=propertyName, _
-        defaultValue:="unknown" _
+    parser.add_argument(
+        "--template",
+        default=CLEAN_V23_TEMPLATE,
+        help="Путь к чистой форме v23",
     )
 
-    GetStudySyncStatus = _
-        StringToStudySyncStatus(storedValue)
-
-End Function
-
-Public Sub RefreshAllStudySyncStatuses(ByVal wb As Workbook)
-
-    UpdateStudySyncStatus wb, "OP", PROP_OP_DATA_HASH, PROP_OP_DATA_STATE
-    UpdateStudySyncStatus wb, "OPOH", PROP_OPOH_DATA_HASH, PROP_OPOH_DATA_STATE
-    UpdateStudySyncStatus wb, "AP", PROP_AP_DATA_HASH, PROP_AP_DATA_STATE
-    UpdateStudySyncStatus wb, "BP", PROP_BP_DATA_HASH, PROP_BP_DATA_STATE
-    UpdateStudySyncStatus wb, "GC", PROP_GC_DATA_HASH, PROP_GC_DATA_STATE
-    UpdateStudySyncStatus wb, "EMV", PROP_EMV_DATA_HASH, PROP_EMV_DATA_STATE
-    UpdateStudySyncStatus wb, "GOR", PROP_GOR_DATA_HASH, PROP_GOR_DATA_STATE
-    UpdateStudySyncStatus wb, "SSF", PROP_SSF_DATA_HASH, PROP_SSF_DATA_STATE
-    UpdateStudySyncStatus wb, "CCE", PROP_CCE_DATA_HASH, PROP_CCE_DATA_STATE
-    UpdateStudySyncStatus wb, "CVD", PROP_CVD_DATA_HASH, PROP_CVD_DATA_STATE
-    UpdateStudySyncStatus wb, "REC", PROP_REC_DATA_HASH, PROP_REC_DATA_STATE
-    UpdateStudySyncStatus wb, "JOIN", PROP_JOIN_DATA_HASH, PROP_JOIN_DATA_STATE
-
-End Sub
-
-Public Sub RefreshChangedStudySyncStatuses(ByVal wb As Workbook)
-
-    RefreshStudyIfNeeded wb, "OP", PROP_OP_DATA_HASH, PROP_OP_DATA_STATE
-    RefreshStudyIfNeeded wb, "OPOH", PROP_OPOH_DATA_HASH, PROP_OPOH_DATA_STATE
-    RefreshStudyIfNeeded wb, "AP", PROP_AP_DATA_HASH, PROP_AP_DATA_STATE
-    RefreshStudyIfNeeded wb, "BP", PROP_BP_DATA_HASH, PROP_BP_DATA_STATE
-    RefreshStudyIfNeeded wb, "GC", PROP_GC_DATA_HASH, PROP_GC_DATA_STATE
-    RefreshStudyIfNeeded wb, "EMV", PROP_EMV_DATA_HASH, PROP_EMV_DATA_STATE
-    RefreshStudyIfNeeded wb, "GOR", PROP_GOR_DATA_HASH, PROP_GOR_DATA_STATE
-    RefreshStudyIfNeeded wb, "SSF", PROP_SSF_DATA_HASH, PROP_SSF_DATA_STATE
-    RefreshStudyIfNeeded wb, "CCE", PROP_CCE_DATA_HASH, PROP_CCE_DATA_STATE
-    RefreshStudyIfNeeded wb, "CVD", PROP_CVD_DATA_HASH, PROP_CVD_DATA_STATE
-    RefreshStudyIfNeeded wb, "REC", PROP_REC_DATA_HASH, PROP_REC_DATA_STATE
-    RefreshStudyIfNeeded wb, "JOIN", PROP_JOIN_DATA_HASH, PROP_JOIN_DATA_STATE
-
-End Sub
-
-
-Private Sub RefreshStudyIfNeeded( _
-    ByVal wb As Workbook, _
-    ByVal studyCode As String, _
-    ByVal hashProperty As String, _
-    ByVal stateProperty As String _
-)
-
-    ' Если статус отсутствует/unknown, проверяем в любом случае.
-    ' Это нужно для первой проверки новой книги.
-    If Not StudyNeedsHashCheck(wb, studyCode) _
-       And GetStudySyncStatus(wb, stateProperty) <> SYNC_STATUS_UNKNOWN Then
-        Exit Sub
-    End If
-
-    UpdateStudySyncStatus _
-        wb, studyCode, hashProperty, stateProperty
-
-End Sub
-
-Private Sub UpdateStudySyncStatus( _
-    ByVal wb As Workbook, _
-    ByVal studyCode As String, _
-    ByVal hashProperty As String, _
-    ByVal stateProperty As String _
-)
-
-    On Error GoTo ErrorHandler
-
-    Dim currentHash As String
-    Dim savedHash As String
-    Dim status As StudySyncStatus
-
-    currentHash = GetCurrentStudyHash(studyCode)
-    savedHash = GetWorkbookMetadataProperty(wb, hashProperty)
-
-    status = DetermineStudySyncStatus(currentHash, savedHash)
-
-    If GetStudySyncStatus(wb, stateProperty) <> status Then
-        SetStudySyncStatus wb, stateProperty, status, False
-    End If
-
-    ClearStudyHashCheck wb, studyCode
-    Exit Sub
-
-
-ErrorHandler:
-
-    Debug.Print "Ошибка определения статуса " & studyCode & ": " & _
-        Err.Number & ": " & Err.Description
-
-    On Error Resume Next
-    SetStudySyncStatus wb, stateProperty, SYNC_STATUS_ERROR, False
-    ClearStudyHashCheck wb, studyCode
-    On Error GoTo 0
-
-End Sub
-
-Private Function DetermineStudySyncStatus( _
-    ByVal currentHash As String, _
-    ByVal savedHash As String _
-) As StudySyncStatus
-
-    If savedHash = "" Then
-
-        If currentHash = EMPTY_DATA_HASH Then
-            DetermineStudySyncStatus = SYNC_STATUS_EMPTY
-        Else
-            DetermineStudySyncStatus = SYNC_STATUS_UNSAVED
-        End If
-
-    ElseIf currentHash = savedHash Then
-
-        If currentHash = EMPTY_DATA_HASH Then
-            DetermineStudySyncStatus = SYNC_STATUS_EMPTY
-        Else
-            DetermineStudySyncStatus = SYNC_STATUS_SYNCED
-        End If
-
-    Else
-
-        DetermineStudySyncStatus = SYNC_STATUS_DIRTY
-
-    End If
-
-End Function
-
-Private Function GetCurrentStudyHash( _
-    ByVal studyCode As String _
-) As String
-
-    Select Case UCase$(studyCode)
-
-        Case "OP"
-            GetCurrentStudyHash = CalculateCurrentOPHash()
-
-        Case "OPOH"
-            GetCurrentStudyHash = CalculateCurrentOPOHHash()
-
-        Case "AP"
-            GetCurrentStudyHash = CalculateCurrentAPHash()
-
-        Case "BP"
-            GetCurrentStudyHash = CalculateCurrentBPHash()
-
-        Case "GC"
-            GetCurrentStudyHash = CalculateCurrentGCHash()
-
-        Case "EMV"
-            GetCurrentStudyHash = CalculateCurrentEMVHash()
-
-        Case "GOR"
-            GetCurrentStudyHash = CalculateCurrentGORHash()
-
-        Case "SSF"
-            GetCurrentStudyHash = CalculateCurrentSSFHash()
-
-        Case "CCE"
-            GetCurrentStudyHash = CalculateCurrentCCEHash()
-
-        Case "CVD"
-            GetCurrentStudyHash = CalculateCurrentCVDHash()
-
-        Case "REC"
-            GetCurrentStudyHash = CalculateCurrentRecHash()
-
-        Case "JOIN"
-            GetCurrentStudyHash = CalculateCurrentJOINHash()
-
-        Case Else
-            Err.Raise vbObjectError + 2200, _
-                "GetCurrentStudyHash", _
-                "Неизвестный тип исследования: " & studyCode
-
-    End Select
-
-End Function
-
-Public Function IsCurrentHashFormVersion(ByVal wb As Workbook) As Boolean
-
-    Dim formVersion As String
-    formVersion = Trim$(GetWorkbookMetadataProperty(wb, PROP_FORM_VERSION))
-
-    If formVersion = "" Then Exit Function
-
-    IsCurrentHashFormVersion = (Split(formVersion, ".")(0) = "23")
-
-End Function
-
-Public Function GetUnsyncedStudiesText(ByVal wb As Workbook) As String
-
-    Dim studyNames As Variant
-    Dim stateProperties As Variant
-
-    studyNames = Array( _
-        "OP", "OPOH", "AP", "BP", "GC", "EMV", _
-        "GOR", "SSF", "CCE", "CVD", "REC", "JOIN" _
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Искать папки проектов рекурсивно внутри base-dir",
     )
 
-    stateProperties = Array( _
-        PROP_OP_DATA_STATE, PROP_OPOH_DATA_STATE, _
-        PROP_AP_DATA_STATE, PROP_BP_DATA_STATE, _
-        PROP_GC_DATA_STATE, PROP_EMV_DATA_STATE, _
-        PROP_GOR_DATA_STATE, PROP_SSF_DATA_STATE, _
-        PROP_CCE_DATA_STATE, PROP_CVD_DATA_STATE, _
-        PROP_REC_DATA_STATE, PROP_JOIN_DATA_STATE _
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Перезаписывать уже существующий файл *_v23.0.1.xlsx",
     )
 
-    Dim i As Long
-    Dim status As StudySyncStatus
-    Dim statusText As String
-    Dim result As String
+    args = parser.parse_args(argv)
 
-    For i = LBound(studyNames) To UBound(studyNames)
+    projects_text = args.projects
 
-        status = GetStudySyncStatus(wb, CStr(stateProperties(i)))
-        statusText = ""
+    if not projects_text:
+        projects_text = input(
+            "Введите проект или диапазон проектов, например 26-F001 или 26-F001...26-F015: "
+        ).strip()
 
-        Select Case status
-            Case SYNC_STATUS_UNSAVED
-                statusText = "данные ещё не сохранялись в БД"
+    json_result = run_json(
+        projects_text=projects_text,
+        base_dir=args.base_dir,
+        template_path=args.template,
+        recursive=args.recursive,
+        overwrite=args.overwrite,
+    )
 
-            Case SYNC_STATUS_DIRTY
-                statusText = "есть изменения после последнего сохранения в БД"
+    print(json_result)
 
-            Case SYNC_STATUS_ERROR
-                statusText = "не удалось определить состояние данных"
-        End Select
-
-        If statusText <> "" Then
-            result = result & "• " & CStr(studyNames(i)) & _
-                " — " & statusText & vbCrLf
-        End If
-
-    Next i
-
-    GetUnsyncedStudiesText = result
-
-End Function
-
-Public Sub SetStudyBaselineAfterLoad( _
-    ByVal wb As Workbook, _
-    ByVal studyCode As String _
-)
-
-    Dim hashProperty As String
-    Dim stateProperty As String
-
-    Select Case UCase$(Trim$(studyCode))
-
-        Case "OP"
-            hashProperty = PROP_OP_DATA_HASH
-            stateProperty = PROP_OP_DATA_STATE
-
-        Case "OPOH"
-            hashProperty = PROP_OPOH_DATA_HASH
-            stateProperty = PROP_OPOH_DATA_STATE
-
-        Case "AP"
-            hashProperty = PROP_AP_DATA_HASH
-            stateProperty = PROP_AP_DATA_STATE
-
-        Case "BP"
-            hashProperty = PROP_BP_DATA_HASH
-            stateProperty = PROP_BP_DATA_STATE
-
-        Case "GC"
-            hashProperty = PROP_GC_DATA_HASH
-            stateProperty = PROP_GC_DATA_STATE
-
-        Case "EMV"
-            hashProperty = PROP_EMV_DATA_HASH
-            stateProperty = PROP_EMV_DATA_STATE
-
-        Case "GOR"
-            hashProperty = PROP_GOR_DATA_HASH
-            stateProperty = PROP_GOR_DATA_STATE
-
-        Case "SSF"
-            hashProperty = PROP_SSF_DATA_HASH
-            stateProperty = PROP_SSF_DATA_STATE
-
-        Case "CCE"
-            hashProperty = PROP_CCE_DATA_HASH
-            stateProperty = PROP_CCE_DATA_STATE
-
-        Case "CVD"
-            hashProperty = PROP_CVD_DATA_HASH
-            stateProperty = PROP_CVD_DATA_STATE
-
-        Case "REC"
-            hashProperty = PROP_REC_DATA_HASH
-            stateProperty = PROP_REC_DATA_STATE
-
-        Case "JOIN"
-            hashProperty = PROP_JOIN_DATA_HASH
-            stateProperty = PROP_JOIN_DATA_STATE
-
-        Case Else
-            Err.Raise vbObjectError + 2201, _
-                "SetStudyBaselineAfterLoad", _
-                "Неизвестный тип исследования: " & studyCode
-
-    End Select
-
-    Dim currentHash As String
-    currentHash = GetCurrentStudyHash(studyCode)
-
-    SetWorkbookMetadataProperty wb, hashProperty, currentHash, False
-
-    If currentHash = EMPTY_DATA_HASH Then
-        SetStudySyncStatus wb, stateProperty, SYNC_STATUS_EMPTY, False
-    Else
-        SetStudySyncStatus wb, stateProperty, SYNC_STATUS_SYNCED, False
-    End If
-
-    ClearStudyHashCheck wb, studyCode
-
-End Sub
-
-Public Function EffectiveWorkflowStage( _
-    Optional ByVal taskStatus As String = "" _
-) As String
-
-    taskStatus = Trim$(taskStatus)
-
-    If taskStatus = "" Then
-        EffectiveWorkflowStage = "Завершено"
-    Else
-        EffectiveWorkflowStage = taskStatus
-    End If
-
-End Function
+    try:
+        parsed = json.loads(json_result)
+        return 0 if parsed.get("ok") else 1
+    except Exception:
+        return 1
 
 
-
-Public Function ShouldSaveStudy( _
-    ByVal newHash As String, _
-    ByVal oldHash As String, _
-    ByVal lastWorkflowStage As String, _
-    Optional ByVal taskStatus As String = "" _
-) As shouldSave
-
-    Dim requestedStage As String
-    requestedStage = EffectiveWorkflowStage(taskStatus)
-
-    lastWorkflowStage = Trim$(lastWorkflowStage)
-
-    ' Данные изменились — сохраняем всегда.
-    If newHash = EMPTY_DATA_HASH Then
-        If oldHash = EMPTY_DATA_HASH Or oldHash = "" Then
-            ShouldSaveStudy = DATA_EMPTY
-        Else
-            ShouldSaveStudy = DATA_DELETED
-        End If
-        Exit Function
-    End If
-    
-    If newHash <> oldHash Then
-        ShouldSaveStudy = DATA_NEED_TO_SAVE
-        Exit Function
-    End If
-
-    ' Данные не изменились.
-    '
-    ' Обычное сохранение повторять не нужно,
-    ' независимо от того, были данные уже валидированы или нет.
-    If requestedStage = "Завершено" Then
-        ShouldSaveStudy = DATA_NO_CHANGES
-        Exit Function
-    End If
-
-    ' Запрошенный этап уже был успешно сохранён.
-    If StrComp( _
-        requestedStage, _
-        lastWorkflowStage, _
-        vbTextCompare _
-    ) = 0 Then
-
-        ShouldSaveStudy = DATA_NO_CHANGES
-        Exit Function
-
-    End If
-
-    ' Например:
-    ' данные те же,
-    ' было "Завершено",
-    ' сейчас запросили "Валидировано".
-    '
-    ' Выполняем обычное полное сохранение ещё раз,
-    ' но уже со статусом "Валидировано".
-    ShouldSaveStudy = DATA_NEED_TO_SAVE
-
-End Function
-
-Public Sub SetAllStudyBaselinesAfterLoad(ByVal wb As Workbook)
-
-    SetStudyBaselineAfterLoad wb, "OP"
-    SetStudyBaselineAfterLoad wb, "OPOH"
-    SetStudyBaselineAfterLoad wb, "AP"
-    SetStudyBaselineAfterLoad wb, "BP"
-    SetStudyBaselineAfterLoad wb, "GC"
-    SetStudyBaselineAfterLoad wb, "EMV"
-    SetStudyBaselineAfterLoad wb, "GOR"
-    SetStudyBaselineAfterLoad wb, "SSF"
-    SetStudyBaselineAfterLoad wb, "CCE"
-    SetStudyBaselineAfterLoad wb, "CVD"
-    SetStudyBaselineAfterLoad wb, "REC"
-    SetStudyBaselineAfterLoad wb, "JOIN"
-
-End Sub
-
+if __name__ == "__main__":
+    sys.exit(main())
