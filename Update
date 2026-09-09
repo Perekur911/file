@@ -1,3 +1,316 @@
-resultIdStable	TaskId	sampleCode	dateStart	timeStart	dateEnd	timeEnd	operator	PVTcell	temperature	pressure	pressureUnit	pressureAbs	pressureMPaAbs	LiquidVolume	dateTimeSync
+Обработка заняла 56s
 
+Да, отдельные файлы тогда не нужны. Чтобы добавить analyseNumber в уже установленный Stable, внеси следующие изменения.
 
+1. Лист Stable
+
+Добавь в первую форму ячейку «Номер анализа» и создай только одно имя уровня книги:
+
+Stable_1_analyseNumber
+
+Для остальных форм имена не создаются — модуль получит ячейки смещением.
+
+Важно, чтобы поле находилось в одинаковой позиции внутри каждой формы.
+
+2. Таблица Stable_results
+
+Добавь столбец с точным названием:
+
+analyseNumber
+
+Лучше поставить после sampleCode:
+
+resultIdStable
+TaskId
+sampleCode
+analyseNumber
+dateStart
+...
+
+3. Модуль Stable
+
+В блок констант добавь:
+
+Private Const COL_ANALYSE_NUMBER_DB As String = "analyseNumber"
+
+Автоматическая выдача номера
+
+Добавь в модуль процедуру:
+
+Private Sub EnsureStableAnalyseNumber( _
+    ByVal formIndex As Long _
+)
+
+    Dim sampleRange As Range
+    Dim analyseRange As Range
+
+    Set sampleRange = _
+        GetStableFormRange(formIndex, "sampleCode")
+
+    Set analyseRange = _
+        GetStableFormRange(formIndex, "analyseNumber")
+
+    If sampleRange Is Nothing Then Exit Sub
+    If analyseRange Is Nothing Then Exit Sub
+
+    Dim sampleCode As String
+    sampleCode = Trim$(CStr(sampleRange.value))
+
+    If sampleCode = "" Then Exit Sub
+    If Trim$(CStr(analyseRange.value)) <> "" Then Exit Sub
+
+    Dim usedNumbers As Object
+    Set usedNumbers = CreateObject("Scripting.Dictionary")
+
+    Dim i As Long
+    Dim otherSampleRange As Range
+    Dim otherAnalyseRange As Range
+    Dim otherValue As Variant
+
+    For i = 1 To Stable_GetLastFormIndex()
+
+        If i <> formIndex Then
+
+            Set otherSampleRange = _
+                GetStableFormRange(i, "sampleCode")
+
+            Set otherAnalyseRange = _
+                GetStableFormRange(i, "analyseNumber")
+
+            If Not otherSampleRange Is Nothing _
+               And Not otherAnalyseRange Is Nothing Then
+
+                If StrComp( _
+                    Trim$(CStr(otherSampleRange.value)), _
+                    sampleCode, _
+                    vbTextCompare _
+                ) = 0 Then
+
+                    otherValue = otherAnalyseRange.value
+
+                    If IsNumeric(otherValue) Then
+
+                        If CDbl(otherValue) > 0 _
+                           And CDbl(otherValue) = _
+                               Fix(CDbl(otherValue)) Then
+
+                            usedNumbers( _
+                                CStr(CLng(otherValue)) _
+                            ) = True
+
+                        End If
+
+                    End If
+
+                End If
+
+            End If
+
+        End If
+
+    Next i
+
+    Dim nextNumber As Long
+    nextNumber = 1
+
+    Do While usedNumbers.Exists(CStr(nextNumber))
+        nextNumber = nextNumber + 1
+    Loop
+
+    analyseRange.value = nextNumber
+
+End Sub
+
+В Save_Stable, внутри цикла форм, непосредственно перед:
+
+If Not Validate_Stable_Form(formIndex, requireComplete) Then
+
+добавь:
+
+EnsureStableAnalyseNumber formIndex
+
+Не используй старую checkNumberAnalys2: она ищет Stable_2_*, Stable_3_* по именам и с новой системой смещений работать не будет.
+
+4. Проверка дубликатов в Save_Stable
+
+Старую проверку только по sampleCode надо заменить проверкой пары.
+
+Вместо словаря sampleCodes используй:
+
+Dim resultKeys As Object
+Set resultKeys = CreateObject("Scripting.Dictionary")
+resultKeys.CompareMode = vbTextCompare
+
+После получения sampleCode добавь:
+
+Dim analyseRange As Range
+Dim analyseNumber As String
+Dim resultKey As String
+
+Set analyseRange = _
+    GetStableFormRange(formIndex, COL_ANALYSE_NUMBER_DB)
+
+analyseNumber = NormalizeKeyValue(analyseRange.value)
+
+resultKey = sampleCode & Chr$(30) & analyseNumber
+
+Проверка:
+
+If resultKeys.Exists(resultKey) Then
+
+    MsgBox _
+        "Stable_" & formIndex & " не сохранена." & _
+        vbCrLf & vbCrLf & _
+        "Сочетание шифра пробы " & sampleCode & _
+        " и номера анализа " & analyseNumber & _
+        " уже указано на странице " & _
+        resultKeys(resultKey) & ".", _
+        vbExclamation
+
+    Exit Function
+
+End If
+
+resultKeys.Add resultKey, formIndex
+
+Старую проверку:
+
+sampleCodes.Exists(sampleCode)
+
+нужно полностью удалить.
+
+5. Поиск формы при загрузке
+
+В FindStableFormIndexForResultRow форму нужно искать сразу по двум значениям:
+
+resultSampleCode = NormalizeKeyValue( _
+    GetTableValue( _
+        resultTable, _
+        resultRowIndex, _
+        "sampleCode" _
+    ) _
+)
+
+resultAnalyseNumber = NormalizeKeyValue( _
+    GetTableValue( _
+        resultTable, _
+        resultRowIndex, _
+        "analyseNumber" _
+    ) _
+)
+
+Для каждой формы сравнивать:
+
+If NormalizeKeyValue( _
+       GetStableFormRange(formIndex, "sampleCode").value _
+   ) = resultSampleCode _
+   And NormalizeKeyValue( _
+       GetStableFormRange(formIndex, "analyseNumber").value _
+   ) = resultAnalyseNumber Then
+
+    FindStableFormIndexForResultRow = formIndex
+    Exit Function
+
+End If
+
+Иначе две записи одной пробы с разными номерами анализа будут загружаться в одну форму.
+
+6. Валидация
+
+В Validate_Stable_Form, внутри обхода заголовков таблицы, добавь:
+
+If fieldNameLower = "analysenumber" Then
+
+    If valueText = "" Then
+
+        AddValidationError _
+            errors, _
+            errorCount, _
+            "Не указан номер анализа: " & rangeName, _
+            rng
+
+    ElseIf Not IsNumeric(fieldValue) Then
+
+        AddValidationError _
+            errors, _
+            errorCount, _
+            "Номер анализа должен быть числом: " & _
+            rangeName, _
+            rng
+
+    ElseIf CDbl(fieldValue) <= 0 _
+           Or CDbl(fieldValue) <> _
+              Fix(CDbl(fieldValue)) Then
+
+        AddValidationError _
+            errors, _
+            errorCount, _
+            "Номер анализа должен быть положительным " & _
+            "целым числом: " & rangeName, _
+            rng
+
+    End If
+
+End If
+
+В Stable_FieldCaption добавь:
+
+Case "analysenumber"
+    Stable_FieldCaption = "Номер анализа"
+
+7. Python-схема
+
+В STABLE_RESULTS.columns, после sampleCode, добавь:
+
+_col(
+    "analyseNumber",
+    "analyseNumber",
+    typ="INTEGER",
+    value_type="integer",
+    required=True,
+),
+
+Итоговый фрагмент:
+
+_col("TaskId", "TaskId", typ="INTEGER", value_type="integer"),
+_col("sampleCode", "sampleCode", typ="TEXT", value_type="text", required=True),
+_col("analyseNumber", "analyseNumber", typ="INTEGER", value_type="integer", required=True),
+_col("dateStart", "dateStart", typ="TEXT", value_type="date"),
+
+8. SQLite
+
+Если миграция Stable ещё не применялась, просто добавь в CREATE TABLE Stable_results:
+
+analyseNumber INTEGER NOT NULL,
+
+После sampleCode.
+
+Уникальный индекс должен быть составным:
+
+CREATE UNIQUE INDEX ux_Stable_results_sampleCode_analyseNumber
+    ON Stable_results (sampleCode, analyseNumber);
+
+Старый индекс только по sampleCode не нужен:
+
+DROP INDEX IF EXISTS ux_Stable_results_sampleCode;
+
+Если таблица уже создана:
+
+ALTER TABLE Stable_results
+    ADD COLUMN analyseNumber INTEGER;
+
+UPDATE Stable_results
+SET analyseNumber = 1
+WHERE analyseNumber IS NULL;
+
+DROP INDEX IF EXISTS ux_Stable_results_sampleCode;
+
+CREATE UNIQUE INDEX ux_Stable_results_sampleCode_analyseNumber
+    ON Stable_results (sampleCode, analyseNumber);
+
+Индекс по TaskId оставь без изменений:
+
+CREATE INDEX IX_Stable_results_TaskId
+    ON Stable_results (TaskId);
+
+В wrappers, Ribbon, StudySync, modMetadata, PowerQuery и clsAppEvents из-за одного analyseNumber ничего дополнительно менять не требуется.
