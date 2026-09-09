@@ -1,2 +1,3 @@
-resultIdStable	TaskId	sampleCode	dateStart	timeStart	dateEnd	timeEnd	operator	PVTcell	temperature	pressure	pressureUnit	pressureAbs	pressureMPaAbs	LiquidVolume
+resultIdStable	TaskId	sampleCode	dateStart	timeStart	dateEnd	timeEnd	operator	PVTcell	temperature	pressure	pressureUnit	pressureAbs	pressureMPaAbs	LiquidVolume	dateTimeSync
+
 
