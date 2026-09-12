@@ -1,7 +1,35 @@
-Вставь в командную строку одной строкой:
+В модуле `CVD` при переработке потерялись три константы с названиями технических столбцов. Вставь их сразу после `End Enum`, перед `CVD_STUDY_CODE`:
 
-```cmd
-python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\xlam_source_manager.py" build --template "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\excel\Addin\PVT_Addin.xlam" --source "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\addin_source" --output "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\build\PVT_Addin.xlam" --vba-encoding cp1251 --force
+```vb
+Private Const COL_CVD_ROW_ID_DB As String = "rowIdCVD"
+Private Const COL_CVD_RESULT_ID_DB As String = "resultIdCVD"
+Private Const COL_CVD_STEP_DB As String = "step"
 ```
 
-Результат — `build\PVT_Addin.xlam`. Шаблон не изменится; `--force` перезапишет предыдущую сборку, если она есть.
+Начало модуля должно выглядеть так:
+
+```vb
+Option Explicit
+
+Private Enum CVDFormState
+    CVD_FORM_EMPTY = 0
+    CVD_FORM_RESERVED = 1
+    CVD_FORM_FILLED = 2
+End Enum
+
+Private Const COL_CVD_ROW_ID_DB As String = "rowIdCVD"
+Private Const COL_CVD_RESULT_ID_DB As String = "resultIdCVD"
+Private Const COL_CVD_STEP_DB As String = "step"
+
+Private Const CVD_STUDY_CODE As String = "CVD"
+```
+
+Я проверил весь актуальный модуль CVD: используются именно эти три необъявленные `COL_CVD_*`. Старые константы `COL_CVD_SAMPLE_CODE_LPH_DB` и `COL_CVD_SAMPLE_CODE_GPH_DB` в новой версии уже нигде не используются, возвращать их не требуется.
+
+Исправление внеси именно в:
+
+```text
+addin_source\modules\CVD.bas
+```
+
+Потом заново собери `PVT_Addin.xlam` и снова выполни `Debug → Compile VBAProject`. Иначе, если исправить только уже собранную XLAM, следующая сборка снова затрёт исправление.
