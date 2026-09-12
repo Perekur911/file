@@ -1,125 +1,35 @@
-Ты вставил `AddFormDLST`, но не вставил две вспомогательные процедуры очистки. Добавь код ниже **в модуль `DLST`**, сразу после `DeleteLastFormDLST` либо в конце модуля — обязательно вне других процедур.
+В твоей надстройке версия хранится в пользовательском свойстве `PVTAddinVersion`.
+
+Открой нужную XLAM в редакторе VBA, нажми `Ctrl+G` и в окне Immediate выполни:
 
 ```vb
-Private Sub DLST_ClearCopiedFormFields( _
-    ByVal wb As Workbook, _
-    ByVal ws As Worksheet, _
-    ByVal formIndex As Long _
-)
-
-    Dim resultTable As ListObject
-    Dim sourceTable As ListObject
-
-    Set resultTable = _
-        wb.Worksheets(DLST_RESULTS_SHEET) _
-          .ListObjects(DLST_RESULTS_TABLE)
-
-    Set sourceTable = _
-        wb.Worksheets(DLST_SOURCE_SHEET) _
-          .ListObjects(DLST_SOURCE_TABLE)
-
-    Dim tableColumn As ListColumn
-    Dim fieldName As String
-    Dim targetRange As Range
-
-    ' Родительские поля DLST_results.
-    For Each tableColumn In resultTable.ListColumns
-
-        fieldName = Trim$(CStr(tableColumn.Name))
-
-        If StrComp( _
-            fieldName, _
-            "dateTimeSync", _
-            vbTextCompare _
-        ) <> 0 Then
-
-            Set targetRange = Nothing
-            Set targetRange = _
-                DLST_FormRange(ws, formIndex, fieldName)
-
-            DLST_ClearNonFormulaCells targetRange
-
-        End If
-
-    Next tableColumn
-
-    ' Дочерние поля st1..st10 и last.
-    Dim steps As Variant
-    Dim stepIndex As Long
-    Dim stepKey As String
-
-    steps = DLST_StepKeys()
-
-    For stepIndex = LBound(steps) To UBound(steps)
-
-        stepKey = CStr(steps(stepIndex))
-
-        For Each tableColumn In sourceTable.ListColumns
-
-            fieldName = Trim$(CStr(tableColumn.Name))
-
-            Select Case LCase$(fieldName)
-
-                Case LCase$(COL_DLST_RESULT_ID_DB), _
-                     LCase$(COL_DLST_STEP_DB)
-
-                    ' Значения формируются при сохранении.
-                    ' Диапазонов на форме для них нет.
-
-                Case Else
-
-                    Set targetRange = Nothing
-                    Set targetRange = DLST_FormRange( _
-                        ws, _
-                        formIndex, _
-                        stepKey & "_" & fieldName _
-                    )
-
-                    DLST_ClearNonFormulaCells targetRange
-
-            End Select
-
-        Next tableColumn
-
-    Next stepIndex
-
-End Sub
-
-
-Private Sub DLST_ClearNonFormulaCells( _
-    ByVal targetRange As Range _
-)
-
-    If targetRange Is Nothing Then Exit Sub
-
-    If targetRange.MergeCells Then
-
-        Dim mergedRange As Range
-        Set mergedRange = targetRange.MergeArea
-
-        If Not RangeHasFormula(mergedRange) Then
-            mergedRange.ClearContents
-        End If
-
-        Exit Sub
-
-    End If
-
-    Dim cell As Range
-
-    For Each cell In targetRange.Cells
-        If Not cell.HasFormula Then
-            cell.ClearContents
-        End If
-    Next cell
-
-End Sub
+Call SetWorkbookMetadataProperty(ThisWorkbook, PROP_ADDIN_VERSION, "1.1.0", True)
 ```
 
-Также в верхней части `DLST` рядом с `DLST_MAX_FORMS` должна присутствовать константа:
+Для надстройки сейчас логична версия **1.1.0**, потому что добавился новый функционал. Версия формы при этом отдельно — **23.1.0**.
+
+Проверить записанное значение можно там же:
 
 ```vb
-Private Const DLST_MIN_FORM_COUNT As Long = 1
+? GetWorkbookMetadataProperty(ThisWorkbook, PROP_ADDIN_VERSION)
 ```
 
-После этого снова запускай компиляцию. Следующая ошибка на `DLST_ClearNonFormulaCells` уже не появится, потому что обе потерянные процедуры добавлены сразу.
+Должно вывести:
+
+```text
+1.1.0
+```
+
+Важно: сборщик копирует свойства из базового шаблона XLAM. Поэтому лучше изменить версию в:
+
+```text
+excel\Addin\PVT_Addin.xlam
+```
+
+затем заново выполнить сборку. Тогда `build\PVT_Addin.xlam` унаследует правильную версию. Также поменяй `components.addin.version` в `project_version.json` на:
+
+```json
+"version": "1.1.0"
+```
+
+Иначе проверка релиза обнаружит несовпадение версии файла и конфигурации.
