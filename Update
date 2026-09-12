@@ -1,37 +1,7 @@
-Обработка заняла 27s
+Вставь в командную строку одной строкой:
 
-Для вызовов через твою общую обёртку достаточно восстановления в одном месте. Локальный вариант я предложил избыточно.
+```cmd
+python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\xlam_source_manager.py" build --template "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\excel\Addin\PVT_Addin.xlam" --source "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\addin_source" --output "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\build\PVT_Addin.xlam" --vba-encoding cp1251 --force
+```
 
-В модуле wrappers, внутри CallMacroCore, сделай три вставки.
-
-1. После On Error GoTo CleanFail, перед StartMacro wb, studies:
-
-
-
-Dim oldCopyObjectsWithCells As Boolean
-Dim copySettingSaved As Boolean
-
-oldCopyObjectsWithCells = Application.CopyObjectsWithCells
-copySettingSaved = True
-
-2. Под существующей меткой CleanExit:, перед EndMacro wb, studies:
-
-
-
-If copySettingSaved Then
-    Application.CopyObjectsWithCells = oldCopyObjectsWithCells
-End If
-
-3. В существующем обработчике CleanFail, после On Error Resume Next, перед EndMacro wb, studies:
-
-
-
-If copySettingSaved Then
-    Application.CopyObjectsWithCells = oldCopyObjectsWithCells
-End If
-
-Существующий код сохранения Err.Number, Err.Source, Err.Description и повторного Err.Raise оставь.
-
-Теперь настройка восстанавливается централизованно и при успехе, и при ошибке — именно в исходное значение, а не принудительно в True. Дополнительный обработчик в AddFormStable из моего предыдущего сообщения добавлять не нужно.
-
-Это покрывает запуск через обёртку; прямой запуск метода из VBE её обходит.
+Результат — `build\PVT_Addin.xlam`. Шаблон не изменится; `--force` перезапишет предыдущую сборку, если она есть.
