@@ -1,35 +1,125 @@
-В модуле `CVD` при переработке потерялись три константы с названиями технических столбцов. Вставь их сразу после `End Enum`, перед `CVD_STUDY_CODE`:
+Ты вставил `AddFormDLST`, но не вставил две вспомогательные процедуры очистки. Добавь код ниже **в модуль `DLST`**, сразу после `DeleteLastFormDLST` либо в конце модуля — обязательно вне других процедур.
 
 ```vb
-Private Const COL_CVD_ROW_ID_DB As String = "rowIdCVD"
-Private Const COL_CVD_RESULT_ID_DB As String = "resultIdCVD"
-Private Const COL_CVD_STEP_DB As String = "step"
+Private Sub DLST_ClearCopiedFormFields( _
+    ByVal wb As Workbook, _
+    ByVal ws As Worksheet, _
+    ByVal formIndex As Long _
+)
+
+    Dim resultTable As ListObject
+    Dim sourceTable As ListObject
+
+    Set resultTable = _
+        wb.Worksheets(DLST_RESULTS_SHEET) _
+          .ListObjects(DLST_RESULTS_TABLE)
+
+    Set sourceTable = _
+        wb.Worksheets(DLST_SOURCE_SHEET) _
+          .ListObjects(DLST_SOURCE_TABLE)
+
+    Dim tableColumn As ListColumn
+    Dim fieldName As String
+    Dim targetRange As Range
+
+    ' Родительские поля DLST_results.
+    For Each tableColumn In resultTable.ListColumns
+
+        fieldName = Trim$(CStr(tableColumn.Name))
+
+        If StrComp( _
+            fieldName, _
+            "dateTimeSync", _
+            vbTextCompare _
+        ) <> 0 Then
+
+            Set targetRange = Nothing
+            Set targetRange = _
+                DLST_FormRange(ws, formIndex, fieldName)
+
+            DLST_ClearNonFormulaCells targetRange
+
+        End If
+
+    Next tableColumn
+
+    ' Дочерние поля st1..st10 и last.
+    Dim steps As Variant
+    Dim stepIndex As Long
+    Dim stepKey As String
+
+    steps = DLST_StepKeys()
+
+    For stepIndex = LBound(steps) To UBound(steps)
+
+        stepKey = CStr(steps(stepIndex))
+
+        For Each tableColumn In sourceTable.ListColumns
+
+            fieldName = Trim$(CStr(tableColumn.Name))
+
+            Select Case LCase$(fieldName)
+
+                Case LCase$(COL_DLST_RESULT_ID_DB), _
+                     LCase$(COL_DLST_STEP_DB)
+
+                    ' Значения формируются при сохранении.
+                    ' Диапазонов на форме для них нет.
+
+                Case Else
+
+                    Set targetRange = Nothing
+                    Set targetRange = DLST_FormRange( _
+                        ws, _
+                        formIndex, _
+                        stepKey & "_" & fieldName _
+                    )
+
+                    DLST_ClearNonFormulaCells targetRange
+
+            End Select
+
+        Next tableColumn
+
+    Next stepIndex
+
+End Sub
+
+
+Private Sub DLST_ClearNonFormulaCells( _
+    ByVal targetRange As Range _
+)
+
+    If targetRange Is Nothing Then Exit Sub
+
+    If targetRange.MergeCells Then
+
+        Dim mergedRange As Range
+        Set mergedRange = targetRange.MergeArea
+
+        If Not RangeHasFormula(mergedRange) Then
+            mergedRange.ClearContents
+        End If
+
+        Exit Sub
+
+    End If
+
+    Dim cell As Range
+
+    For Each cell In targetRange.Cells
+        If Not cell.HasFormula Then
+            cell.ClearContents
+        End If
+    Next cell
+
+End Sub
 ```
 
-Начало модуля должно выглядеть так:
+Также в верхней части `DLST` рядом с `DLST_MAX_FORMS` должна присутствовать константа:
 
 ```vb
-Option Explicit
-
-Private Enum CVDFormState
-    CVD_FORM_EMPTY = 0
-    CVD_FORM_RESERVED = 1
-    CVD_FORM_FILLED = 2
-End Enum
-
-Private Const COL_CVD_ROW_ID_DB As String = "rowIdCVD"
-Private Const COL_CVD_RESULT_ID_DB As String = "resultIdCVD"
-Private Const COL_CVD_STEP_DB As String = "step"
-
-Private Const CVD_STUDY_CODE As String = "CVD"
+Private Const DLST_MIN_FORM_COUNT As Long = 1
 ```
 
-Я проверил весь актуальный модуль CVD: используются именно эти три необъявленные `COL_CVD_*`. Старые константы `COL_CVD_SAMPLE_CODE_LPH_DB` и `COL_CVD_SAMPLE_CODE_GPH_DB` в новой версии уже нигде не используются, возвращать их не требуется.
-
-Исправление внеси именно в:
-
-```text
-addin_source\modules\CVD.bas
-```
-
-Потом заново собери `PVT_Addin.xlam` и снова выполни `Debug → Compile VBAProject`. Иначе, если исправить только уже собранную XLAM, следующая сборка снова затрёт исправление.
+После этого снова запускай компиляцию. Следующая ошибка на `DLST_ClearNonFormulaCells` уже не появится, потому что обе потерянные процедуры добавлены сразу.
