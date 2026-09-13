@@ -1,99 +1,103 @@
-Сначала миграция рабочей БД должна быть применена: при создании тега скрипт проверит, что последняя версия в `schema_migrations` равна `2.1.0`.
+Да, именно это и произошло: старые формы версии `23.0.1` физически не содержат исследований Stable и DLST, поэтому свойства отсутствуют и читаются как `unknown`.
 
-Также в `project_version.json` должно быть:
+Нужно сделать версионную совместимость.
 
-```json
-"project": {
-    "version": "2.1.0"
+### 1. После `STUDY_STATE_PROPERTIES` добавь
+
+```python
+STUDY_FIRST_FORM_VERSION: dict[str, str] = {
+    "STABLE": "23.1.0",
+    "DLST": "23.1.0",
 }
 ```
 
-Сначала проверочный запуск без коммита:
+Сами `STABLE` и `DLST` из `STUDY_STATE_PROPERTIES` не удаляй.
 
-```cmd
-python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --dry-run --tag v2.1.0 --message "Release 2.1.0: DLST, Stable and form fixes"
+### 2. Полностью замени `read_study_states`
+
+Сейчас она выглядит примерно так:
+
+```python
+def read_study_states(props: dict[str, str]) -> tuple[dict[str, str], list[str], bool]:
 ```
 
-Если проверка прошла без ошибок, настоящий коммит с релизным тегом:
+Замени целиком на:
 
-```cmd
-python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --tag v2.1.0 --message "Release 2.1.0: DLST, Stable and form fixes"
+```python
+def read_study_states(
+    props: dict[str, str],
+    workbook_version: str,
+) -> tuple[dict[str, str], list[str], bool]:
+    states: dict[str, str] = {}
+    blocking: list[str] = []
+
+    for study, property_name in STUDY_STATE_PROPERTIES.items():
+        raw_state = props.get(property_name, "")
+        state = str(raw_state).strip().lower()
+
+        if not state:
+            first_version = STUDY_FIRST_FORM_VERSION.get(study)
+
+            # Исследования ещё не существовало в этой версии формы.
+            # Отсутствующее свойство в таком случае означает empty,
+            # а не ошибку metadata.
+            if (
+                first_version
+                and workbook_version
+                and compare_versions(workbook_version, first_version) < 0
+            ):
+                state = "empty"
+            else:
+                state = "unknown"
+
+        states[study] = state
+
+        if state not in SAFE_RECREATE_STATES:
+            blocking.append(f"{study}={state}")
+
+    return states, blocking, not blocking
 ```
 
-`--message` должен оставаться последним аргументом — так устроен твой скрипт.
+### 3. В `inspect_project` найди
 
-Итоговый порядок:
-
-1. Обновить все версии в `project_version.json`.
-2. Применить миграцию к рабочей БД.
-3. Выполнить команду с `--dry-run`.
-4. Если ошибок нет — выполнить вторую команду.
-5. Проверить, что создан тег `v2.1.0`.
-
-Скрипт создаёт локальный коммит и тег. Отправку в удалённый репозиторий он не выполняет.
-
-
-
-
-
-Чтобы проверить и установить версию надстройки:
-
-1. Открой XLAM в Excel.
-2. Нажми `Alt+F11`.
-3. Выбери любой модуль именно этой надстройки.
-4. Открой Immediate Window: `Ctrl+G`.
-
-Проверить текущую версию:
-
-```vb
-? ThisWorkbook.CustomDocumentProperties("PVTAddinVersion").Value
+```python
+states, blocking, safe = read_study_states(props)
 ```
 
-Установить версию, например `1.1.0`:
+Замени на:
 
-```vb
-Call SetWorkbookMetadataProperty(ThisWorkbook, "PVTAddinVersion", "1.1.0", True)
+```python
+states, blocking, safe = read_study_states(props, actual_version)
 ```
 
-Либо через константу, если она доступна в этом модуле:
+### 4. В `validate_built_workbook` найди второй вызов
 
-```vb
-Call SetWorkbookMetadataProperty(ThisWorkbook, PROP_ADDIN_VERSION, "1.1.0", True)
+```python
+_states, blocking, safe = read_study_states(props)
 ```
 
-Затем снова проверь:
+Замени на:
 
-```vb
-? ThisWorkbook.CustomDocumentProperties("PVTAddinVersion").Value
+```python
+_states, blocking, safe = read_study_states(props, actual_version)
 ```
 
-После этого обязательно:
+### Что получится
 
-* нажми `Ctrl+S`;
-* закрой Excel;
-* снова открой надстройку и повторно проверь значение.
+Для старой формы `23.0.1`:
 
-Для текущего релиза я бы оставил:
+```text
+STABLE=empty
+DLST=empty
+SafeToRecreate=YES
+RecommendedAction=RECREATE_TO_CURRENT
+```
 
-* версия проекта/БД: `2.1.0`;
-* версия формы: `23.1.0`;
-* версия надстройки: `1.1.0`.
+Для новой формы `23.1.0`, если VBA почему-то не создала эти свойства, останется:
 
-И проверь, чтобы версия надстройки `1.1.0` также была указана в соответствующем поле `project_version.json`.
+```text
+STABLE=unknown
+DLST=unknown
+```
 
-
-
-
-Обработка заняла 23s
-
-Да, нашёл. У скрипта режимы export и build. Для экспорта актуальной надстройки запускай из корня проекта:
-
-python .\tools\xlam_source_manager.py export --addin ".\excel\Addin\PVT_Addin.xlam" --source ".\addin_source" --vba-encoding cp1251
-
-Перед запуском закрой PVT_Addin.xlam в Excel. Команда выгрузит модули, классы, формы и метаданные в addin_source.
-
-После этого уже:
-
-python -m pip install dulwich
-
-и запускаем git_commit.py --dry-run. И да — второй режим у менеджера на самом деле называется build, а не import.
+и обновление будет правильно заблокировано. То есть мы разрешаем отсутствие свойств только в версиях формы, где Stable и DLST ещё не существовали. После правок повторно запусти только `scan`.
