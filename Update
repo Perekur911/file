@@ -1,34 +1,31 @@
-Это корректный patch-релиз `2.1.1`.
+Перед коммитом обнови:
 
-Перед коммитом в `project_version.json`:
+* `project.version` → `2.1.2`
+* `components.form.version` → `23.1.1`
+* свойство книги `PVTFormVersion` → `23.1.1`
+* путь/имя шаблона в `project_version.json`, если версия присутствует в имени файла.
 
-* `project.version`: `2.1.1`
-* Python-компонент: повысить patch, например `1.0.0 → 1.0.1`
-* форма: оставить `23.1.0`
-* надстройка: оставить `1.1.0`
-* схема БД: оставить `2.1.0`
+Версии надстройки, Python и БД не меняй.
 
-### Changelog 2.1.1
+### Changelog 2.1.2
 
-## Версия 2.1.1
+## Версия 2.1.2
 
-### Исправления
+### Исправления формы
 
-* Исправлено сканирование состояний исследований при обновлении проектов со старыми версиями формы.
-* Отсутствующие свойства `StableDataState` и `DLSTDataState` в формах до версии `23.1.0` теперь корректно распознаются как отсутствие данных, а не как неизвестное состояние.
-* Сохранена строгая проверка метаданных для актуальных форм: отсутствие обязательных свойств в версии `23.1.0` и новее продолжает блокировать пересоздание.
-* Восстановлена возможность безопасного автоматического пересоздания старых форм до актуальной версии.
+* На листе GOR исправлена формула расчёта объёма газа дегазации.
+* На листе GOR исправлен расчёт отклонения материального баланса при отсутствии значения плотности сепарированной жидкости при 20 °C.
 
-### Сначала проверка без коммита
+### Проверка без коммита
 
 ```cmd
-python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --dry-run --tag v2.1.1 --message "Release 2.1.1: исправлена совместимость сканирования старых форм"
+python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --dry-run --tag v2.1.2 --message "Release 2.1.2: исправлены формулы расчета GOR"
 ```
 
-Если проверка прошла, настоящий коммит:
+### Коммит и тег
 
 ```cmd
-python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --tag v2.1.1 --message "Release 2.1.1: исправлена совместимость сканирования старых форм"
+python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --tag v2.1.2 --message "Release 2.1.2: исправлены формулы расчета GOR"
 ```
 
-`--message` обязательно оставляй последним аргументом.
+Аргумент `--message` оставляй последним.
