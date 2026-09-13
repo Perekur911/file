@@ -36,6 +36,50 @@ python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\g
 
 
 
+Чтобы проверить и установить версию надстройки:
+
+1. Открой XLAM в Excel.
+2. Нажми `Alt+F11`.
+3. Выбери любой модуль именно этой надстройки.
+4. Открой Immediate Window: `Ctrl+G`.
+
+Проверить текущую версию:
+
+```vb
+? ThisWorkbook.CustomDocumentProperties("PVTAddinVersion").Value
+```
+
+Установить версию, например `1.1.0`:
+
+```vb
+Call SetWorkbookMetadataProperty(ThisWorkbook, "PVTAddinVersion", "1.1.0", True)
+```
+
+Либо через константу, если она доступна в этом модуле:
+
+```vb
+Call SetWorkbookMetadataProperty(ThisWorkbook, PROP_ADDIN_VERSION, "1.1.0", True)
+```
+
+Затем снова проверь:
+
+```vb
+? ThisWorkbook.CustomDocumentProperties("PVTAddinVersion").Value
+```
+
+После этого обязательно:
+
+* нажми `Ctrl+S`;
+* закрой Excel;
+* снова открой надстройку и повторно проверь значение.
+
+Для текущего релиза я бы оставил:
+
+* версия проекта/БД: `2.1.0`;
+* версия формы: `23.1.0`;
+* версия надстройки: `1.1.0`.
+
+И проверь, чтобы версия надстройки `1.1.0` также была указана в соответствующем поле `project_version.json`.
 
 
 
