@@ -1,35 +1,33 @@
-В твоей надстройке версия хранится в пользовательском свойстве `PVTAddinVersion`.
+Сначала миграция рабочей БД должна быть применена: при создании тега скрипт проверит, что последняя версия в `schema_migrations` равна `2.1.0`.
 
-Открой нужную XLAM в редакторе VBA, нажми `Ctrl+G` и в окне Immediate выполни:
-
-```vb
-Call SetWorkbookMetadataProperty(ThisWorkbook, PROP_ADDIN_VERSION, "1.1.0", True)
-```
-
-Для надстройки сейчас логична версия **1.1.0**, потому что добавился новый функционал. Версия формы при этом отдельно — **23.1.0**.
-
-Проверить записанное значение можно там же:
-
-```vb
-? GetWorkbookMetadataProperty(ThisWorkbook, PROP_ADDIN_VERSION)
-```
-
-Должно вывести:
-
-```text
-1.1.0
-```
-
-Важно: сборщик копирует свойства из базового шаблона XLAM. Поэтому лучше изменить версию в:
-
-```text
-excel\Addin\PVT_Addin.xlam
-```
-
-затем заново выполнить сборку. Тогда `build\PVT_Addin.xlam` унаследует правильную версию. Также поменяй `components.addin.version` в `project_version.json` на:
+Также в `project_version.json` должно быть:
 
 ```json
-"version": "1.1.0"
+"project": {
+    "version": "2.1.0"
+}
 ```
 
-Иначе проверка релиза обнаружит несовпадение версии файла и конфигурации.
+Сначала проверочный запуск без коммита:
+
+```cmd
+python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --dry-run --tag v2.1.0 --message "Release 2.1.0: DLST, Stable and form fixes"
+```
+
+Если проверка прошла без ошибок, настоящий коммит с релизным тегом:
+
+```cmd
+python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --tag v2.1.0 --message "Release 2.1.0: DLST, Stable and form fixes"
+```
+
+`--message` должен оставаться последним аргументом — так устроен твой скрипт.
+
+Итоговый порядок:
+
+1. Обновить все версии в `project_version.json`.
+2. Применить миграцию к рабочей БД.
+3. Выполнить команду с `--dry-run`.
+4. Если ошибок нет — выполнить вторую команду.
+5. Проверить, что создан тег `v2.1.0`.
+
+Скрипт создаёт локальный коммит и тег. Отправку в удалённый репозиторий он не выполняет.
