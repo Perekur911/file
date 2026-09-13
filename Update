@@ -31,3 +31,25 @@ python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\g
 5. Проверить, что создан тег `v2.1.0`.
 
 Скрипт создаёт локальный коммит и тег. Отправку в удалённый репозиторий он не выполняет.
+
+
+
+
+
+
+
+
+
+Обработка заняла 23s
+
+Да, нашёл. У скрипта режимы export и build. Для экспорта актуальной надстройки запускай из корня проекта:
+
+python .\tools\xlam_source_manager.py export --addin ".\excel\Addin\PVT_Addin.xlam" --source ".\addin_source" --vba-encoding cp1251
+
+Перед запуском закрой PVT_Addin.xlam в Excel. Команда выгрузит модули, классы, формы и метаданные в addin_source.
+
+После этого уже:
+
+python -m pip install dulwich
+
+и запускаем git_commit.py --dry-run. И да — второй режим у менеджера на самом деле называется build, а не import.
