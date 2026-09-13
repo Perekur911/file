@@ -1,103 +1,34 @@
-Да, именно это и произошло: старые формы версии `23.0.1` физически не содержат исследований Stable и DLST, поэтому свойства отсутствуют и читаются как `unknown`.
+Это корректный patch-релиз `2.1.1`.
 
-Нужно сделать версионную совместимость.
+Перед коммитом в `project_version.json`:
 
-### 1. После `STUDY_STATE_PROPERTIES` добавь
+* `project.version`: `2.1.1`
+* Python-компонент: повысить patch, например `1.0.0 → 1.0.1`
+* форма: оставить `23.1.0`
+* надстройка: оставить `1.1.0`
+* схема БД: оставить `2.1.0`
 
-```python
-STUDY_FIRST_FORM_VERSION: dict[str, str] = {
-    "STABLE": "23.1.0",
-    "DLST": "23.1.0",
-}
+### Changelog 2.1.1
+
+## Версия 2.1.1
+
+### Исправления
+
+* Исправлено сканирование состояний исследований при обновлении проектов со старыми версиями формы.
+* Отсутствующие свойства `StableDataState` и `DLSTDataState` в формах до версии `23.1.0` теперь корректно распознаются как отсутствие данных, а не как неизвестное состояние.
+* Сохранена строгая проверка метаданных для актуальных форм: отсутствие обязательных свойств в версии `23.1.0` и новее продолжает блокировать пересоздание.
+* Восстановлена возможность безопасного автоматического пересоздания старых форм до актуальной версии.
+
+### Сначала проверка без коммита
+
+```cmd
+python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --dry-run --tag v2.1.1 --message "Release 2.1.1: исправлена совместимость сканирования старых форм"
 ```
 
-Сами `STABLE` и `DLST` из `STUDY_STATE_PROPERTIES` не удаляй.
+Если проверка прошла, настоящий коммит:
 
-### 2. Полностью замени `read_study_states`
-
-Сейчас она выглядит примерно так:
-
-```python
-def read_study_states(props: dict[str, str]) -> tuple[dict[str, str], list[str], bool]:
+```cmd
+python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --tag v2.1.1 --message "Release 2.1.1: исправлена совместимость сканирования старых форм"
 ```
 
-Замени целиком на:
-
-```python
-def read_study_states(
-    props: dict[str, str],
-    workbook_version: str,
-) -> tuple[dict[str, str], list[str], bool]:
-    states: dict[str, str] = {}
-    blocking: list[str] = []
-
-    for study, property_name in STUDY_STATE_PROPERTIES.items():
-        raw_state = props.get(property_name, "")
-        state = str(raw_state).strip().lower()
-
-        if not state:
-            first_version = STUDY_FIRST_FORM_VERSION.get(study)
-
-            # Исследования ещё не существовало в этой версии формы.
-            # Отсутствующее свойство в таком случае означает empty,
-            # а не ошибку metadata.
-            if (
-                first_version
-                and workbook_version
-                and compare_versions(workbook_version, first_version) < 0
-            ):
-                state = "empty"
-            else:
-                state = "unknown"
-
-        states[study] = state
-
-        if state not in SAFE_RECREATE_STATES:
-            blocking.append(f"{study}={state}")
-
-    return states, blocking, not blocking
-```
-
-### 3. В `inspect_project` найди
-
-```python
-states, blocking, safe = read_study_states(props)
-```
-
-Замени на:
-
-```python
-states, blocking, safe = read_study_states(props, actual_version)
-```
-
-### 4. В `validate_built_workbook` найди второй вызов
-
-```python
-_states, blocking, safe = read_study_states(props)
-```
-
-Замени на:
-
-```python
-_states, blocking, safe = read_study_states(props, actual_version)
-```
-
-### Что получится
-
-Для старой формы `23.0.1`:
-
-```text
-STABLE=empty
-DLST=empty
-SafeToRecreate=YES
-RecommendedAction=RECREATE_TO_CURRENT
-```
-
-Для новой формы `23.1.0`, если VBA почему-то не создала эти свойства, останется:
-
-```text
-STABLE=unknown
-DLST=unknown
-```
-
-и обновление будет правильно заблокировано. То есть мы разрешаем отсутствие свойств только в версиях формы, где Stable и DLST ещё не существовали. После правок повторно запусти только `scan`.
+`--message` обязательно оставляй последним аргументом.
