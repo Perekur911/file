@@ -1,31 +1,54 @@
-Перед коммитом обнови:
+Обработка заняла 37s
 
-* `project.version` → `2.1.2`
-* `components.form.version` → `23.1.1`
-* свойство книги `PVTFormVersion` → `23.1.1`
-* путь/имя шаблона в `project_version.json`, если версия присутствует в имени файла.
+Тогда причина не в формулах. Если именно на третьей форме sampleCode визуально заполнен, а VBA получает пустоту, почти наверняка неверно задано смещение формы:
 
-Версии надстройки, Python и БД не меняй.
+Private Const STABLE_FORM_COLUMN_COUNT As Long = 6
 
-### Changelog 2.1.2
+Код ищет третью форму так:
 
-## Версия 2.1.2
+Stable_1_sampleCode.Offset(0, 2 * STABLE_FORM_COLUMN_COUNT)
 
-### Исправления формы
+То есть сейчас сдвигается на 12 столбцов.
 
-* На листе GOR исправлена формула расчёта объёма газа дегазации.
-* На листе GOR исправлен расчёт отклонения материального баланса при отсутствии значения плотности сепарированной жидкости при 20 °C.
+Проверим точно. В Immediate Window выполни:
 
-### Проверка без коммита
+? GetStableFormRange(1, "sampleCode").Address(0, 0), GetStableFormRange(1, "sampleCode").Value2
+? GetStableFormRange(2, "sampleCode").Address(0, 0), GetStableFormRange(2, "sampleCode").Value2
+? GetStableFormRange(3, "sampleCode").Address(0, 0), GetStableFormRange(3, "sampleCode").Value2
 
-```cmd
-python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --dry-run --tag v2.1.2 --message "Release 2.1.2: исправлены формулы расчета GOR"
-```
+Потом мышкой выбери заполненную ячейку шифра пробы именно на третьей форме и выполни:
 
-### Коммит и тег
+? ActiveCell.Address(0, 0), ActiveCell.MergeArea.Address(0, 0), ActiveCell.MergeArea.Cells(1, 1).Value2
 
-```cmd
-python "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project\tools\git_commit.py" --repo "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\repository_SQlite_Project" --name "ТВОЕ ИМЯ" --email "ТВОЙ EMAIL" --database "\\tm.novatek.int\tmn-dfs$\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --tag v2.1.2 --message "Release 2.1.2: исправлены формулы расчета GOR"
-```
+Сравни адрес третьей команды с фактическим адресом. Если они отличаются, нужно исправить STABLE_FORM_COLUMN_COUNT.
 
-Аргумент `--message` оставляй последним.
+Правильная длина формы вычисляется так:
+
+(столбец sampleCode формы 3 − столбец sampleCode формы 1) / 2
+
+Например:
+
+форма 1: B2;
+
+форма 3: P2;
+
+разница: 16 − 2 = 14;
+
+14 / 2 = 7;
+
+значит константа должна быть 7.
+
+
+При подсчёте учитываются все столбцы формы, включая узкие столбцы-пробелы.
+
+После исправления константы обязательно проверь также:
+
+? GetStableFormRange(3, "TaskId").Address(0, 0)
+? GetStableFormRange(3, "temperature").Address(0, 0)
+? GetStableFormRange(3, "LiquidVolume").Address(0, 0)
+
+И ячейку страницы:
+
+? Stable_GetLastFormIndex()
+
+Предыдущую предложенную правку с pressureMPaAbs и LiquidVolume пока не вноси. Сначала нужно исправить геометрию — иначе модуль будет читать не те ячейки вообще.
