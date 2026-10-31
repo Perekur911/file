@@ -1,33 +1,141 @@
-Да. Репозиторий Dulwich — обычный Git-репозиторий, поэтому можно смотреть построчные различия. Dulwich поддерживает `diff` между рабочими файлами, коммитами и деревьями. :chatgpt-content-reference{index="0"}
+Нужно изменить только `create_quality_act.py`. VBA, шаблон акта и БД менять не требуется.
 
-Из корня репозитория:
+### 1. Добавить таблицу преобразований
 
-### Текущие изменения относительно последнего коммита
+В начале файла, сразу после:
 
-```cmd
-C:\Users\Dmitriy.Kayurin\.venvs\sqlite-excel\Scripts\python.exe -m dulwich diff
+```python
+GAS_SAMPLE_TYPES = {"GS", "DG", "PNG", "SHFLU", "WHG"}
+LIQ_SAMPLE_TYPES = {"LS", "DEC"}
 ```
 
-Только конкретный файл:
+вставить:
 
-```cmd
-C:\Users\Dmitriy.Kayurin\.venvs\sqlite-excel\Scripts\python.exe -m dulwich diff -- "addin_source/modules/CCE.bas"
+```python
+SAMPLER_TYPE_DISPLAY_NAMES = {
+    "kzh": "КЖ",
+    "pk": "ПК",
+    "kpp": "КПП",
+    "gb": "GB",
+}
 ```
 
-### Разница между двумя релизами
+Ключи записаны в нижнем регистре намеренно — преобразование будет работать независимо от регистра исходного значения:
 
-Например, между `v3.0.1` и новым `v3.0.2`:
+- `Kzh`, `KZH`, `kzh` → `КЖ`
+- `PK`, `pk` → `ПК`
+- `KPp`, `KPP`, `kpp` → `КПП`
+- `gb`, `GB`, `Gb` → `GB`
 
-```cmd
-C:\Users\Dmitriy.Kayurin\.venvs\sqlite-excel\Scripts\python.exe -m dulwich diff v3.0.1 v3.0.2
+Остальные значения останутся без изменений.
+
+### 2. Добавить функцию преобразования
+
+Найди функцию:
+
+```python
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
 ```
 
-Только модуль CCE:
+Сразу после неё вставь:
 
-```cmd
-C:\Users\Dmitriy.Kayurin\.venvs\sqlite-excel\Scripts\python.exe -m dulwich diff v3.0.1 v3.0.2 -- "addin_source/modules/CCE.bas"
+```python
+def translate_sampler_type(value: Any) -> Any:
+    """
+    Преобразует отдельные латинские обозначения типов
+    пробоотборников в обозначения для акта качества.
+
+    Неизвестные значения возвращаются без изменений.
+    """
+    key = normalize_text(value).casefold()
+
+    return SAMPLER_TYPE_DISPLAY_NAMES.get(key, value)
 ```
 
-Твой `git_commit.py --dry-run` сейчас показывает только список изменённых файлов, но не изменения строк. Можно потом добавить ему аргумент `--diff`, чтобы перед коммитом он сразу показывал полный diff.
+### 3. Изменить заполнение газовой таблицы
 
-Для `.py`, `.bas`, `.sql`, `.json` изменения будут видны построчно. Для `.xlsx` и `.xlam` будет только отметка об изменении бинарного файла — содержимое VBA нужно сравнивать через экспортированные `.bas/.cls/.frm`.
+В блоке:
+
+```python
+if sample_type in GAS_SAMPLE_TYPES:
+```
+
+сейчас есть такой цикл:
+
+```python
+for col_name, act_col_idx in gas_map["LIF"].items():
+    gas_act_tbl[gas_cur_row][act_col_idx] = get_row_value(
+        lif_row,
+        lif_map,
+        col_name,
+    )
+```
+
+Замени его целиком на:
+
+```python
+for col_name, act_col_idx in gas_map["LIF"].items():
+    value = get_row_value(
+        lif_row,
+        lif_map,
+        col_name,
+    )
+
+    if col_name.casefold() == "typesampler":
+        value = translate_sampler_type(value)
+
+    gas_act_tbl[gas_cur_row][act_col_idx] = value
+```
+
+### 4. Изменить заполнение жидкостной таблицы
+
+Ниже, в блоке:
+
+```python
+elif sample_type in LIQ_SAMPLE_TYPES:
+```
+
+сейчас есть:
+
+```python
+for col_name, act_col_idx in liq_map["LIF"].items():
+    liq_act_tbl[liq_cur_row][act_col_idx] = get_row_value(
+        lif_row,
+        lif_map,
+        col_name,
+    )
+```
+
+Замени целиком на:
+
+```python
+for col_name, act_col_idx in liq_map["LIF"].items():
+    value = get_row_value(
+        lif_row,
+        lif_map,
+        col_name,
+    )
+
+    if col_name.casefold() == "typesampler":
+        value = translate_sampler_type(value)
+
+    liq_act_tbl[liq_cur_row][act_col_idx] = value
+```
+
+### Что получится
+
+Преобразование затронет только колонку `LIF_typeSampler` при формировании акта:
+
+| Значение в ProjectLIF | Значение в акте |
+|---|---|
+| `Kzh` | `КЖ` |
+| `PK` | `ПК` |
+| `KPp` | `КПП` |
+| `gb` | `GB` |
+| `PGO` | `PGO` |
+| любое другое | без изменений |
+
+Исходные значения в `ProjectLIF` не меняются — преобразуется только текст, записываемый в создаваемый акт качества.
