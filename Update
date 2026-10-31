@@ -1,110 +1,405 @@
-Лучше сделать это в `fill_result_blocks()`, причём после попытки подмешать результаты. Тогда `"-"` появится и когда:
+Я бы не пытался сопоставлять ряды по тексту легенды. Легенда может измениться, повториться, а порядок форм после загрузки — поменяться. Надёжнее после сохранения или загрузки AP полностью пересобирать только этот график. Даже несколько десятков рядов для Excel — практически мгновенно.
 
-- строка `OP_results` найдена, но `natureLiq` пустая;
-- строка `OP_results` вообще не найдена;
-- значение содержит только пробелы.
+Ряды будем связывать с уже существующими динамическими диапазонами:
 
-### 1. В начале `fill_result_blocks()`
+- `AP_1_P` — давление;
+- `AP_1_d` — плотность;
+- `AP_2_P`, `AP_2_d` и далее.
 
-Сейчас начало функции выглядит так:
+То есть значения на графике останутся ссылками, а не скопированными массивами.
 
-```python
-lif_sample_col = act_map["LIF"].get("samplecode")
-if lif_sample_col is None:
-    return min_date, max_date
+## 1. Назвать график
+
+На листе `GOR` выдели нужный график и задай ему имя:
+
+```text
+GOR_AP_chart
 ```
 
-Сразу после него добавь:
+Имя можно установить через поле имени слева от строки формул.
 
-```python
-op_nature_liq_col = act_map.get("OP", {}).get("natureliq")
+Код ниже предполагает, что это отдельный график только для данных AP.
+
+## 2. Добавить константы в модуль `GOR`
+
+В начале `GOR.bas`, рядом с остальными константами, добавь:
+
+```vb
+Private Const GOR_AP_CHART_NAME As String = "GOR_AP_chart"
+
+Private Const AP_CHART_PRESSURE_COLUMN As String = "Давление, psig"
+Private Const AP_CHART_DENSITY_COLUMN As String = "Плотность, г/см3"
+```
+
+## 3. Добавить процедуру обновления графика
+
+В конец модуля `GOR.bas` вставь:
+
+```vb
+Public Sub RefreshGORAPDensityChart( _
+    ByVal wb As Workbook, _
+    Optional ByVal clearOnly As Boolean = False _
+)
+
+    On Error GoTo CleanFail
+
+    Dim sheetGOR As Worksheet
+    Dim sheetAP As Worksheet
+
+    Set sheetGOR = wb.Worksheets("GOR")
+    Set sheetAP = wb.Worksheets("AP")
+
+    ' =============================================================
+    ' НАХОДИМ ГРАФИК
+    ' =============================================================
+
+    Dim chartObject As ChartObject
+
+    On Error Resume Next
+    Set chartObject = sheetGOR.ChartObjects(GOR_AP_CHART_NAME)
+    On Error GoTo CleanFail
+
+    If chartObject Is Nothing Then
+        Err.Raise _
+            vbObjectError + 1701, _
+            "RefreshGORAPDensityChart", _
+            "На листе GOR не найден график """ & _
+            GOR_AP_CHART_NAME & """."
+    End If
+
+    Dim targetChart As Chart
+    Set targetChart = chartObject.Chart
+
+    ' =============================================================
+    ' УДАЛЯЕМ СТАРЫЕ РЯДЫ
+    ' =============================================================
+
+    Dim seriesIndex As Long
+
+    For seriesIndex = _
+        targetChart.SeriesCollection.count To 1 Step -1
+
+        targetChart.SeriesCollection(seriesIndex).Delete
+
+    Next seriesIndex
+
+    ' При пустой таблице AP_results только очищаем график.
+    If clearOnly Then Exit Sub
+
+    ' =============================================================
+    ' ДОБАВЛЯЕМ АКТУАЛЬНЫЕ ФОРМЫ AP
+    ' =============================================================
+
+    Dim formIndex As Long
+    formIndex = 1
+
+    Dim sampleCode As String
+    Dim temperatureText As String
+    Dim legendText As String
+
+    Dim temperatureValue As Variant
+
+    Dim sourceTable As ListObject
+    Dim pressureRange As Range
+    Dim densityRange As Range
+
+    Dim pressureCount As Long
+    Dim densityCount As Long
+
+    Dim pressureName As String
+    Dim densityName As String
+
+    Dim newSeries As Series
+
+    Dim workbookNameForFormula As String
+    workbookNameForFormula = Replace(wb.name, "'", "''")
+
+    Do While NamedRangeExists( _
+        wb, _
+        "AP_" & formIndex & "_sampleCode" _
+    )
+
+        sampleCode = Trim$(CStr( _
+            sheetAP.Range( _
+                "AP_" & formIndex & "_sampleCode" _
+            ).value _
+        ))
+
+        ' Пустая или зарезервированная форма на график не добавляется.
+        If sampleCode = "" Then
+            GoTo NextAPForm
+        End If
+
+        Set sourceTable = Nothing
+
+        On Error Resume Next
+        Set sourceTable = _
+            sheetAP.ListObjects("AP_source_" & formIndex)
+        On Error GoTo CleanFail
+
+        If sourceTable Is Nothing Then
+            GoTo NextAPForm
+        End If
+
+        If sourceTable.DataBodyRange Is Nothing Then
+            GoTo NextAPForm
+        End If
+
+        Set pressureRange = Nothing
+        Set densityRange = Nothing
+
+        On Error Resume Next
+
+        Set pressureRange = _
+            sourceTable.ListColumns( _
+                AP_CHART_PRESSURE_COLUMN _
+            ).DataBodyRange
+
+        Set densityRange = _
+            sourceTable.ListColumns( _
+                AP_CHART_DENSITY_COLUMN _
+            ).DataBodyRange
+
+        On Error GoTo CleanFail
+
+        If pressureRange Is Nothing _
+           Or densityRange Is Nothing Then
+
+            GoTo NextAPForm
+
+        End If
+
+        pressureCount = Application.count(pressureRange)
+        densityCount = Application.count(densityRange)
+
+        ' Нужна хотя бы одна пара давление + плотность.
+        If pressureCount = 0 _
+           Or densityCount = 0 Then
+
+            GoTo NextAPForm
+
+        End If
+
+        ' После нормального сохранения количества должны совпадать.
+        If pressureCount <> densityCount Then
+
+            Debug.Print _
+                "AP_" & formIndex & _
+                ": количество давлений не совпадает " & _
+                "с количеством плотностей."
+
+            GoTo NextAPForm
+
+        End If
+
+        ' =========================================================
+        ' ФОРМИРУЕМ ЛЕГЕНДУ
+        ' =========================================================
+
+        temperatureText = ""
+
+        If NamedRangeExists( _
+            wb, _
+            "AP_" & formIndex & "_Tfact" _
+        ) Then
+
+            temperatureValue = _
+                sheetAP.Range( _
+                    "AP_" & formIndex & "_Tfact" _
+                ).value
+
+            If Not IsError(temperatureValue) Then
+                temperatureText = _
+                    Trim$(CStr(temperatureValue))
+            End If
+
+        End If
+
+        legendText = sampleCode
+
+        If temperatureText <> "" Then
+            legendText = _
+                legendText & " " & temperatureText & " °C"
+        End If
+
+        ' =========================================================
+        ' ДОБАВЛЯЕМ РЯД
+        ' =========================================================
+
+        pressureName = "AP_" & formIndex & "_P"
+        densityName = "AP_" & formIndex & "_d"
+
+        If Not NamedRangeExists(wb, pressureName) _
+           Or Not NamedRangeExists(wb, densityName) Then
+
+            Debug.Print _
+                "Не найдены диапазоны " & _
+                pressureName & " / " & densityName
+
+            GoTo NextAPForm
+
+        End If
+
+        Set newSeries = _
+            targetChart.SeriesCollection.NewSeries
+
+        With newSeries
+
+            .name = legendText
+
+            .XValues = _
+                "='" & workbookNameForFormula & "'!" & _
+                pressureName
+
+            .values = _
+                "='" & workbookNameForFormula & "'!" & _
+                densityName
+
+        End With
+
+NextAPForm:
+        formIndex = formIndex + 1
+
+    Loop
+
+    Exit Sub
+
+CleanFail:
+
+    Debug.Print _
+        "RefreshGORAPDensityChart: " & _
+        Err.Number & ": " & Err.Description
+
+    ShowNotification _
+        "Не удалось обновить график AP на листе GOR:" & _
+        vbCrLf & Err.Description, _
+        6
+
+End Sub
+```
+
+Процедура:
+
+- полностью удаляет старые ряды;
+- проходит по существующим формам AP;
+- пропускает пустые формы;
+- пропускает формы без данных;
+- добавляет зависимость `плотность(d)` от `давления(P)`;
+- формирует легенду вида:
+
+```text
+26-F669-YRH-411 20 °C
+```
+
+- использует ссылки на динамические диапазоны `AP_N_P` и `AP_N_d`.
+
+## 4. Вызвать обновление после загрузки AP
+
+В функции:
+
+```vb
+Public Function Load_AP_results_to_forms(...)
+```
+
+найди конец нормального выполнения. Сейчас там после формирования результата стоит:
+
+```vb
+    End If
+    
+    Exit Function
+    
+CleanFail:
+```
+
+Перед `Exit Function` вставь:
+
+```vb
+    Call RefreshGORAPDensityChart(wb)
+
+    Exit Function
 ```
 
 Получится:
 
-```python
-lif_sample_col = act_map["LIF"].get("samplecode")
-if lif_sample_col is None:
-    return min_date, max_date
+```vb
+    End If
 
-op_nature_liq_col = act_map.get("OP", {}).get("natureliq")
+    Call RefreshGORAPDensityChart(wb)
+
+    Exit Function
+
+CleanFail:
 ```
 
-Здесь используется `natureliq`, а не `natureLiq`, потому что функция `build_act_map()` приводит названия полей к нижнему регистру.
+Это обновит график после обычной загрузки AP из БД.
 
-### 2. После цикла по таблицам результатов
+## 5. Очищать график, если AP_results пустая
 
-В этой же функции найди конец блока:
+В этой же функции есть выход при пустой таблице `AP_results`.
 
-```python
-for result_code, result_table in results.items():
+В оба варианта проверки пустой таблицы перед `Exit Function` добавь:
+
+```vb
+Call RefreshGORAPDensityChart(wb, True)
 ```
 
-Сейчас его окончание выглядит так:
+Например:
 
-```python
-                act_table[row_num_act][act_col_idx] = value
+```vb
+If resultTable.DataBodyRange Is Nothing Then
 
-    return min_date, max_date
+    text = "OK|Таблица AP_results пустая."
+    Load_AP_results_to_forms = text
+
+    Call RefreshGORAPDensityChart(wb, True)
+
+    Exit Function
+
+End If
 ```
 
-Между присваиванием и `return`, на уровне цикла по строкам акта, вставь:
+И аналогично:
 
-```python
-        # Если природа жидкой фазы не указана,
-        # записываем в акт прочерк.
-        if op_nature_liq_col is not None:
-            nature_liq_value = act_table[row_num_act][op_nature_liq_col]
+```vb
+If Application.CountA(resultTable.DataBodyRange) = 0 Then
 
-            if normalize_text(nature_liq_value) == "":
-                act_table[row_num_act][op_nature_liq_col] = "-"
+    text = "OK|Таблица AP_results пустая."
+    Load_AP_results_to_forms = text
+
+    Call RefreshGORAPDensityChart(wb, True)
+
+    Exit Function
+
+End If
 ```
 
-Итоговая нижняя часть функции должна выглядеть так:
+## 6. В `Save_AP` отдельно ничего добавлять не нужно
 
-```python
-            for col_name, act_col_idx in result_fields.items():
-                if result_code == "OP" and col_name == "vliqphase":
-                    value = get_op_vliqphase_for_act(
-                        result_table,
-                        result_row_index,
-                    )
+После успешного сохранения у тебя уже вызывается:
 
-                else:
-                    value = result_table.get_value(
-                        result_row_index,
-                        col_name,
-                    )
-
-                act_table[row_num_act][act_col_idx] = value
-
-        # Если природа жидкой фазы не указана,
-        # записываем в акт прочерк.
-        if op_nature_liq_col is not None:
-            nature_liq_value = act_table[row_num_act][op_nature_liq_col]
-
-            if normalize_text(nature_liq_value) == "":
-                act_table[row_num_act][op_nature_liq_col] = "-"
-
-    return min_date, max_date
+```vb
+Call Load_AP_results_to_forms( _
+    "by_key", _
+    Array(COL_RESULT_ID_DB, COL_ROW_ID_DB) _
+)
 ```
 
-Важно соблюдать отступы: проверка `OP_natureLiq` должна располагаться внутри цикла:
-
-```python
-for row_num_act in range(...)
-```
-
-но уже после завершения цикла:
-
-```python
-for result_code, result_table in results.items()
-```
-
-Шаблон акта должен по-прежнему содержать заголовок именно:
+А `Load_AP_results_to_forms()` теперь сама обновляет график. Поэтому получается:
 
 ```text
-OP_natureLiq
+Save_AP
+  → сохранение в БД
+  → загрузка полученных ID
+  → RefreshGORAPDensityChart
 ```
 
-Больше ничего менять не нужно.
+При ручной загрузке:
+
+```text
+Load_AP
+  → загрузка из БД
+  → заполнение форм AP
+  → RefreshGORAPDensityChart
+```
+
+Таким образом, лишнего двойного обновления не будет. Полная пересборка рядов здесь надёжнее проверки легенд и не должна давать заметной задержки.
