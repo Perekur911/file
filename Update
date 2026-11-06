@@ -1,405 +1,667 @@
-Я бы не пытался сопоставлять ряды по тексту легенды. Легенда может измениться, повториться, а порядок форм после загрузки — поменяться. Надёжнее после сохранения или загрузки AP полностью пересобирать только этот график. Даже несколько десятков рядов для Excel — практически мгновенно.
+Обработка заняла 2m 21s
 
-Ряды будем связывать с уже существующими динамическими диапазонами:
+Лучше сделать два механизма:
 
-- `AP_1_P` — давление;
-- `AP_1_d` — плотность;
-- `AP_2_P`, `AP_2_d` и далее.
+- сортировка по любому столбцу нажатием на заголовок;
+- отдельная панель фильтров над таблицей: поиск по всем столбцам плюс фильтры по статусу версии, рекомендации, возможности пересоздания, источнику и назначенному действию.
 
-То есть значения на графике останутся ссылками, а не скопированными массивами.
+Ниже изменения для актуального create_project_forms.py с классом ProjectFormsApp.
 
-## 1. Назвать график
+1. Добавить состояние сортировки и фильтров
 
-На листе `GOR` выдели нужный график и задай ему имя:
+В ProjectFormsApp.__init__() найди:
 
-```text
-GOR_AP_chart
-```
+self.projects_var = tk.StringVar()
+self.year_var = tk.StringVar(value=str(datetime.now().year))
+self.status_var = tk.StringVar(value="Готово")
 
-Имя можно установить через поле имени слева от строки формул.
+Сразу после вставь:
 
-Код ниже предполагает, что это отдельный график только для данных AP.
+self.sort_column = "project"
+self.sort_reverse = False
 
-## 2. Добавить константы в модуль `GOR`
+self.filter_text_var = tk.StringVar()
+self.filter_version_var = tk.StringVar(value="Все")
+self.filter_recommended_var = tk.StringVar(value="Все")
+self.filter_safe_var = tk.StringVar(value="Все")
+self.filter_source_var = tk.StringVar(value="Все")
+self.filter_action_var = tk.StringVar(value="Все")
 
-В начале `GOR.bas`, рядом с остальными константами, добавь:
+Ниже сейчас вызывается:
 
-```vb
-Private Const GOR_AP_CHART_NAME As String = "GOR_AP_chart"
+self._build_controls()
+self._build_table()
 
-Private Const AP_CHART_PRESSURE_COLUMN As String = "Давление, psig"
-Private Const AP_CHART_DENSITY_COLUMN As String = "Плотность, г/см3"
-```
+Между ними добавь:
 
-## 3. Добавить процедуру обновления графика
+self._build_controls()
+self._build_filters()
+self._build_table()
 
-В конец модуля `GOR.bas` вставь:
+2. Добавить панель фильтров
 
-```vb
-Public Sub RefreshGORAPDensityChart( _
-    ByVal wb As Workbook, _
-    Optional ByVal clearOnly As Boolean = False _
-)
+Сразу после метода _build_controls() вставь новый метод:
 
-    On Error GoTo CleanFail
+def _build_filters(self) -> None:
+    ttk = self.ttk
 
-    Dim sheetGOR As Worksheet
-    Dim sheetAP As Worksheet
+    frame = ttk.LabelFrame(
+        self.root,
+        text="Фильтры таблицы",
+        padding=(8, 6),
+    )
+    frame.pack(fill="x", padx=8, pady=(0, 8))
 
-    Set sheetGOR = wb.Worksheets("GOR")
-    Set sheetAP = wb.Worksheets("AP")
-
-    ' =============================================================
-    ' НАХОДИМ ГРАФИК
-    ' =============================================================
-
-    Dim chartObject As ChartObject
-
-    On Error Resume Next
-    Set chartObject = sheetGOR.ChartObjects(GOR_AP_CHART_NAME)
-    On Error GoTo CleanFail
-
-    If chartObject Is Nothing Then
-        Err.Raise _
-            vbObjectError + 1701, _
-            "RefreshGORAPDensityChart", _
-            "На листе GOR не найден график """ & _
-            GOR_AP_CHART_NAME & """."
-    End If
-
-    Dim targetChart As Chart
-    Set targetChart = chartObject.Chart
-
-    ' =============================================================
-    ' УДАЛЯЕМ СТАРЫЕ РЯДЫ
-    ' =============================================================
-
-    Dim seriesIndex As Long
-
-    For seriesIndex = _
-        targetChart.SeriesCollection.count To 1 Step -1
-
-        targetChart.SeriesCollection(seriesIndex).Delete
-
-    Next seriesIndex
-
-    ' При пустой таблице AP_results только очищаем график.
-    If clearOnly Then Exit Sub
-
-    ' =============================================================
-    ' ДОБАВЛЯЕМ АКТУАЛЬНЫЕ ФОРМЫ AP
-    ' =============================================================
-
-    Dim formIndex As Long
-    formIndex = 1
-
-    Dim sampleCode As String
-    Dim temperatureText As String
-    Dim legendText As String
-
-    Dim temperatureValue As Variant
-
-    Dim sourceTable As ListObject
-    Dim pressureRange As Range
-    Dim densityRange As Range
-
-    Dim pressureCount As Long
-    Dim densityCount As Long
-
-    Dim pressureName As String
-    Dim densityName As String
-
-    Dim newSeries As Series
-
-    Dim workbookNameForFormula As String
-    workbookNameForFormula = Replace(wb.name, "'", "''")
-
-    Do While NamedRangeExists( _
-        wb, _
-        "AP_" & formIndex & "_sampleCode" _
+    ttk.Label(frame, text="Поиск:").grid(
+        row=0,
+        column=0,
+        sticky="w",
     )
 
-        sampleCode = Trim$(CStr( _
-            sheetAP.Range( _
-                "AP_" & formIndex & "_sampleCode" _
-            ).value _
-        ))
-
-        ' Пустая или зарезервированная форма на график не добавляется.
-        If sampleCode = "" Then
-            GoTo NextAPForm
-        End If
-
-        Set sourceTable = Nothing
-
-        On Error Resume Next
-        Set sourceTable = _
-            sheetAP.ListObjects("AP_source_" & formIndex)
-        On Error GoTo CleanFail
-
-        If sourceTable Is Nothing Then
-            GoTo NextAPForm
-        End If
-
-        If sourceTable.DataBodyRange Is Nothing Then
-            GoTo NextAPForm
-        End If
-
-        Set pressureRange = Nothing
-        Set densityRange = Nothing
-
-        On Error Resume Next
-
-        Set pressureRange = _
-            sourceTable.ListColumns( _
-                AP_CHART_PRESSURE_COLUMN _
-            ).DataBodyRange
-
-        Set densityRange = _
-            sourceTable.ListColumns( _
-                AP_CHART_DENSITY_COLUMN _
-            ).DataBodyRange
-
-        On Error GoTo CleanFail
-
-        If pressureRange Is Nothing _
-           Or densityRange Is Nothing Then
-
-            GoTo NextAPForm
-
-        End If
-
-        pressureCount = Application.count(pressureRange)
-        densityCount = Application.count(densityRange)
-
-        ' Нужна хотя бы одна пара давление + плотность.
-        If pressureCount = 0 _
-           Or densityCount = 0 Then
-
-            GoTo NextAPForm
-
-        End If
-
-        ' После нормального сохранения количества должны совпадать.
-        If pressureCount <> densityCount Then
-
-            Debug.Print _
-                "AP_" & formIndex & _
-                ": количество давлений не совпадает " & _
-                "с количеством плотностей."
-
-            GoTo NextAPForm
-
-        End If
-
-        ' =========================================================
-        ' ФОРМИРУЕМ ЛЕГЕНДУ
-        ' =========================================================
-
-        temperatureText = ""
-
-        If NamedRangeExists( _
-            wb, _
-            "AP_" & formIndex & "_Tfact" _
-        ) Then
-
-            temperatureValue = _
-                sheetAP.Range( _
-                    "AP_" & formIndex & "_Tfact" _
-                ).value
-
-            If Not IsError(temperatureValue) Then
-                temperatureText = _
-                    Trim$(CStr(temperatureValue))
-            End If
-
-        End If
-
-        legendText = sampleCode
-
-        If temperatureText <> "" Then
-            legendText = _
-                legendText & " " & temperatureText & " °C"
-        End If
-
-        ' =========================================================
-        ' ДОБАВЛЯЕМ РЯД
-        ' =========================================================
-
-        pressureName = "AP_" & formIndex & "_P"
-        densityName = "AP_" & formIndex & "_d"
-
-        If Not NamedRangeExists(wb, pressureName) _
-           Or Not NamedRangeExists(wb, densityName) Then
-
-            Debug.Print _
-                "Не найдены диапазоны " & _
-                pressureName & " / " & densityName
-
-            GoTo NextAPForm
-
-        End If
-
-        Set newSeries = _
-            targetChart.SeriesCollection.NewSeries
-
-        With newSeries
-
-            .name = legendText
-
-            .XValues = _
-                "='" & workbookNameForFormula & "'!" & _
-                pressureName
-
-            .values = _
-                "='" & workbookNameForFormula & "'!" & _
-                densityName
-
-        End With
-
-NextAPForm:
-        formIndex = formIndex + 1
-
-    Loop
-
-    Exit Sub
-
-CleanFail:
-
-    Debug.Print _
-        "RefreshGORAPDensityChart: " & _
-        Err.Number & ": " & Err.Description
-
-    ShowNotification _
-        "Не удалось обновить график AP на листе GOR:" & _
-        vbCrLf & Err.Description, _
-        6
-
-End Sub
-```
-
-Процедура:
-
-- полностью удаляет старые ряды;
-- проходит по существующим формам AP;
-- пропускает пустые формы;
-- пропускает формы без данных;
-- добавляет зависимость `плотность(d)` от `давления(P)`;
-- формирует легенду вида:
-
-```text
-26-F669-YRH-411 20 °C
-```
-
-- использует ссылки на динамические диапазоны `AP_N_P` и `AP_N_d`.
-
-## 4. Вызвать обновление после загрузки AP
-
-В функции:
-
-```vb
-Public Function Load_AP_results_to_forms(...)
-```
-
-найди конец нормального выполнения. Сейчас там после формирования результата стоит:
-
-```vb
-    End If
-    
-    Exit Function
-    
-CleanFail:
-```
-
-Перед `Exit Function` вставь:
-
-```vb
-    Call RefreshGORAPDensityChart(wb)
-
-    Exit Function
-```
-
-Получится:
-
-```vb
-    End If
-
-    Call RefreshGORAPDensityChart(wb)
-
-    Exit Function
-
-CleanFail:
-```
-
-Это обновит график после обычной загрузки AP из БД.
-
-## 5. Очищать график, если AP_results пустая
-
-В этой же функции есть выход при пустой таблице `AP_results`.
-
-В оба варианта проверки пустой таблицы перед `Exit Function` добавь:
-
-```vb
-Call RefreshGORAPDensityChart(wb, True)
-```
-
-Например:
-
-```vb
-If resultTable.DataBodyRange Is Nothing Then
-
-    text = "OK|Таблица AP_results пустая."
-    Load_AP_results_to_forms = text
-
-    Call RefreshGORAPDensityChart(wb, True)
-
-    Exit Function
-
-End If
-```
-
-И аналогично:
-
-```vb
-If Application.CountA(resultTable.DataBodyRange) = 0 Then
-
-    text = "OK|Таблица AP_results пустая."
-    Load_AP_results_to_forms = text
-
-    Call RefreshGORAPDensityChart(wb, True)
-
-    Exit Function
-
-End If
-```
-
-## 6. В `Save_AP` отдельно ничего добавлять не нужно
-
-После успешного сохранения у тебя уже вызывается:
-
-```vb
-Call Load_AP_results_to_forms( _
-    "by_key", _
-    Array(COL_RESULT_ID_DB, COL_ROW_ID_DB) _
+    self.filter_text_entry = ttk.Entry(
+        frame,
+        textvariable=self.filter_text_var,
+        width=28,
+    )
+    self.filter_text_entry.grid(
+        row=0,
+        column=1,
+        sticky="ew",
+        padx=(5, 12),
+    )
+
+    ttk.Label(frame, text="Статус версии:").grid(
+        row=0,
+        column=2,
+        sticky="w",
+    )
+
+    self.filter_version_combo = ttk.Combobox(
+        frame,
+        textvariable=self.filter_version_var,
+        values=("Все",),
+        state="readonly",
+        width=22,
+    )
+    self.filter_version_combo.grid(
+        row=0,
+        column=3,
+        padx=(5, 12),
+    )
+
+    ttk.Label(frame, text="Рекомендация:").grid(
+        row=0,
+        column=4,
+        sticky="w",
+    )
+
+    self.filter_recommended_combo = ttk.Combobox(
+        frame,
+        textvariable=self.filter_recommended_var,
+        values=("Все",),
+        state="readonly",
+        width=29,
+    )
+    self.filter_recommended_combo.grid(
+        row=0,
+        column=5,
+        padx=(5, 12),
+    )
+
+    ttk.Label(frame, text="Пересоздание:").grid(
+        row=1,
+        column=0,
+        sticky="w",
+        pady=(6, 0),
+    )
+
+    self.filter_safe_combo = ttk.Combobox(
+        frame,
+        textvariable=self.filter_safe_var,
+        values=("Все", "ДА", "НЕТ"),
+        state="readonly",
+        width=14,
+    )
+    self.filter_safe_combo.grid(
+        row=1,
+        column=1,
+        sticky="w",
+        padx=(5, 12),
+        pady=(6, 0),
+    )
+
+    ttk.Label(frame, text="Источник:").grid(
+        row=1,
+        column=2,
+        sticky="w",
+        pady=(6, 0),
+    )
+
+    self.filter_source_combo = ttk.Combobox(
+        frame,
+        textvariable=self.filter_source_var,
+        values=("Все",),
+        state="readonly",
+        width=22,
+    )
+    self.filter_source_combo.grid(
+        row=1,
+        column=3,
+        padx=(5, 12),
+        pady=(6, 0),
+    )
+
+    ttk.Label(frame, text="Действие:").grid(
+        row=1,
+        column=4,
+        sticky="w",
+        pady=(6, 0),
+    )
+
+    self.filter_action_combo = ttk.Combobox(
+        frame,
+        textvariable=self.filter_action_var,
+        values=(
+            "Все",
+            "Без действия",
+            "Обновить/создать",
+            "Пересоздать",
+        ),
+        state="readonly",
+        width=29,
+    )
+    self.filter_action_combo.grid(
+        row=1,
+        column=5,
+        padx=(5, 12),
+        pady=(6, 0),
+    )
+
+    ttk.Button(
+        frame,
+        text="Сбросить фильтры",
+        command=self.clear_filters,
+    ).grid(
+        row=0,
+        column=6,
+        rowspan=2,
+        padx=(4, 0),
+    )
+
+    frame.columnconfigure(1, weight=1)
+
+    self._bind_entry_paste(self.filter_text_entry)
+
+    # Поиск обновляется сразу при вводе или вставке.
+    self.filter_text_var.trace_add(
+        "write",
+        self._on_filter_text_changed,
+    )
+
+    for combo in (
+        self.filter_version_combo,
+        self.filter_recommended_combo,
+        self.filter_safe_combo,
+        self.filter_source_combo,
+        self.filter_action_combo,
+    ):
+        combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self.refresh_table(),
+        )
+
+3. Изменить создание заголовков таблицы
+
+В _build_table() после объявления columns:
+
+columns = (
+    ...
 )
-```
 
-А `Load_AP_results_to_forms()` теперь сама обновляет график. Поэтому получается:
+добавь:
 
-```text
-Save_AP
-  → сохранение в БД
-  → загрузка полученных ID
-  → RefreshGORAPDensityChart
-```
+self.table_columns = columns
 
-При ручной загрузке:
+После словаря headings добавь:
 
-```text
-Load_AP
-  → загрузка из БД
-  → заполнение форм AP
-  → RefreshGORAPDensityChart
-```
+self.table_headings = headings
 
-Таким образом, лишнего двойного обновления не будет. Полная пересборка рядов здесь надёжнее проверки легенд и не должна давать заметной задержки.
+В цикле настройки заголовков замени:
+
+self.tree.heading(column, text=headings[column])
+
+на:
+
+self.tree.heading(
+    column,
+    text=headings[column],
+    command=lambda selected_column=column: (
+        self.sort_by_column(selected_column)
+    ),
+)
+
+После всех bind, в конце _build_table(), добавь:
+
+self._update_sort_headings()
+
+Теперь нажатие на заголовок будет переключать направление сортировки.
+
+4. Добавить функции фильтрации и сортировки
+
+Сразу после метода:
+
+def _project_visible_for_year(...)
+
+вставь следующие методы:
+
+def _on_filter_text_changed(self, *_args) -> None:
+    if hasattr(self, "tree") and not self.busy:
+        self.refresh_table()
+
+
+def clear_filters(self) -> None:
+    self.filter_text_var.set("")
+    self.filter_version_var.set("Все")
+    self.filter_recommended_var.set("Все")
+    self.filter_safe_var.set("Все")
+    self.filter_source_var.set("Все")
+    self.filter_action_var.set("Все")
+
+    if hasattr(self, "tree"):
+        self.refresh_table()
+
+
+def _update_filter_lists(self, year: int) -> None:
+    year_items = [
+        item
+        for project, item in self.cache.items()
+        if self._project_visible_for_year(project, year)
+    ]
+
+    version_values = (
+        "Все",
+        *sorted({
+            item.version_status
+            for item in year_items
+            if item.version_status
+        }),
+    )
+
+    recommended_values = (
+        "Все",
+        *sorted({
+            item.recommended_action
+            for item in year_items
+            if item.recommended_action
+        }),
+    )
+
+    source_values = (
+        "Все",
+        *sorted({
+            item.inspection_source
+            for item in year_items
+            if item.inspection_source
+        }),
+    )
+
+    self.filter_version_combo.configure(
+        values=version_values,
+    )
+    self.filter_recommended_combo.configure(
+        values=recommended_values,
+    )
+    self.filter_source_combo.configure(
+        values=source_values,
+    )
+
+    if self.filter_version_var.get() not in version_values:
+        self.filter_version_var.set("Все")
+
+    if self.filter_recommended_var.get() not in recommended_values:
+        self.filter_recommended_var.set("Все")
+
+    if self.filter_source_var.get() not in source_values:
+        self.filter_source_var.set("Все")
+
+
+def _matches_filters(self, item: ProjectInspection) -> bool:
+    version_filter = self.filter_version_var.get()
+
+    if (
+        version_filter != "Все"
+        and item.version_status != version_filter
+    ):
+        return False
+
+    recommended_filter = self.filter_recommended_var.get()
+
+    if (
+        recommended_filter != "Все"
+        and item.recommended_action != recommended_filter
+    ):
+        return False
+
+    safe_filter = self.filter_safe_var.get()
+
+    if safe_filter == "ДА" and not item.safe_to_recreate:
+        return False
+
+    if safe_filter == "НЕТ" and item.safe_to_recreate:
+        return False
+
+    source_filter = self.filter_source_var.get()
+
+    if (
+        source_filter != "Все"
+        and item.inspection_source != source_filter
+    ):
+        return False
+
+    action_filter = self.filter_action_var.get()
+
+    action_mapping = {
+        "Без действия": "",
+        "Обновить/создать": "update",
+        "Пересоздать": "recreate",
+    }
+
+    if action_filter != "Все":
+        expected_action = action_mapping[action_filter]
+
+        if item.selected_action != expected_action:
+            return False
+
+    search_text = self.filter_text_var.get().strip().casefold()
+
+    if search_text:
+        search_values = list(self._row_values(item))
+        search_values.extend(
+            (
+                item.issue,
+                item.selected_folder,
+                item.expected_folder,
+                " ".join(item.found_folders),
+                " ".join(item.workbook_candidates),
+            )
+        )
+
+        full_text = "\n".join(
+            str(value)
+            for value in search_values
+            if value is not None
+        ).casefold()
+
+        if search_text not in full_text:
+            return False
+
+    return True
+
+
+@staticmethod
+def _natural_sort_key(value: Any) -> tuple:
+    text = str(value or "").strip().casefold()
+
+    parts = re.split(r"(\d+)", text)
+
+    return tuple(
+        (0, int(part))
+        if part.isdigit()
+        else (1, part)
+        for part in parts
+        if part != ""
+    )
+
+
+def _column_display_value(
+    self,
+    item: ProjectInspection,
+    column: str,
+) -> str:
+    column_index = self.table_columns.index(column)
+    return self._row_values(item)[column_index]
+
+
+def sort_by_column(self, column: str) -> None:
+    if self.sort_column == column:
+        self.sort_reverse = not self.sort_reverse
+    else:
+        self.sort_column = column
+        self.sort_reverse = False
+
+    self._update_sort_headings()
+    self._sort_tree_items()
+
+
+def _update_sort_headings(self) -> None:
+    for column in self.table_columns:
+        caption = self.table_headings[column]
+
+        if column == self.sort_column:
+            caption += " ▼" if self.sort_reverse else " ▲"
+
+        self.tree.heading(column, text=caption)
+
+
+def _sort_tree_items(self) -> None:
+    if not hasattr(self, "tree"):
+        return
+
+    children = list(self.tree.get_children())
+
+    filled: list[str] = []
+    empty: list[str] = []
+
+    for project in children:
+        item = self.cache.get(project)
+
+        if item is None:
+            continue
+
+        value = self._column_display_value(
+            item,
+            self.sort_column,
+        )
+
+        if str(value).strip():
+            filled.append(project)
+        else:
+            empty.append(project)
+
+    filled.sort(
+        key=lambda project: self._natural_sort_key(
+            self._column_display_value(
+                self.cache[project],
+                self.sort_column,
+            )
+        ),
+        reverse=self.sort_reverse,
+    )
+
+    # Пустые значения всегда располагаются внизу.
+    ordered = filled + empty
+
+    for position, project in enumerate(ordered):
+        self.tree.move(project, "", position)
+
+Сортировка будет натуральной: например, 26-F9 не окажется после 26-F100.
+
+5. Разделить отображение строки и проверку её видимости
+
+Перед существующим _upsert_row() добавь:
+
+def _set_tree_row(self, item: ProjectInspection) -> None:
+    project = item.refresh_project
+    values = self._row_values(item)
+    tags = (self._row_tag(item),)
+
+    if self.tree.exists(project):
+        self.tree.item(
+            project,
+            values=values,
+            tags=tags,
+        )
+    else:
+        self.tree.insert(
+            "",
+            "end",
+            iid=project,
+            values=values,
+            tags=tags,
+        )
+
+Существующий _upsert_row() замени целиком:
+
+def _upsert_row(self, item: ProjectInspection) -> None:
+    year = self._read_year()
+
+    if year is None:
+        return
+
+    project = item.refresh_project
+
+    should_show = (
+        self._project_visible_for_year(project, year)
+        and self._matches_filters(item)
+    )
+
+    if not should_show:
+        if self.tree.exists(project):
+            self.tree.delete(project)
+        return
+
+    self._set_tree_row(item)
+    self._sort_tree_items()
+
+Это важно: если после сканирования статус проекта изменился и перестал соответствовать фильтру, строка автоматически исчезнет из таблицы.
+
+6. Добавить полное обновление таблицы
+
+Перед show_cached_year() вставь:
+
+def refresh_table(self) -> None:
+    year = self._read_year()
+
+    if year is None:
+        return
+
+    selected_before = set(self.selected_projects())
+
+    self._update_filter_lists(year)
+
+    for iid in self.tree.get_children():
+        self.tree.delete(iid)
+
+    total_for_year = 0
+    shown = 0
+
+    for project in sorted(self.cache):
+        item = self.cache[project]
+
+        if not self._project_visible_for_year(project, year):
+            continue
+
+        total_for_year += 1
+
+        if not self._matches_filters(item):
+            continue
+
+        self._set_tree_row(item)
+        shown += 1
+
+    self._sort_tree_items()
+
+    selected_after = [
+        project
+        for project in selected_before
+        if self.tree.exists(project)
+    ]
+
+    if selected_after:
+        self.tree.selection_set(selected_after)
+
+    self.status_var.set(
+        f"Показано проектов: {shown} из {total_for_year}; "
+        f"год: {year}"
+    )
+
+7. Упростить show_cached_year()
+
+Существующий метод show_cached_year() замени целиком:
+
+def show_cached_year(self) -> None:
+    if self.busy:
+        return
+
+    self.refresh_table()
+
+Теперь год, фильтры и сортировка будут применяться одним общим механизмом.
+
+8. Исправить выполнение плана с учётом фильтров
+
+Это важный момент: отфильтрованная строка не должна исчезать из плана, если ей уже было назначено действие.
+
+В execute_plan() сейчас план строится по:
+
+visible_projects = self.tree.get_children()
+
+plan = {
+    project: self.cache[project].selected_action
+    for project in visible_projects
+    if self.cache[project].selected_action in {"update", "recreate"}
+}
+
+Замени начало execute_plan() на:
+
+def execute_plan(self) -> None:
+    if self.busy:
+        return
+
+    year = self._read_year()
+
+    if year is None:
+        return
+
+    plan = {
+        project: item.selected_action
+        for project, item in self.cache.items()
+        if self._project_visible_for_year(project, year)
+        and item.selected_action in {"update", "recreate"}
+    }
+
+    if not plan:
+        self.status_var.set(
+            "План пуст: сначала назначьте действия"
+        )
+        return
+
+    cache_snapshot = {
+        key: replace(value)
+        for key, value in self.cache.items()
+    }
+
+    self._set_busy(
+        True,
+        f"Выполняется план: {len(plan)} проектов...",
+    )
+
+    thread = threading.Thread(
+        target=self._execution_worker,
+        args=(plan, cache_snapshot, year),
+        daemon=True,
+    )
+    thread.start()
+
+То есть замени метод до конца запуска потока. Остальную логику менять не надо.
+
+Что получится
+
+- клик по заголовку — сортировка;
+- повторный клик — обратная сортировка;
+- стрелка ▲/▼ показывает направление;
+- поиск работает сразу по всем отображаемым данным;
+- отдельные фильтры можно комбинировать;
+- Выделить всё выделяет только строки, оставшиеся после фильтрации;
+- назначенные действия сохраняются, даже если строка скрылась фильтром;
+- Выполнить план выполняет все назначенные действия выбранного года;
+- экспорт в Excel останется экспортом только отображаемых после фильтрации строк — в текущем порядке сортировки.
