@@ -1,134 +1,293 @@
-Обработка заняла 56s
+Обработка заняла 2m 30s
 
-Если последнее изменение схемы было 005_add_comments_and_dlst_type.sql с версией БД 3.0.0, то для нового поля Stable нужна следующая миграция 006, а версия схемы — например 3.1.0.
+Это надо изменить только в модуле SSF. БД и Python менять не требуется: SSF_results может существовать без строк в SSF_sourceData, а sampleCode дочерней таблицы не обязательный.
 
-Ниже считаю, что поле называется totalCellVolume. Если ты назвал его иначе, везде используй своё точное имя с тем же регистром.
+Логика будет такая:
 
-1. Новая миграция БД
+- TaskId пустой → шифры необязательны;
+- TaskId указан, а в задании виалы/банки/пикнометры везде пусто, - или 0 → шифры необязательны;
+- в задании хотя бы одно другое значение → должен существовать хотя бы один корректный шифр;
+- если шифры введены добровольно — они сохраняются независимо от задания.
 
-Создай файл:
+1. Добавь вспомогательные функции
 
-database/migrations/006_add_stable_total_cell_volume.sql
+В модуле SSF, сразу после CheckSSFTask, вставь:
 
-Содержимое:
+Private Function SSF_TaskRequiresSampleCodes( _
+    ByVal wb As Workbook, _
+    ByVal taskIdValue As Variant _
+) As Boolean
 
--- ============================================================
--- SQLite migration: add total cell volume to Stable
--- 006_add_stable_total_cell_volume / schema version 3.1.0
--- ============================================================
+    SSF_TaskRequiresSampleCodes = False
 
-PRAGMA foreign_keys = OFF;
+    If IsError(taskIdValue) Then Exit Function
 
-BEGIN TRANSACTION;
+    Dim taskIdText As String
+    taskIdText = Trim$(CStr(taskIdValue))
 
-ALTER TABLE Stable_results
-    ADD COLUMN totalCellVolume REAL;
+    ' Задание не указано — проверку не проводим.
+    If taskIdText = "" Then Exit Function
+    If Not IsNumeric(taskIdValue) Then Exit Function
+    If CDbl(taskIdValue) <= 0 Then Exit Function
+    If CDbl(taskIdValue) <> Fix(CDbl(taskIdValue)) Then Exit Function
 
-INSERT INTO schema_migrations (
-    schema_version,
-    migration_name
-)
-VALUES (
-    '3.1.0',
-    '006_add_stable_total_cell_volume'
-);
+    Dim tasks As ListObject
+    Set tasks = wb.Worksheets("Task").ListObjects(1)
 
-COMMIT;
+    If tasks.DataBodyRange Is Nothing Then Exit Function
 
-PRAGMA foreign_keys = ON;
+    Dim taskCell As Range
 
-Поле нужно оставить nullable, без NOT NULL: в старых результатах его ещё нет.
+    Set taskCell = tasks _
+        .ListColumns("Номер задания") _
+        .DataBodyRange _
+        .Find( _
+            What:=CLng(taskIdValue), _
+            LookIn:=xlValues, _
+            LookAt:=xlWhole, _
+            SearchOrder:=xlByColumns, _
+            SearchDirection:=xlNext, _
+            MatchCase:=False _
+        )
 
-Старый файл 005_add_comments_and_dlst_type.sql менять не нужно.
+    ' Неизвестное задание обрабатывает CheckSSFTask.
+    If taskCell Is Nothing Then Exit Function
 
-2. Заполнение старых данных
+    Dim taskRowIndex As Long
+    taskRowIndex = _
+        taskCell.row - tasks.DataBodyRange.row + 1
 
-Пары resultIdStable — значение достаточно, если ID взяты именно из рабочей БД.
+    If SSF_TaskSampleValueRequiresCode( _
+        tasks.ListColumns("Кол-во виал") _
+             .DataBodyRange.Cells(taskRowIndex, 1).value _
+    ) Then
 
-Можно добавить в миграцию перед INSERT INTO schema_migrations:
+        SSF_TaskRequiresSampleCodes = True
+        Exit Function
 
-UPDATE Stable_results
-SET totalCellVolume =
-    CASE resultIdStable
-        WHEN 101 THEN 189.8799
-        WHEN 102 THEN 203.5000
-        WHEN 103 THEN 175.1650
-        -- остальные значения
-        ELSE totalCellVolume
-    END
-WHERE resultIdStable IN (
-    101,
-    102,
-    103
-);
+    End If
 
-В SQL десятичный разделитель обязательно точка.
+    If SSF_TaskSampleValueRequiresCode( _
+        tasks.ListColumns("Наличие банки") _
+             .DataBodyRange.Cells(taskRowIndex, 1).value _
+    ) Then
 
-Для дополнительной защиты лучше при подготовке данных сохранить рядом:
+        SSF_TaskRequiresSampleCodes = True
+        Exit Function
 
-resultIdStable | sampleCode | analyseNumber | totalCellVolume
+    End If
 
-Обновлять можно по ID, а sampleCode + analyseNumber использовать для ручной проверки соответствия.
+    If SSF_TaskSampleValueRequiresCode( _
+        tasks.ListColumns("Кол-во пикнометров") _
+             .DataBodyRange.Cells(taskRowIndex, 1).value _
+    ) Then
 
-3. schema.py
+        SSF_TaskRequiresSampleCodes = True
+        Exit Function
 
-В описании STABLE_RESULTS, рядом с LiquidVolume, должна быть колонка:
+    End If
 
-_col(
-    "totalCellVolume",
-    "totalCellVolume",
-    typ="REAL",
-    value_type="real",
-),
+End Function
 
-Например:
 
-_col("pressureMPaAbs", "pressureMPaAbs", typ="REAL", value_type="real"),
-_col("LiquidVolume", "LiquidVolume", typ="REAL", value_type="real"),
-_col("totalCellVolume", "totalCellVolume", typ="REAL", value_type="real"),
-_col("dateTimeSync", "dateTimeSync", typ="TEXT", value_type="datetime"),
+Private Function SSF_TaskSampleValueRequiresCode( _
+    ByVal fieldValue As Variant _
+) As Boolean
 
-Проверь, чтобы не было второго определения этой колонки и чтобы имя полностью совпадало с:
+    ' Ошибочное значение безопаснее считать требующим проверки.
+    If IsError(fieldValue) Then
+        SSF_TaskSampleValueRequiresCode = True
+        Exit Function
+    End If
 
-- заголовком Stable_results;
-- именованным диапазоном;
-- VBA;
-- SQL.
+    Dim valueText As String
+    valueText = Trim$(CStr(fieldValue))
 
-4. project_version.json
+    ' Эти значения означают отсутствие полученной пробы.
+    If valueText = "" Or valueText = "-" Then
+        SSF_TaskSampleValueRequiresCode = False
+        Exit Function
+    End If
 
-Измени только версию схемы БД:
+    If IsNumeric(fieldValue) Then
 
-"database_schema": {
-  "version": "3.1.0",
-  "filename": "sqlite\\results.db"
-}
+        SSF_TaskSampleValueRequiresCode = _
+            (CDbl(fieldValue) <> 0)
 
-Версию Python увеличивай только если менялся schema.py и этот компонент у тебя версионируется отдельно. Поскольку schema.py меняется, логично её тоже увеличить.
+    Else
 
-5. Проверка после миграции
+        ' Любой другой текст означает, что проба указана.
+        SSF_TaskSampleValueRequiresCode = True
 
-PRAGMA table_info(Stable_results);
+    End If
 
-И:
+End Function
 
-SELECT
-    resultIdStable,
-    sampleCode,
-    analyseNumber,
-    totalCellVolume
-FROM Stable_results
-ORDER BY resultIdStable;
+Функция смотрит непосредственно в таблицу Task, а не доверяет значениям, перенесённым в форму SSF.
 
-Проверка регистрации миграции:
+2. Измени Validate_SSF_Form
 
-SELECT *
-FROM schema_migrations
-ORDER BY id DESC;
+В начале функции, после получения sourceTable и проверки его столбцов, добавь:
 
-Индекс для totalCellVolume не нужен: по этому полю ничего не ищется и не связывается.
+Dim taskRequiresSampleCodes As Boolean
 
-После этого обязательно проверить на тестовой копии два сценария:
+    taskRequiresSampleCodes = _
+        SSF_TaskRequiresSampleCodes( _
+            wb, _
+            sheetSSF.Range( _
+                "SSF_" & formIndex & "_TaskId" _
+            ).value _
+        )
 
-1. загрузка старого Stable — значение приходит из выполненного UPDATE либо остаётся пустым;
-2. сохранение нового Stable — totalCellVolume записывается и затем загружается обратно.
+Найди блок:
+
+' =============================================================
+' ДОЛЖНА БЫТЬ УКАЗАНА ХОТЯ БЫ ОДНА ПОЛУЧЕННАЯ ПРОБА
+' =============================================================
+
+If countFieldsSeen = 3 Then
+
+Замени начало условия на:
+
+' =============================================================
+' ЕСЛИ ЗАДАНИЕ ПРЕДУСМАТРИВАЕТ ПОЛУЧЕННЫЕ ПРОБЫ,
+' В ФОРМЕ ДОЛЖНО БЫТЬ УКАЗАНО ИХ КОЛИЧЕСТВО
+' =============================================================
+
+If taskRequiresSampleCodes _
+   And countFieldsSeen = 3 Then
+
+Остальное содержимое блока оставь прежним.
+
+Теперь пустые vial, bottle, pics не вызовут ошибку, если:
+
+- TaskId отсутствует;
+- либо в задании все три значения пустые, - или 0.
+
+3. Измени обязательное создание шифров в Save_SSF
+
+Сразу после:
+
+If Not Validate_SSF_Form(i) Then
+    Exit Function
+End If
+
+добавь:
+
+Dim taskRequiresSampleCodes As Boolean
+
+taskRequiresSampleCodes = _
+    SSF_TaskRequiresSampleCodes( _
+        wb, _
+        sheetSSF.Range( _
+            "SSF_" & i & "_TaskId" _
+        ).value _
+    )
+
+Дальше найди участок:
+
+' Если корректных шифров вообще нет,
+' предлагаем их сформировать.
+If Not SSF_GetSampleCodeCounts( _
+    i, _
+    actualLPhCount, _
+    actualGPhCount _
+) Then
+
+    Application.ScreenUpdating = True
+    DoEvents
+    Application.ScreenUpdating = False
+
+    If Not CreateSampleCodeSSF3(i) Then
+        Save_SSF = MACRO_FAILED
+        Exit Function
+    End If
+
+    actualLPhCount = 0
+    actualGPhCount = 0
+
+    Call SSF_GetSampleCodeCounts( _
+        i, _
+        actualLPhCount, _
+        actualGPhCount _
+    )
+
+End If
+
+Замени его на:
+
+Dim hasSampleCodes As Boolean
+
+hasSampleCodes = _
+    SSF_GetSampleCodeCounts( _
+        i, _
+        actualLPhCount, _
+        actualGPhCount _
+    )
+
+' Автоматически предлагаем сформировать шифры только тогда,
+' когда они действительно предусмотрены заданием.
+If taskRequiresSampleCodes _
+   And Not hasSampleCodes Then
+
+    Application.ScreenUpdating = True
+    DoEvents
+    Application.ScreenUpdating = False
+
+    If Not CreateSampleCodeSSF3(i) Then
+        Save_SSF = MACRO_FAILED
+        Exit Function
+    End If
+
+    actualLPhCount = 0
+    actualGPhCount = 0
+
+    hasSampleCodes = _
+        SSF_GetSampleCodeCounts( _
+            i, _
+            actualLPhCount, _
+            actualGPhCount _
+        )
+
+End If
+
+4. Измени окончательную блокировку
+
+Сейчас ниже находится:
+
+If actualLPhCount + actualGPhCount = 0 Then
+
+Замени на:
+
+If taskRequiresSampleCodes _
+   And actualLPhCount + actualGPhCount = 0 Then
+
+Таким образом, отсутствие шифров блокирует сохранение только при наличии требования в задании.
+
+5. Ограничь проверку количества
+
+Ниже имеется проверка:
+
+If actualLPhCount <> expectedLPhCount _
+   Or actualGPhCount <> expectedGPhCount Then
+
+Замени на:
+
+If taskRequiresSampleCodes _
+   And ( _
+       actualLPhCount <> expectedLPhCount _
+       Or actualGPhCount <> expectedGPhCount _
+   ) Then
+
+Это важно: без TaskId или при нулевом количестве проб в задании макрос не должен выдавать предупреждение о несовпадении количества.
+
+Итоговое поведение:
+
+TaskId	Значения задания	Шифры	Результат
+
+Нет	Любые значения формы	Нет	Сохранение разрешено
+Нет	—	Есть	Шифры сохраняются
+Есть	- / пусто / 0	Нет	Сохранение разрешено
+Есть	- / пусто / 0	Есть	Шифры сохраняются
+Есть	Хотя бы одна проба указана	Нет	Сохранение запрещено
+Есть	Хотя бы одна проба указана	Есть	Сохранение разрешено; количество проверяется 
