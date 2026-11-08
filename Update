@@ -1,82 +1,134 @@
-Обработка заняла 2m 9s
+Обработка заняла 56s
 
-Нашёл причину. Python не вызывается правильно: текущий хэш OP совпадает с сохранённым, а последний статус уже Валидировано. Ошибка в другом — в метаданных книги остаётся устаревший OPDataState = dirty, и при закрытии он не всегда перепроверяется.
+Если последнее изменение схемы было 005_add_comments_and_dlst_type.sql с версией БД 3.0.0, то для нового поля Stable нужна следующая миграция 006, а версия схемы — например 3.1.0.
 
-Это потенциально касается всех исследований, не только OP.
+Ниже считаю, что поле называется totalCellVolume. Если ты назвал его иначе, везде используй своё точное имя с тем же регистром.
 
-1. Общая правка в modMetadata
+1. Новая миграция БД
 
-Полностью замени процедуру RefreshStudyIfNeeded:
+Создай файл:
 
-Private Sub RefreshStudyIfNeeded( _
-    ByVal wb As Workbook, _
-    ByVal studyCode As String, _
-    ByVal hashProperty As String, _
-    ByVal stateProperty As String _
+database/migrations/006_add_stable_total_cell_volume.sql
+
+Содержимое:
+
+-- ============================================================
+-- SQLite migration: add total cell volume to Stable
+-- 006_add_stable_total_cell_volume / schema version 3.1.0
+-- ============================================================
+
+PRAGMA foreign_keys = OFF;
+
+BEGIN TRANSACTION;
+
+ALTER TABLE Stable_results
+    ADD COLUMN totalCellVolume REAL;
+
+INSERT INTO schema_migrations (
+    schema_version,
+    migration_name
 )
+VALUES (
+    '3.1.0',
+    '006_add_stable_total_cell_volume'
+);
 
-    Dim storedStatus As StudySyncStatus
-    storedStatus = GetStudySyncStatus(wb, stateProperty)
+COMMIT;
 
-    ' Если исследование не отмечено как изменённое,
-    ' доверяем только безопасным статусам.
-    '
-    ' DIRTY, UNSAVED, ERROR и UNKNOWN обязательно перепроверяем:
-    ' сохранённый статус мог устареть.
-    If Not StudyNeedsHashCheck(wb, studyCode) Then
+PRAGMA foreign_keys = ON;
 
-        Select Case storedStatus
+Поле нужно оставить nullable, без NOT NULL: в старых результатах его ещё нет.
 
-            Case SYNC_STATUS_EMPTY, _
-                 SYNC_STATUS_SYNCED
+Старый файл 005_add_comments_and_dlst_type.sql менять не нужно.
 
-                Exit Sub
+2. Заполнение старых данных
 
-        End Select
+Пары resultIdStable — значение достаточно, если ID взяты именно из рабочей БД.
 
-    End If
+Можно добавить в миграцию перед INSERT INTO schema_migrations:
 
-    UpdateStudySyncStatus _
-        wb, _
-        studyCode, _
-        hashProperty, _
-        stateProperty
+UPDATE Stable_results
+SET totalCellVolume =
+    CASE resultIdStable
+        WHEN 101 THEN 189.8799
+        WHEN 102 THEN 203.5000
+        WHEN 103 THEN 175.1650
+        -- остальные значения
+        ELSE totalCellVolume
+    END
+WHERE resultIdStable IN (
+    101,
+    102,
+    103
+);
 
-End Sub
+В SQL десятичный разделитель обязательно точка.
 
-Теперь перед закрытием:
+Для дополнительной защиты лучше при подготовке данных сохранить рядом:
 
-- synced и empty без изменений пересчитываться не будут;
-- dirty, unsaved, error, unknown всегда будут подтверждаться реальным хэшем;
-- если dirty устарел, он автоматически станет synced;
-- если изменения действительно есть, предупреждение останется.
+resultIdStable | sampleCode | analyseNumber | totalCellVolume
 
-2. Дополнительная правка в Save_OP
+Обновлять можно по ID, а sampleCode + analyseNumber использовать для ручной проверки соответствия.
 
-В Save_OP найди:
+3. schema.py
 
-If needToSave = DATA_NO_CHANGES Then
-    Save_OP = MACRO_NO_CHANGES
-    Exit Function
+В описании STABLE_RESULTS, рядом с LiquidVolume, должна быть колонка:
 
-Замени на:
+_col(
+    "totalCellVolume",
+    "totalCellVolume",
+    typ="REAL",
+    value_type="real",
+),
 
-If needToSave = DATA_NO_CHANGES Then
+Например:
 
-    ' Хэши совпадают — данные действительно синхронизированы.
-    SetStudySyncStatus _
-        wb, _
-        PROP_OP_DATA_STATE, _
-        SYNC_STATUS_SYNCED, _
-        False
+_col("pressureMPaAbs", "pressureMPaAbs", typ="REAL", value_type="real"),
+_col("LiquidVolume", "LiquidVolume", typ="REAL", value_type="real"),
+_col("totalCellVolume", "totalCellVolume", typ="REAL", value_type="real"),
+_col("dateTimeSync", "dateTimeSync", typ="TEXT", value_type="datetime"),
 
-    ClearStudyHashCheck wb, "OP"
+Проверь, чтобы не было второго определения этой колонки и чтобы имя полностью совпадало с:
 
-    Save_OP = MACRO_NO_CHANGES
-    Exit Function
+- заголовком Stable_results;
+- именованным диапазоном;
+- VBA;
+- SQL.
 
-End If
+4. project_version.json
 
-Это сразу исправит состояние после нажатия «Валидировать OP», даже если Python запускать не требуется.
+Измени только версию схемы БД:
 
-Итого: наличие статуса Валидировано важно только потому, что повторная валидация закономерно возвращает DATA_NO_CHANGES. Ложное предупреждение вызывает именно зависший OPDataState = dirty. После обеих правок логика будет согласованной. 
+"database_schema": {
+  "version": "3.1.0",
+  "filename": "sqlite\\results.db"
+}
+
+Версию Python увеличивай только если менялся schema.py и этот компонент у тебя версионируется отдельно. Поскольку schema.py меняется, логично её тоже увеличить.
+
+5. Проверка после миграции
+
+PRAGMA table_info(Stable_results);
+
+И:
+
+SELECT
+    resultIdStable,
+    sampleCode,
+    analyseNumber,
+    totalCellVolume
+FROM Stable_results
+ORDER BY resultIdStable;
+
+Проверка регистрации миграции:
+
+SELECT *
+FROM schema_migrations
+ORDER BY id DESC;
+
+Индекс для totalCellVolume не нужен: по этому полю ничего не ищется и не связывается.
+
+После этого обязательно проверить на тестовой копии два сценария:
+
+1. загрузка старого Stable — значение приходит из выполненного UPDATE либо остаётся пустым;
+2. сохранение нового Stable — totalCellVolume записывается и затем загружается обратно.
