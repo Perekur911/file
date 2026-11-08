@@ -1,293 +1,40 @@
-Обработка заняла 2m 30s
+Обработка заняла 18s
 
-Это надо изменить только в модуле SSF. БД и Python менять не требуется: SSF_results может существовать без строк в SSF_sourceData, а sampleCode дочерней таблицы не обязательный.
+# Версия 4.0.0
 
-Логика будет такая:
+## Надстройка (версия 3.0.3)
 
-- TaskId пустой → шифры необязательны;
-- TaskId указан, а в задании виалы/банки/пикнометры везде пусто, - или 0 → шифры необязательны;
-- в задании хотя бы одно другое значение → должен существовать хотя бы один корректный шифр;
-- если шифры введены добровольно — они сохраняются независимо от задания.
+* Изменена валидация SSF: сохранение без шифров полученных проб разрешено, если задание не предусматривает отбор проб или `TaskId` отсутствует.
+* Добавлено сохранение и загрузка общего объёма ячейки Stable.
+* Реализовано управление отображаемыми сериями на графике плотности GOR.
 
-1. Добавь вспомогательные функции
+## Форма (версия 25.0.0)
 
-В модуле SSF, сразу после CheckSSFTask, вставь:
+* CVD: скорректирован расчёт массы флюида в PVT-ячейке.
+* Stable: добавлено поле общего объёма ячейки.
+* Stable: добавлена термобарограмма стабилизации с плановыми и фактическими значениями давления и температуры.
+* Stable: разблокировано поле общего комментария.
+* GOR: добавлен график плотности с возможностью выбора отображаемых серий.
+* REC: убрана неактуальная первая страница.
+* OPOH: разблокированы необходимые поля, включая поле ввода оператора.
+* CCE и REC: исправлена работа флажков.
+* CCE: исправлена формула расчёта θ.
+* Обновлён список исполнителей.
 
-Private Function SSF_TaskRequiresSampleCodes( _
-    ByVal wb As Workbook, _
-    ByVal taskIdValue As Variant _
-) As Boolean
+## Акт качества поверхностных проб (версия 2.0.0)
 
-    SSF_TaskRequiresSampleCodes = False
+* Добавлено преобразование обозначений типов пробоотборников: `Kzh` → `КЖ`, `PK` → `ПК`, `KPp` → `КПП`, `gb` → `GB`.
+* В поле природы жидкой фазы выводится `-`, если значение отсутствует.
+* Удалены строки представителя подрядчика.
+* Увеличено количество строк для вывода проб.
 
-    If IsError(taskIdValue) Then Exit Function
+## Python-скрипты (версия 3.1.2)
 
-    Dim taskIdText As String
-    taskIdText = Trim$(CStr(taskIdValue))
+* В интерфейс `create_project_forms.py` добавлены сортировка и фильтрация списка проектов.
+* Добавлена поддержка нового поля общего объёма ячейки Stable.
 
-    ' Задание не указано — проверку не проводим.
-    If taskIdText = "" Then Exit Function
-    If Not IsNumeric(taskIdValue) Then Exit Function
-    If CDbl(taskIdValue) <= 0 Then Exit Function
-    If CDbl(taskIdValue) <> Fix(CDbl(taskIdValue)) Then Exit Function
+## База данных (версия 3.1.0)
 
-    Dim tasks As ListObject
-    Set tasks = wb.Worksheets("Task").ListObjects(1)
+* В таблицу `Stable_results` добавлено поле общего объёма ячейки.
 
-    If tasks.DataBodyRange Is Nothing Then Exit Function
-
-    Dim taskCell As Range
-
-    Set taskCell = tasks _
-        .ListColumns("Номер задания") _
-        .DataBodyRange _
-        .Find( _
-            What:=CLng(taskIdValue), _
-            LookIn:=xlValues, _
-            LookAt:=xlWhole, _
-            SearchOrder:=xlByColumns, _
-            SearchDirection:=xlNext, _
-            MatchCase:=False _
-        )
-
-    ' Неизвестное задание обрабатывает CheckSSFTask.
-    If taskCell Is Nothing Then Exit Function
-
-    Dim taskRowIndex As Long
-    taskRowIndex = _
-        taskCell.row - tasks.DataBodyRange.row + 1
-
-    If SSF_TaskSampleValueRequiresCode( _
-        tasks.ListColumns("Кол-во виал") _
-             .DataBodyRange.Cells(taskRowIndex, 1).value _
-    ) Then
-
-        SSF_TaskRequiresSampleCodes = True
-        Exit Function
-
-    End If
-
-    If SSF_TaskSampleValueRequiresCode( _
-        tasks.ListColumns("Наличие банки") _
-             .DataBodyRange.Cells(taskRowIndex, 1).value _
-    ) Then
-
-        SSF_TaskRequiresSampleCodes = True
-        Exit Function
-
-    End If
-
-    If SSF_TaskSampleValueRequiresCode( _
-        tasks.ListColumns("Кол-во пикнометров") _
-             .DataBodyRange.Cells(taskRowIndex, 1).value _
-    ) Then
-
-        SSF_TaskRequiresSampleCodes = True
-        Exit Function
-
-    End If
-
-End Function
-
-
-Private Function SSF_TaskSampleValueRequiresCode( _
-    ByVal fieldValue As Variant _
-) As Boolean
-
-    ' Ошибочное значение безопаснее считать требующим проверки.
-    If IsError(fieldValue) Then
-        SSF_TaskSampleValueRequiresCode = True
-        Exit Function
-    End If
-
-    Dim valueText As String
-    valueText = Trim$(CStr(fieldValue))
-
-    ' Эти значения означают отсутствие полученной пробы.
-    If valueText = "" Or valueText = "-" Then
-        SSF_TaskSampleValueRequiresCode = False
-        Exit Function
-    End If
-
-    If IsNumeric(fieldValue) Then
-
-        SSF_TaskSampleValueRequiresCode = _
-            (CDbl(fieldValue) <> 0)
-
-    Else
-
-        ' Любой другой текст означает, что проба указана.
-        SSF_TaskSampleValueRequiresCode = True
-
-    End If
-
-End Function
-
-Функция смотрит непосредственно в таблицу Task, а не доверяет значениям, перенесённым в форму SSF.
-
-2. Измени Validate_SSF_Form
-
-В начале функции, после получения sourceTable и проверки его столбцов, добавь:
-
-Dim taskRequiresSampleCodes As Boolean
-
-    taskRequiresSampleCodes = _
-        SSF_TaskRequiresSampleCodes( _
-            wb, _
-            sheetSSF.Range( _
-                "SSF_" & formIndex & "_TaskId" _
-            ).value _
-        )
-
-Найди блок:
-
-' =============================================================
-' ДОЛЖНА БЫТЬ УКАЗАНА ХОТЯ БЫ ОДНА ПОЛУЧЕННАЯ ПРОБА
-' =============================================================
-
-If countFieldsSeen = 3 Then
-
-Замени начало условия на:
-
-' =============================================================
-' ЕСЛИ ЗАДАНИЕ ПРЕДУСМАТРИВАЕТ ПОЛУЧЕННЫЕ ПРОБЫ,
-' В ФОРМЕ ДОЛЖНО БЫТЬ УКАЗАНО ИХ КОЛИЧЕСТВО
-' =============================================================
-
-If taskRequiresSampleCodes _
-   And countFieldsSeen = 3 Then
-
-Остальное содержимое блока оставь прежним.
-
-Теперь пустые vial, bottle, pics не вызовут ошибку, если:
-
-- TaskId отсутствует;
-- либо в задании все три значения пустые, - или 0.
-
-3. Измени обязательное создание шифров в Save_SSF
-
-Сразу после:
-
-If Not Validate_SSF_Form(i) Then
-    Exit Function
-End If
-
-добавь:
-
-Dim taskRequiresSampleCodes As Boolean
-
-taskRequiresSampleCodes = _
-    SSF_TaskRequiresSampleCodes( _
-        wb, _
-        sheetSSF.Range( _
-            "SSF_" & i & "_TaskId" _
-        ).value _
-    )
-
-Дальше найди участок:
-
-' Если корректных шифров вообще нет,
-' предлагаем их сформировать.
-If Not SSF_GetSampleCodeCounts( _
-    i, _
-    actualLPhCount, _
-    actualGPhCount _
-) Then
-
-    Application.ScreenUpdating = True
-    DoEvents
-    Application.ScreenUpdating = False
-
-    If Not CreateSampleCodeSSF3(i) Then
-        Save_SSF = MACRO_FAILED
-        Exit Function
-    End If
-
-    actualLPhCount = 0
-    actualGPhCount = 0
-
-    Call SSF_GetSampleCodeCounts( _
-        i, _
-        actualLPhCount, _
-        actualGPhCount _
-    )
-
-End If
-
-Замени его на:
-
-Dim hasSampleCodes As Boolean
-
-hasSampleCodes = _
-    SSF_GetSampleCodeCounts( _
-        i, _
-        actualLPhCount, _
-        actualGPhCount _
-    )
-
-' Автоматически предлагаем сформировать шифры только тогда,
-' когда они действительно предусмотрены заданием.
-If taskRequiresSampleCodes _
-   And Not hasSampleCodes Then
-
-    Application.ScreenUpdating = True
-    DoEvents
-    Application.ScreenUpdating = False
-
-    If Not CreateSampleCodeSSF3(i) Then
-        Save_SSF = MACRO_FAILED
-        Exit Function
-    End If
-
-    actualLPhCount = 0
-    actualGPhCount = 0
-
-    hasSampleCodes = _
-        SSF_GetSampleCodeCounts( _
-            i, _
-            actualLPhCount, _
-            actualGPhCount _
-        )
-
-End If
-
-4. Измени окончательную блокировку
-
-Сейчас ниже находится:
-
-If actualLPhCount + actualGPhCount = 0 Then
-
-Замени на:
-
-If taskRequiresSampleCodes _
-   And actualLPhCount + actualGPhCount = 0 Then
-
-Таким образом, отсутствие шифров блокирует сохранение только при наличии требования в задании.
-
-5. Ограничь проверку количества
-
-Ниже имеется проверка:
-
-If actualLPhCount <> expectedLPhCount _
-   Or actualGPhCount <> expectedGPhCount Then
-
-Замени на:
-
-If taskRequiresSampleCodes _
-   And ( _
-       actualLPhCount <> expectedLPhCount _
-       Or actualGPhCount <> expectedGPhCount _
-   ) Then
-
-Это важно: без TaskId или при нулевом количестве проб в задании макрос не должен выдавать предупреждение о несовпадении количества.
-
-Итоговое поведение:
-
-TaskId	Значения задания	Шифры	Результат
-
-Нет	Любые значения формы	Нет	Сохранение разрешено
-Нет	—	Есть	Шифры сохраняются
-Есть	- / пусто / 0	Нет	Сохранение разрешено
-Есть	- / пусто / 0	Есть	Шифры сохраняются
-Есть	Хотя бы одна проба указана	Нет	Сохранение запрещено
-Есть	Хотя бы одна проба указана	Есть	Сохранение разрешено; количество проверяется 
+----------------------------------------------------------------------------------------------------
