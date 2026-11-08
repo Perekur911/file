@@ -1,667 +1,82 @@
-Обработка заняла 2m 21s
+Обработка заняла 2m 9s
 
-Лучше сделать два механизма:
+Нашёл причину. Python не вызывается правильно: текущий хэш OP совпадает с сохранённым, а последний статус уже Валидировано. Ошибка в другом — в метаданных книги остаётся устаревший OPDataState = dirty, и при закрытии он не всегда перепроверяется.
 
-- сортировка по любому столбцу нажатием на заголовок;
-- отдельная панель фильтров над таблицей: поиск по всем столбцам плюс фильтры по статусу версии, рекомендации, возможности пересоздания, источнику и назначенному действию.
+Это потенциально касается всех исследований, не только OP.
 
-Ниже изменения для актуального create_project_forms.py с классом ProjectFormsApp.
+1. Общая правка в modMetadata
 
-1. Добавить состояние сортировки и фильтров
+Полностью замени процедуру RefreshStudyIfNeeded:
 
-В ProjectFormsApp.__init__() найди:
-
-self.projects_var = tk.StringVar()
-self.year_var = tk.StringVar(value=str(datetime.now().year))
-self.status_var = tk.StringVar(value="Готово")
-
-Сразу после вставь:
-
-self.sort_column = "project"
-self.sort_reverse = False
-
-self.filter_text_var = tk.StringVar()
-self.filter_version_var = tk.StringVar(value="Все")
-self.filter_recommended_var = tk.StringVar(value="Все")
-self.filter_safe_var = tk.StringVar(value="Все")
-self.filter_source_var = tk.StringVar(value="Все")
-self.filter_action_var = tk.StringVar(value="Все")
-
-Ниже сейчас вызывается:
-
-self._build_controls()
-self._build_table()
-
-Между ними добавь:
-
-self._build_controls()
-self._build_filters()
-self._build_table()
-
-2. Добавить панель фильтров
-
-Сразу после метода _build_controls() вставь новый метод:
-
-def _build_filters(self) -> None:
-    ttk = self.ttk
-
-    frame = ttk.LabelFrame(
-        self.root,
-        text="Фильтры таблицы",
-        padding=(8, 6),
-    )
-    frame.pack(fill="x", padx=8, pady=(0, 8))
-
-    ttk.Label(frame, text="Поиск:").grid(
-        row=0,
-        column=0,
-        sticky="w",
-    )
-
-    self.filter_text_entry = ttk.Entry(
-        frame,
-        textvariable=self.filter_text_var,
-        width=28,
-    )
-    self.filter_text_entry.grid(
-        row=0,
-        column=1,
-        sticky="ew",
-        padx=(5, 12),
-    )
-
-    ttk.Label(frame, text="Статус версии:").grid(
-        row=0,
-        column=2,
-        sticky="w",
-    )
-
-    self.filter_version_combo = ttk.Combobox(
-        frame,
-        textvariable=self.filter_version_var,
-        values=("Все",),
-        state="readonly",
-        width=22,
-    )
-    self.filter_version_combo.grid(
-        row=0,
-        column=3,
-        padx=(5, 12),
-    )
-
-    ttk.Label(frame, text="Рекомендация:").grid(
-        row=0,
-        column=4,
-        sticky="w",
-    )
-
-    self.filter_recommended_combo = ttk.Combobox(
-        frame,
-        textvariable=self.filter_recommended_var,
-        values=("Все",),
-        state="readonly",
-        width=29,
-    )
-    self.filter_recommended_combo.grid(
-        row=0,
-        column=5,
-        padx=(5, 12),
-    )
-
-    ttk.Label(frame, text="Пересоздание:").grid(
-        row=1,
-        column=0,
-        sticky="w",
-        pady=(6, 0),
-    )
-
-    self.filter_safe_combo = ttk.Combobox(
-        frame,
-        textvariable=self.filter_safe_var,
-        values=("Все", "ДА", "НЕТ"),
-        state="readonly",
-        width=14,
-    )
-    self.filter_safe_combo.grid(
-        row=1,
-        column=1,
-        sticky="w",
-        padx=(5, 12),
-        pady=(6, 0),
-    )
-
-    ttk.Label(frame, text="Источник:").grid(
-        row=1,
-        column=2,
-        sticky="w",
-        pady=(6, 0),
-    )
-
-    self.filter_source_combo = ttk.Combobox(
-        frame,
-        textvariable=self.filter_source_var,
-        values=("Все",),
-        state="readonly",
-        width=22,
-    )
-    self.filter_source_combo.grid(
-        row=1,
-        column=3,
-        padx=(5, 12),
-        pady=(6, 0),
-    )
-
-    ttk.Label(frame, text="Действие:").grid(
-        row=1,
-        column=4,
-        sticky="w",
-        pady=(6, 0),
-    )
-
-    self.filter_action_combo = ttk.Combobox(
-        frame,
-        textvariable=self.filter_action_var,
-        values=(
-            "Все",
-            "Без действия",
-            "Обновить/создать",
-            "Пересоздать",
-        ),
-        state="readonly",
-        width=29,
-    )
-    self.filter_action_combo.grid(
-        row=1,
-        column=5,
-        padx=(5, 12),
-        pady=(6, 0),
-    )
-
-    ttk.Button(
-        frame,
-        text="Сбросить фильтры",
-        command=self.clear_filters,
-    ).grid(
-        row=0,
-        column=6,
-        rowspan=2,
-        padx=(4, 0),
-    )
-
-    frame.columnconfigure(1, weight=1)
-
-    self._bind_entry_paste(self.filter_text_entry)
-
-    # Поиск обновляется сразу при вводе или вставке.
-    self.filter_text_var.trace_add(
-        "write",
-        self._on_filter_text_changed,
-    )
-
-    for combo in (
-        self.filter_version_combo,
-        self.filter_recommended_combo,
-        self.filter_safe_combo,
-        self.filter_source_combo,
-        self.filter_action_combo,
-    ):
-        combo.bind(
-            "<<ComboboxSelected>>",
-            lambda _event: self.refresh_table(),
-        )
-
-3. Изменить создание заголовков таблицы
-
-В _build_table() после объявления columns:
-
-columns = (
-    ...
+Private Sub RefreshStudyIfNeeded( _
+    ByVal wb As Workbook, _
+    ByVal studyCode As String, _
+    ByVal hashProperty As String, _
+    ByVal stateProperty As String _
 )
 
-добавь:
+    Dim storedStatus As StudySyncStatus
+    storedStatus = GetStudySyncStatus(wb, stateProperty)
 
-self.table_columns = columns
+    ' Если исследование не отмечено как изменённое,
+    ' доверяем только безопасным статусам.
+    '
+    ' DIRTY, UNSAVED, ERROR и UNKNOWN обязательно перепроверяем:
+    ' сохранённый статус мог устареть.
+    If Not StudyNeedsHashCheck(wb, studyCode) Then
 
-После словаря headings добавь:
+        Select Case storedStatus
 
-self.table_headings = headings
+            Case SYNC_STATUS_EMPTY, _
+                 SYNC_STATUS_SYNCED
 
-В цикле настройки заголовков замени:
+                Exit Sub
 
-self.tree.heading(column, text=headings[column])
+        End Select
 
-на:
+    End If
 
-self.tree.heading(
-    column,
-    text=headings[column],
-    command=lambda selected_column=column: (
-        self.sort_by_column(selected_column)
-    ),
-)
+    UpdateStudySyncStatus _
+        wb, _
+        studyCode, _
+        hashProperty, _
+        stateProperty
 
-После всех bind, в конце _build_table(), добавь:
+End Sub
 
-self._update_sort_headings()
+Теперь перед закрытием:
 
-Теперь нажатие на заголовок будет переключать направление сортировки.
+- synced и empty без изменений пересчитываться не будут;
+- dirty, unsaved, error, unknown всегда будут подтверждаться реальным хэшем;
+- если dirty устарел, он автоматически станет synced;
+- если изменения действительно есть, предупреждение останется.
 
-4. Добавить функции фильтрации и сортировки
+2. Дополнительная правка в Save_OP
 
-Сразу после метода:
+В Save_OP найди:
 
-def _project_visible_for_year(...)
+If needToSave = DATA_NO_CHANGES Then
+    Save_OP = MACRO_NO_CHANGES
+    Exit Function
 
-вставь следующие методы:
+Замени на:
 
-def _on_filter_text_changed(self, *_args) -> None:
-    if hasattr(self, "tree") and not self.busy:
-        self.refresh_table()
+If needToSave = DATA_NO_CHANGES Then
 
+    ' Хэши совпадают — данные действительно синхронизированы.
+    SetStudySyncStatus _
+        wb, _
+        PROP_OP_DATA_STATE, _
+        SYNC_STATUS_SYNCED, _
+        False
 
-def clear_filters(self) -> None:
-    self.filter_text_var.set("")
-    self.filter_version_var.set("Все")
-    self.filter_recommended_var.set("Все")
-    self.filter_safe_var.set("Все")
-    self.filter_source_var.set("Все")
-    self.filter_action_var.set("Все")
+    ClearStudyHashCheck wb, "OP"
 
-    if hasattr(self, "tree"):
-        self.refresh_table()
+    Save_OP = MACRO_NO_CHANGES
+    Exit Function
 
+End If
 
-def _update_filter_lists(self, year: int) -> None:
-    year_items = [
-        item
-        for project, item in self.cache.items()
-        if self._project_visible_for_year(project, year)
-    ]
+Это сразу исправит состояние после нажатия «Валидировать OP», даже если Python запускать не требуется.
 
-    version_values = (
-        "Все",
-        *sorted({
-            item.version_status
-            for item in year_items
-            if item.version_status
-        }),
-    )
-
-    recommended_values = (
-        "Все",
-        *sorted({
-            item.recommended_action
-            for item in year_items
-            if item.recommended_action
-        }),
-    )
-
-    source_values = (
-        "Все",
-        *sorted({
-            item.inspection_source
-            for item in year_items
-            if item.inspection_source
-        }),
-    )
-
-    self.filter_version_combo.configure(
-        values=version_values,
-    )
-    self.filter_recommended_combo.configure(
-        values=recommended_values,
-    )
-    self.filter_source_combo.configure(
-        values=source_values,
-    )
-
-    if self.filter_version_var.get() not in version_values:
-        self.filter_version_var.set("Все")
-
-    if self.filter_recommended_var.get() not in recommended_values:
-        self.filter_recommended_var.set("Все")
-
-    if self.filter_source_var.get() not in source_values:
-        self.filter_source_var.set("Все")
-
-
-def _matches_filters(self, item: ProjectInspection) -> bool:
-    version_filter = self.filter_version_var.get()
-
-    if (
-        version_filter != "Все"
-        and item.version_status != version_filter
-    ):
-        return False
-
-    recommended_filter = self.filter_recommended_var.get()
-
-    if (
-        recommended_filter != "Все"
-        and item.recommended_action != recommended_filter
-    ):
-        return False
-
-    safe_filter = self.filter_safe_var.get()
-
-    if safe_filter == "ДА" and not item.safe_to_recreate:
-        return False
-
-    if safe_filter == "НЕТ" and item.safe_to_recreate:
-        return False
-
-    source_filter = self.filter_source_var.get()
-
-    if (
-        source_filter != "Все"
-        and item.inspection_source != source_filter
-    ):
-        return False
-
-    action_filter = self.filter_action_var.get()
-
-    action_mapping = {
-        "Без действия": "",
-        "Обновить/создать": "update",
-        "Пересоздать": "recreate",
-    }
-
-    if action_filter != "Все":
-        expected_action = action_mapping[action_filter]
-
-        if item.selected_action != expected_action:
-            return False
-
-    search_text = self.filter_text_var.get().strip().casefold()
-
-    if search_text:
-        search_values = list(self._row_values(item))
-        search_values.extend(
-            (
-                item.issue,
-                item.selected_folder,
-                item.expected_folder,
-                " ".join(item.found_folders),
-                " ".join(item.workbook_candidates),
-            )
-        )
-
-        full_text = "\n".join(
-            str(value)
-            for value in search_values
-            if value is not None
-        ).casefold()
-
-        if search_text not in full_text:
-            return False
-
-    return True
-
-
-@staticmethod
-def _natural_sort_key(value: Any) -> tuple:
-    text = str(value or "").strip().casefold()
-
-    parts = re.split(r"(\d+)", text)
-
-    return tuple(
-        (0, int(part))
-        if part.isdigit()
-        else (1, part)
-        for part in parts
-        if part != ""
-    )
-
-
-def _column_display_value(
-    self,
-    item: ProjectInspection,
-    column: str,
-) -> str:
-    column_index = self.table_columns.index(column)
-    return self._row_values(item)[column_index]
-
-
-def sort_by_column(self, column: str) -> None:
-    if self.sort_column == column:
-        self.sort_reverse = not self.sort_reverse
-    else:
-        self.sort_column = column
-        self.sort_reverse = False
-
-    self._update_sort_headings()
-    self._sort_tree_items()
-
-
-def _update_sort_headings(self) -> None:
-    for column in self.table_columns:
-        caption = self.table_headings[column]
-
-        if column == self.sort_column:
-            caption += " ▼" if self.sort_reverse else " ▲"
-
-        self.tree.heading(column, text=caption)
-
-
-def _sort_tree_items(self) -> None:
-    if not hasattr(self, "tree"):
-        return
-
-    children = list(self.tree.get_children())
-
-    filled: list[str] = []
-    empty: list[str] = []
-
-    for project in children:
-        item = self.cache.get(project)
-
-        if item is None:
-            continue
-
-        value = self._column_display_value(
-            item,
-            self.sort_column,
-        )
-
-        if str(value).strip():
-            filled.append(project)
-        else:
-            empty.append(project)
-
-    filled.sort(
-        key=lambda project: self._natural_sort_key(
-            self._column_display_value(
-                self.cache[project],
-                self.sort_column,
-            )
-        ),
-        reverse=self.sort_reverse,
-    )
-
-    # Пустые значения всегда располагаются внизу.
-    ordered = filled + empty
-
-    for position, project in enumerate(ordered):
-        self.tree.move(project, "", position)
-
-Сортировка будет натуральной: например, 26-F9 не окажется после 26-F100.
-
-5. Разделить отображение строки и проверку её видимости
-
-Перед существующим _upsert_row() добавь:
-
-def _set_tree_row(self, item: ProjectInspection) -> None:
-    project = item.refresh_project
-    values = self._row_values(item)
-    tags = (self._row_tag(item),)
-
-    if self.tree.exists(project):
-        self.tree.item(
-            project,
-            values=values,
-            tags=tags,
-        )
-    else:
-        self.tree.insert(
-            "",
-            "end",
-            iid=project,
-            values=values,
-            tags=tags,
-        )
-
-Существующий _upsert_row() замени целиком:
-
-def _upsert_row(self, item: ProjectInspection) -> None:
-    year = self._read_year()
-
-    if year is None:
-        return
-
-    project = item.refresh_project
-
-    should_show = (
-        self._project_visible_for_year(project, year)
-        and self._matches_filters(item)
-    )
-
-    if not should_show:
-        if self.tree.exists(project):
-            self.tree.delete(project)
-        return
-
-    self._set_tree_row(item)
-    self._sort_tree_items()
-
-Это важно: если после сканирования статус проекта изменился и перестал соответствовать фильтру, строка автоматически исчезнет из таблицы.
-
-6. Добавить полное обновление таблицы
-
-Перед show_cached_year() вставь:
-
-def refresh_table(self) -> None:
-    year = self._read_year()
-
-    if year is None:
-        return
-
-    selected_before = set(self.selected_projects())
-
-    self._update_filter_lists(year)
-
-    for iid in self.tree.get_children():
-        self.tree.delete(iid)
-
-    total_for_year = 0
-    shown = 0
-
-    for project in sorted(self.cache):
-        item = self.cache[project]
-
-        if not self._project_visible_for_year(project, year):
-            continue
-
-        total_for_year += 1
-
-        if not self._matches_filters(item):
-            continue
-
-        self._set_tree_row(item)
-        shown += 1
-
-    self._sort_tree_items()
-
-    selected_after = [
-        project
-        for project in selected_before
-        if self.tree.exists(project)
-    ]
-
-    if selected_after:
-        self.tree.selection_set(selected_after)
-
-    self.status_var.set(
-        f"Показано проектов: {shown} из {total_for_year}; "
-        f"год: {year}"
-    )
-
-7. Упростить show_cached_year()
-
-Существующий метод show_cached_year() замени целиком:
-
-def show_cached_year(self) -> None:
-    if self.busy:
-        return
-
-    self.refresh_table()
-
-Теперь год, фильтры и сортировка будут применяться одним общим механизмом.
-
-8. Исправить выполнение плана с учётом фильтров
-
-Это важный момент: отфильтрованная строка не должна исчезать из плана, если ей уже было назначено действие.
-
-В execute_plan() сейчас план строится по:
-
-visible_projects = self.tree.get_children()
-
-plan = {
-    project: self.cache[project].selected_action
-    for project in visible_projects
-    if self.cache[project].selected_action in {"update", "recreate"}
-}
-
-Замени начало execute_plan() на:
-
-def execute_plan(self) -> None:
-    if self.busy:
-        return
-
-    year = self._read_year()
-
-    if year is None:
-        return
-
-    plan = {
-        project: item.selected_action
-        for project, item in self.cache.items()
-        if self._project_visible_for_year(project, year)
-        and item.selected_action in {"update", "recreate"}
-    }
-
-    if not plan:
-        self.status_var.set(
-            "План пуст: сначала назначьте действия"
-        )
-        return
-
-    cache_snapshot = {
-        key: replace(value)
-        for key, value in self.cache.items()
-    }
-
-    self._set_busy(
-        True,
-        f"Выполняется план: {len(plan)} проектов...",
-    )
-
-    thread = threading.Thread(
-        target=self._execution_worker,
-        args=(plan, cache_snapshot, year),
-        daemon=True,
-    )
-    thread.start()
-
-То есть замени метод до конца запуска потока. Остальную логику менять не надо.
-
-Что получится
-
-- клик по заголовку — сортировка;
-- повторный клик — обратная сортировка;
-- стрелка ▲/▼ показывает направление;
-- поиск работает сразу по всем отображаемым данным;
-- отдельные фильтры можно комбинировать;
-- Выделить всё выделяет только строки, оставшиеся после фильтрации;
-- назначенные действия сохраняются, даже если строка скрылась фильтром;
-- Выполнить план выполняет все назначенные действия выбранного года;
-- экспорт в Excel останется экспортом только отображаемых после фильтрации строк — в текущем порядке сортировки.
+Итого: наличие статуса Валидировано важно только потому, что повторная валидация закономерно возвращает DATA_NO_CHANGES. Ложное предупреждение вызывает именно зависший OPDataState = dirty. После обеих правок логика будет согласованной. 
