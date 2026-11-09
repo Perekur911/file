@@ -1,81 +1,57 @@
-Обработка заняла 21s
+Обработка заняла 1m 35s
 
-Теперь точно видно место ошибки:
+Имена указаны правильно: модуль AP действительно создаёт AP_1_P, AP_1_d, AP_2_P, AP_2_d и т. д.
 
-parent_written = replace_table_rows(...)
-resize_list_object(...)
-table.Resize(new_range)
+Проблема, скорее всего, в том, что это динамические имена:
 
-То есть падает изменение размера родительской таблицы Task на листе Task. В этот момент лист Task защищён.
+=OFFSET(..., COUNT(AP_source_1[VPR P]), ...)
 
-Это не связано с новой миграцией или таблицей Stable. Цепочка такая:
+Во время загрузки расчёт Excel отключён или ещё не выполнен. COUNT(...) временно возвращает 0, диапазон получается некорректным, а NamedRangeExists() считает, что имени нет.
 
-build_new_workbook
-→ run_refresh_tasks_for_book
-→ запись таблицы Task
-→ Task.Resize
-→ ошибка из-за защиты листа Task
+В методе обновления графика AP на листе GOR непосредственно перед циклом по формам добавь:
 
-Скорее всего, для этого проекта выполняется restore_from_db=True, после чего VBA-загрузка снова защищает листы. Поэтому первоначального unprotect_all_sheets(workbook) уже недостаточно.
+Dim sheetAP As Worksheet
+Set sheetAP = wb.Worksheets("AP")
 
-В build_new_workbook() вставь повторное снятие защиты непосредственно перед run_refresh_tasks_for_book():
+' После загрузки данных необходимо пересчитать формулы VPR P/VPR d,
+' от которых зависят динамические диапазоны AP_n_P и AP_n_d.
+sheetAP.Calculate
+DoEvents
 
-if restore_from_db:
-            run_load_all_studies_for_book(
-                workbook_path=temp_path,
-                refresh_project=refresh_project,
-            )
-            load_forms_from_tables(
-                app=app,
-                workbook=workbook,
-                addin_name=addin_name,
-            )
+И диапазоны лучше получать через лист AP, а не через wb.Names. Найди участок рядом с сообщением:
 
-        # После восстановления из БД VBA могла снова защитить листы.
-        unprotect_all_sheets(workbook)
+Debug.Print "Не найдены диапазоны " & ...
 
-        run_refresh_tasks_for_book(
-            workbook_path=temp_path,
-            refresh_project=refresh_project,
-        )
+Получение диапазонов сделай так:
 
-Для контроля сразу после снятия защиты можно временно добавить:
+Set pressureRange = Nothing
+Set densityRange = Nothing
 
-if workbook.sheets["Task"].api.ProtectContents:
-            raise RuntimeError(
-                "Не удалось снять защиту с листа Task "
-                "перед обновлением таблицы заданий."
-            )
+On Error Resume Next
+Set pressureRange = sheetAP.Range("AP_" & formIndex & "_P")
+Set densityRange = sheetAP.Range("AP_" & formIndex & "_d")
+On Error GoTo CleanFail
 
-Я бы оставил эту проверку постоянно: она выдаст нормальную понятную ошибку вместо большого COM-traceback.
+If pressureRange Is Nothing Or densityRange Is Nothing Then
 
-И желательно переписать unprotect_all_sheets(), потому что сейчас она беззвучно проглатывает ошибки:
+    Debug.Print _
+        "Не найдены диапазоны AP_" & formIndex & _
+        "_P / AP_" & formIndex & "_d"
 
-def unprotect_all_sheets(book: xw.Book) -> None:
-    failed_sheets: list[str] = []
+    GoTo NextAPForm
 
-    for sheet in book.sheets:
-        for password in UNPROTECT_PASSWORDS:
-            try:
-                sheet.api.Unprotect(Password=password)
-            except Exception:
-                continue
+End If
 
-            if not bool(sheet.api.ProtectContents):
-                break
+То есть проверку вида:
 
-        if bool(sheet.api.ProtectContents):
-            failed_sheets.append(sheet.name)
+NamedRangeExists(wb, ...)
 
-    if failed_sheets:
-        raise RuntimeError(
-            "Не удалось снять защиту с листов: "
-            + ", ".join(failed_sheets)
-        )
+для этих двух динамических диапазонов убери.
 
-Таким образом:
+Чтобы быстро подтвердить причину, после завершения загрузки выполни в Immediate:
 
-- конкретно падает таблица Task;
-- операция — ListObject.Resize;
-- лист Task оказался повторно защищён;
-- повторный unprotect_all_sheets(workbook) перед run_refresh_tasks_for_book() должен исправить пересоздание этого проекта.
+? ActiveWorkbook.Worksheets("AP").Range("AP_1_P").Address
+
+? ActiveWorkbook.Worksheets("AP").Range("AP_1_d").Address
+
+Если сейчас адреса выводятся, значит имена существуют, а во время построения графика они действительно проверялись до пересчёта. Тогда sheetAP.Calculate перед циклом должен решить проблему. Если даже сейчас возникает ошибка, значит в самой форме повреждены определения этих имён.
