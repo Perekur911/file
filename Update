@@ -1,19 +1,81 @@
-Обработка заняла 36s
+Обработка заняла 21s
 
-Из терминала, находясь в корне репозитория, для применения к рабочей БД:
+Теперь точно видно место ошибки:
 
-C:/Users/Dmitriy.Kayurin/.venvs/sqlite-excel/Scripts/python.exe .\apply_sqlite_migration.py --db "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --sql ".\database\migrations\006_add_stable_total_cell_volume.sql" --version "3.1.0" --apply
+parent_written = replace_table_rows(...)
+resize_list_object(...)
+table.Resize(new_range)
 
-Важно: перед запуском закрой Excel и все процессы синхронизации.
+То есть падает изменение размера родительской таблицы Task на листе Task. В этот момент лист Task защищён.
 
-Если хочешь сначала ещё раз проверить на копии, выполни ту же команду без --apply:
+Это не связано с новой миграцией или таблицей Stable. Цепочка такая:
 
-C:/Users/Dmitriy.Kayurin/.venvs/sqlite-excel/Scripts/python.exe .\apply_sqlite_migration.py --db "L:\LRC\common_data\ФЛЮИДЫ\ГТИ\sqlite-excel\sqlite\results.db" --sql ".\database\migrations\006_add_stable_total_cell_volume.sql" --version "3.1.0"
+build_new_workbook
+→ run_refresh_tasks_for_book
+→ запись таблицы Task
+→ Task.Resize
+→ ошибка из-за защиты листа Task
 
-Либо открыть графическое окно скрипта:
+Скорее всего, для этого проекта выполняется restore_from_db=True, после чего VBA-загрузка снова защищает листы. Поэтому первоначального unprotect_all_sheets(workbook) уже недостаточно.
 
-C:/Users/Dmitriy.Kayurin/.venvs/sqlite-excel/Scripts/python.exe .\apply_sqlite_migration.py
+В build_new_workbook() вставь повторное снятие защиты непосредственно перед run_refresh_tasks_for_book():
 
-Параметр --version "3.1.0" обязателен, потому что внутри скрипта версия по умолчанию всё ещё 2.1.0. Имя файла должно совпадать с migration_name внутри SQL:
+if restore_from_db:
+            run_load_all_studies_for_book(
+                workbook_path=temp_path,
+                refresh_project=refresh_project,
+            )
+            load_forms_from_tables(
+                app=app,
+                workbook=workbook,
+                addin_name=addin_name,
+            )
 
-006_add_stable_total_cell_volume
+        # После восстановления из БД VBA могла снова защитить листы.
+        unprotect_all_sheets(workbook)
+
+        run_refresh_tasks_for_book(
+            workbook_path=temp_path,
+            refresh_project=refresh_project,
+        )
+
+Для контроля сразу после снятия защиты можно временно добавить:
+
+if workbook.sheets["Task"].api.ProtectContents:
+            raise RuntimeError(
+                "Не удалось снять защиту с листа Task "
+                "перед обновлением таблицы заданий."
+            )
+
+Я бы оставил эту проверку постоянно: она выдаст нормальную понятную ошибку вместо большого COM-traceback.
+
+И желательно переписать unprotect_all_sheets(), потому что сейчас она беззвучно проглатывает ошибки:
+
+def unprotect_all_sheets(book: xw.Book) -> None:
+    failed_sheets: list[str] = []
+
+    for sheet in book.sheets:
+        for password in UNPROTECT_PASSWORDS:
+            try:
+                sheet.api.Unprotect(Password=password)
+            except Exception:
+                continue
+
+            if not bool(sheet.api.ProtectContents):
+                break
+
+        if bool(sheet.api.ProtectContents):
+            failed_sheets.append(sheet.name)
+
+    if failed_sheets:
+        raise RuntimeError(
+            "Не удалось снять защиту с листов: "
+            + ", ".join(failed_sheets)
+        )
+
+Таким образом:
+
+- конкретно падает таблица Task;
+- операция — ListObject.Resize;
+- лист Task оказался повторно защищён;
+- повторный unprotect_all_sheets(workbook) перед run_refresh_tasks_for_book() должен исправить пересоздание этого проекта.
