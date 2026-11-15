@@ -1,34 +1,83 @@
-Обработка заняла 1m 14s
+Обработка заняла 49s
 
-Теперь видно, какая проверка отбрасывает ряды графика.
+Добавь в конец модуля helpersRange, после последнего End Function, такую процедуру:
 
-В GOR.bas сообщение «Не найдены диапазоны» появляется после того, как код уже получил оба диапазона через sheetAP.Range(...) и проверил количество чисел в них. Затем выполняется повторная проверка через NamedRangeExists, которая получает ошибку 1004 и пропускает добавление ряда.
+Public Sub DeleteFormNames( _
+    ByVal wb As Workbook, _
+    ByVal formPrefix As String, _
+    ByVal formIndex As Long _
+)
 
-Поэтому моя прежняя гипотеза про нулевой COUNT этот случай не объясняет.
+    Dim prefix As String
+    prefix = Trim$(formPrefix) & "_" & CStr(formIndex) & "_"
 
-В RefreshGORAPDensityChart замени участок от:
+    Dim i As Long
+    Dim nm As Excel.Name
+    Dim shortName As String
 
-pressureName = "AP_" & formIndex & "_P"
+    ' Перебираем с конца, поскольку удаление меняет индексы.
+    For i = wb.Names.Count To 1 Step -1
 
-до End With перед меткой NextAPForm: на:
+        Set nm = wb.Names(i)
+        shortName = nm.Name
 
-pressureName = "AP_" & formIndex & "_P"
-densityName = "AP_" & formIndex & "_d"
+        ' Убираем указание листа у локальных имён.
+        shortName = Mid$( _
+            shortName, _
+            InStrRev(shortName, "!") + 1 _
+        )
 
-Set newSeries = targetChart.SeriesCollection.NewSeries
+        If StrComp( _
+            Left$(shortName, Len(prefix)), _
+            prefix, _
+            vbTextCompare _
+        ) = 0 Then
 
-With newSeries
-    .Name = legendText
+            nm.Delete
 
-    .XValues = _
-        "='" & workbookNameForFormula & "'!" & pressureName
+        End If
 
-    .Values = _
-        "='" & workbookNameForFormula & "'!" & densityName
-End With
+    Next i
 
-Убираем только повторную проверку NamedRangeExists перед созданием ряда. Проверки полученных диапазонов и данных выше остаются; ссылки графика на динамические имена тоже сохраняются.
+End Sub
 
-Это устраняет причину пропуска рядов, видимую в логе. Повтори обновление графика без точки останова.
+Затем в модуле AP, в процедуре DeleteLastListAP2, найди этот блок:
 
-Ошибка для AP_5_sampleCode ожидаема, если форм четыре: так цикл обнаруживает, что следующей формы уже нет.
+Dim headerCell As Range
+Dim namedRange As String
+
+For Each headerCell In tableResults.HeaderRowRange.Cells
+    namedRange = "AP_" & lastForm & "_" & CStr(headerCell.Value)
+
+    If NamedRangeExists(ActiveWorkbook, namedRange) Then
+        ActiveWorkbook.Names(namedRange).Delete
+    End If
+Next headerCell
+
+Замени его целиком одной строкой:
+
+DeleteFormNames sheetAP.Parent, "AP", lastForm
+
+Аналогично замени такие же блоки в остальных процедурах. У них отличается только префикс:
+
+Модуль	Процедура	Строка вместо старого блока
+
+BP	DeleteLastListBP2	DeleteFormNames sheetBP.Parent, "BP", lastForm
+EMV	DeleteLastListEMV	DeleteFormNames sheetEMV.Parent, "EMV", lastForm
+GC	DeleteLastListGC2	DeleteFormNames sheetGC.Parent, "GC", lastForm
+GOR	DeleteLastListGOR	DeleteFormNames sheetGOR.Parent, "GOR", lastForm
+OPOH	DeleteLastListOPOH	DeleteFormNames sheetOPOH.Parent, "OPOH", lastForm
+
+
+В каждой процедуре новый вызов должен стоять перед удалением столбцов формы. Например, для AP получится:
+
+DeleteFormNames sheetAP.Parent, "AP", lastForm
+
+sheetAP.Range( _
+    sheetAP.Columns(firstColLastForm), _
+    sheetAP.Columns(lastColLastForm) _
+).EntireColumn.Delete
+
+Call DeleteCheckBoxesFromColumnRight(sheetAP, firstColLastForm)
+
+Теперь при удалении третьей формы будут удаляться все имена AP_3_*, включая AP_3_d, AP_3_P и AP_3_Tt. Формулы этих имён при удалении не вычисляются.
