@@ -1,57 +1,33 @@
-Обработка заняла 1m 35s
+Обработка заняла 5m 55s
 
-Имена указаны правильно: модуль AP действительно создаёт AP_1_P, AP_1_d, AP_2_P, AP_2_d и т. д.
+Имена в форме есть. Нашёл проблему в том, как код проверяет их доступность, но настоящую ошибку сейчас скрывает обработчик.
 
-Проблема, скорее всего, в том, что это динамические имена:
+В helpersRange.NamedRangeExists стоит:
 
-=OFFSET(..., COUNT(AP_source_1[VPR P]), ...)
+Set testRange = wb.Names(rangeName).RefersToRange
 
-Во время загрузки расчёт Excel отключён или ещё не выполнен. COUNT(...) временно возвращает 0, диапазон получается некорректным, а NamedRangeExists() считает, что имени нет.
+При любой ошибке функция возвращает False. Поэтому сообщение «не найдены диапазоны» означает также «имя существует, но его формула сейчас не возвращает диапазон». RefersToRange действительно может завершаться ошибкой при невозможности получить диапазон. 
 
-В методе обновления графика AP на листе GOR непосредственно перед циклом по формам добавь:
+В твоём шаблоне AP_1_d задан так:
 
-Dim sheetAP As Worksheet
-Set sheetAP = wb.Worksheets("AP")
+=OFFSET(AP!$J$22,0,0,COUNT(AP_source_1[VPR d]),1)
 
-' После загрузки данных необходимо пересчитать формулы VPR P/VPR d,
-' от которых зависят динамические диапазоны AP_n_P и AP_n_d.
-sheetAP.Calculate
-DoEvents
+То есть его размер зависит от расчётного столбца VPR d, а не непосредственно от введённых плотностей. Если COUNT возвращает ноль, получается недопустимая высота диапазона. 
 
-И диапазоны лучше получать через лист AP, а не через wb.Names. Найди участок рядом с сообщением:
+Есть подходящий под это сценарий: загрузка AP выполняется при xlCalculationManual, а RefreshGORAPDensityChart вызывается до EndMacro, возвращающего автоматический пересчёт. Но нулевой COUNT именно в момент твоего сбоя пока не подтверждён.
 
-Debug.Print "Не найдены диапазоны " & ...
+Ещё проверил сборку: в отдельном GOR.bas уже стоят твои строки sheetAP.Range(...), а внутри PVT_Addin.xlam остался прежний вариант. Проверка через NamedRangeExists присутствует в обоих.
 
-Получение диапазонов сделай так:
+Чтобы установить точную причину, поставь точку останова в RefreshGORAPDensityChart на строке:
 
 Set pressureRange = Nothing
-Set densityRange = Nothing
 
-On Error Resume Next
-Set pressureRange = sheetAP.Range("AP_" & formIndex & "_P")
-Set densityRange = sheetAP.Range("AP_" & formIndex & "_d")
-On Error GoTo CleanFail
+При остановке выполни в Immediate Window:
 
-If pressureRange Is Nothing Or densityRange Is Nothing Then
+? wb.FullName
+? wb.Names("AP_" & formIndex & "_d").RefersTo
+? Application.Count(sourceTable.ListColumns("VPR P").DataBodyRange), Application.Count(sourceTable.ListColumns("VPR d").DataBodyRange)
+? TypeName(sheetAP.Evaluate(wb.Names("AP_" & formIndex & "_d").RefersTo))
+? wb.Names("AP_" & formIndex & "_d").RefersToRange.Address
 
-    Debug.Print _
-        "Не найдены диапазоны AP_" & formIndex & _
-        "_P / AP_" & formIndex & "_d"
-
-    GoTo NextAPForm
-
-End If
-
-То есть проверку вида:
-
-NamedRangeExists(wb, ...)
-
-для этих двух динамических диапазонов убери.
-
-Чтобы быстро подтвердить причину, после завершения загрузки выполни в Immediate:
-
-? ActiveWorkbook.Worksheets("AP").Range("AP_1_P").Address
-
-? ActiveWorkbook.Worksheets("AP").Range("AP_1_d").Address
-
-Если сейчас адреса выводятся, значит имена существуют, а во время построения графика они действительно проверялись до пересчёта. Тогда sheetAP.Calculate перед циклом должен решить проблему. Если даже сейчас возникает ошибка, значит в самой форме повреждены определения этих имён.
+Пришли вывод и ошибку последней строки, если она появится. Нужен результат именно во время остановки макроса: после его завершения режим пересчёта уже меняется, поэтому ручная проверка может успешно находить тот же диапазон.
