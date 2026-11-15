@@ -1,21 +1,155 @@
-Обработка заняла 1m 28s
+Обработка заняла 7m 8s
 
-Для этой записи предлагаю версии: проект 4.1.0, надстройка 3.1.0, Python 3.2.0.
+Доступ к БД уже прошёл. Теперь падает изменение размера таблицы: Excel получает неподходящий диапазон из HeaderRowRange.Resize(...).
 
----
+Зададим диапазон явно, сохранив положение заголовка и минимум одну строку данных — это требования Excel к ListObject.Resize. 
 
-Версия 4.1.0
+В equipment_catalog.py замени функцию write_table целиком:
 
-Надстройка (версия 3.1.0)
+def write_table(sheet, name, columns, rows):
+    table = get_table(sheet, name)
 
-* Исправлена проверка несохранённых в БД изменений при закрытии книги с формами поколения "25.x.x". Восстановлены обновление статусов исследований и предупреждение о необходимости сохранения.
-* Исправлено добавление данных AP на график плотности листа GOR.
-* При удалении форм AP, BP, GC и EMV добавлено удаление вспомогательных именованных диапазонов, включая динамические диапазоны графиков.
-* В обновление проекта включена автоматическая проверка актуальности справочника оборудования из БД.
-* Добавлена возможность принудительного обновления справочника оборудования.
+    if table is None:
+        last = sheet.api.Cells.Find(
+            What="*",
+            LookIn=-4123,
+            SearchOrder=2,
+            SearchDirection=2,
+        )
 
-Python-скрипты (версия 3.2.0)
+        left = int(last.Column) + 2 if last is not None else 1
+        right = left + len(columns) - 1
 
-* Добавлен скрипт "equipment_catalog.py" для загрузки справочников "typesEquipment", "modelsEquipment" и "unitsEquipment" из БД в существующие проектные книги.
-* Реализовано сравнение справочника по SHA-256 с хэшем "EquipmentCatalogHash", сохранённым в свойствах книги. Неизменённые таблицы и списки не перезаписываются.
-* Добавлено автоматическое обновление одностолбцовых таблиц номеров оборудования и выпадающих списков моделей. Для выбора доступны активные приборы; уже выбранные значения в формах сохраняются.
+        # Создаём диапазоны по абсолютным координатам.
+        header_range = sheet.range(
+            (1, left),
+            (1, right),
+        )
+        header_range.api.Value2 = (tuple(columns),)
+
+        source_range = sheet.range(
+            (1, left),
+            (2, right),
+        )
+
+        table = sheet.api.ListObjects.Add(
+            SourceType=1,
+            Source=source_range.api,
+            XlListObjectHasHeaders=1,
+        )
+        table.Name = name
+
+    raw = table.HeaderRowRange.Value2
+
+    if not isinstance(raw, (tuple, list)):
+        headers = [str(raw)]
+    else:
+        values = (
+            raw[0]
+            if isinstance(raw[0], (tuple, list))
+            else raw
+        )
+        headers = [str(v) for v in values]
+
+    if set(headers) != set(columns) or len(headers) != len(columns):
+        raise ValueError(
+            f"Не совпадают столбцы таблицы {name}: {headers}"
+        )
+
+    # Подготавливаем значения до изменения таблицы.
+    matrix = [
+        tuple(
+            as_bool(row.get(h))
+            if name in TABLES and h in BOOL_COLUMNS
+            else row.get(h)
+            for h in headers
+        )
+        for row in rows
+    ]
+
+    matrix = tuple(
+        matrix or [tuple(None for _ in headers)]
+    )
+
+    if table.DataBodyRange is None:
+        table.ListRows.Add()
+
+    header = table.HeaderRowRange
+
+    top = int(header.Row)
+    left = int(header.Column)
+    right = left + len(headers) - 1
+
+    data_rows = max(1, len(rows))
+    totals = 1 if table.ShowTotals else 0
+
+    old_bottom = (
+        int(table.Range.Row)
+        + int(table.Range.Rows.Count)
+        - 1
+    )
+    old_address = table.Range.Address
+
+    bottom = top + data_rows + totals
+
+    new_range = sheet.range(
+        (top, left),
+        (bottom, right),
+    )
+
+    try:
+        table.Resize(new_range.api)
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"Таблица {name}: не удалось изменить диапазон "
+            f"{old_address} на {new_range.address}; "
+            f"строк данных={data_rows}, "
+            f"столбцов={len(headers)}"
+        ) from exc
+
+    body = table.DataBodyRange
+
+    if body is None or int(body.Rows.Count) != data_rows:
+        raise RuntimeError(
+            f"Таблица {name}: неверное число строк после Resize"
+        )
+
+    # Очищаем данные только после успешного Resize.
+    body.ClearContents()
+
+    # Удаляем старые значения под уменьшившейся таблицей.
+    if old_bottom > bottom:
+        sheet.range(
+            (bottom + 1, left),
+            (old_bottom, right),
+        ).clear_contents()
+
+    for index, header_name in enumerate(headers):
+        text_column = (
+            name not in TABLES
+            or header_name in TEXT_COLUMNS
+        )
+
+        column_range = sheet.range(
+            (top + 1, left + index),
+            (top + data_rows, left + index),
+        )
+
+        column_range.number_format = (
+            "@" if text_column else "General"
+        )
+
+    body.Value2 = matrix
+
+Ещё в функции validation_targets замени выражение:
+
+base.Offset(0, index * width)
+
+на:
+
+sheet.range((int(base.Row), int(base.Column) + index * width)).api
+
+Это также задаёт ячейку по абсолютным координатам, без неоднозначного обращения через COM.
+
+Сохрани Python-файл и повтори обновление проекта. Проверил расчёт прямоугольных диапазонов, уменьшение таблиц, пустые списки и сохранение начальных нулей в номерах.
