@@ -1,155 +1,805 @@
-Обработка заняла 7m 8s
+Обработка заняла 21m 59s
 
-Доступ к БД уже прошёл. Теперь падает изменение размера таблицы: Excel получает неподходящий диапазон из HeaderRowRange.Resize(...).
+Да. Используем твою createMnemonicTabless и существующую getEquipmentNumbers. Python обновляет только три исходных справочника, а VBA заполняет таблицы номерами оборудования. Всё остаётся внутри одного запуска Python.
 
-Зададим диапазон явно, сохранив положение заголовка и минимум одну строку данных — это требования Excel к ListObject.Resize. 
+Ниже — точные изменения. Шаблон формы менять не требуется.
 
-В equipment_catalog.py замени функцию write_table целиком:
+1. Полностью замени содержимое equipment_catalog.py, расположенного рядом с refresh_tasks.py, следующим кодом.
 
-def write_table(sheet, name, columns, rows):
-    table = get_table(sheet, name)
+Он проверяет хэш, обновляет существующие typesEquipment, modelsEquipment, unitsEquipment и возвращает результат. Хэш в свойства книги запишет VBA после заполнения списков.
 
-    if table is None:
-        last = sheet.api.Cells.Find(
-            What="*",
-            LookIn=-4123,
-            SearchOrder=2,
-            SearchDirection=2,
-        )
+from __future__ import annotations
 
-        left = int(last.Column) + 2 if last is not None else 1
-        right = left + len(columns) - 1
+import hashlib
+import json
+import sqlite3
+from pathlib import Path
+from urllib.parse import urlsplit
 
-        # Создаём диапазоны по абсолютным координатам.
-        header_range = sheet.range(
-            (1, left),
-            (1, right),
-        )
-        header_range.api.Value2 = (tuple(columns),)
 
-        source_range = sheet.range(
-            (1, left),
-            (2, right),
-        )
+HASH_PROPERTY = "EquipmentCatalogHash"
+CATALOG_VERSION = "equipment-vba-v2"
 
-        table = sheet.api.ListObjects.Add(
-            SourceType=1,
-            Source=source_range.api,
-            XlListObjectHasHeaders=1,
-        )
-        table.Name = name
+TABLES = {
+    "typesEquipment": "typeEquipmentId",
+    "modelsEquipment": "equipmentModelId",
+    "unitsEquipment": "equipmentUnitId",
+}
 
-    raw = table.HeaderRowRange.Value2
+BOOL_COLUMNS = {
+    "SeparationGasVolume",
+    "TransferVolume",
+    "phaseRatio",
+    "Viscosity",
+    "Density",
+    "PVTCell",
+    "absolutePressure",
+}
 
-    if not isinstance(raw, (tuple, list)):
-        headers = [str(raw)]
-    else:
-        values = (
-            raw[0]
-            if isinstance(raw[0], (tuple, list))
-            else raw
-        )
-        headers = [str(v) for v in values]
+TEXT_COLUMNS = {
+    "typeEquipment",
+    "shortNameEquipment",
+    "fullNameEquipment",
+    "mnemonicName",
+    "Manufacturer",
+    "serialNumber",
+    "inventoryNumber",
+    "shortNumber",
+    "status",
+    "UnitPressure",
+    "UnitVolume",
+}
 
-    if set(headers) != set(columns) or len(headers) != len(columns):
-        raise ValueError(
-            f"Не совпадают столбцы таблицы {name}: {headers}"
-        )
 
-    # Подготавливаем значения до изменения таблицы.
-    matrix = [
-        tuple(
-            as_bool(row.get(h))
-            if name in TABLES and h in BOOL_COLUMNS
-            else row.get(h)
-            for h in headers
-        )
-        for row in rows
-    ]
+def read_catalog(db_path):
+    uri = Path(db_path).absolute().as_uri()
+    parts = urlsplit(uri)
 
-    matrix = tuple(
-        matrix or [tuple(None for _ in headers)]
+    if parts.netloc:
+        uri = "file:////" + parts.netloc + parts.path
+
+    conn = sqlite3.connect(
+        uri + "?mode=ro",
+        uri=True,
+        timeout=15,
     )
-
-    if table.DataBodyRange is None:
-        table.ListRows.Add()
-
-    header = table.HeaderRowRange
-
-    top = int(header.Row)
-    left = int(header.Column)
-    right = left + len(headers) - 1
-
-    data_rows = max(1, len(rows))
-    totals = 1 if table.ShowTotals else 0
-
-    old_bottom = (
-        int(table.Range.Row)
-        + int(table.Range.Rows.Count)
-        - 1
-    )
-    old_address = table.Range.Address
-
-    bottom = top + data_rows + totals
-
-    new_range = sheet.range(
-        (top, left),
-        (bottom, right),
-    )
+    conn.row_factory = sqlite3.Row
 
     try:
-        table.Resize(new_range.api)
+        conn.execute("BEGIN")
+        catalog = {}
 
-    except Exception as exc:
-        raise RuntimeError(
-            f"Таблица {name}: не удалось изменить диапазон "
-            f"{old_address} на {new_range.address}; "
-            f"строк данных={data_rows}, "
-            f"столбцов={len(headers)}"
-        ) from exc
+        for name, pk in TABLES.items():
+            cur = conn.execute(
+                f'SELECT * FROM "{name}" ORDER BY "{pk}"'
+            )
+            catalog[name] = {
+                "columns": [c[0] for c in cur.description],
+                "rows": [dict(row) for row in cur.fetchall()],
+            }
+    finally:
+        conn.close()
 
-    body = table.DataBodyRange
+    payload = json.dumps(
+        [CATALOG_VERSION, catalog],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
 
-    if body is None or int(body.Rows.Count) != data_rows:
-        raise RuntimeError(
-            f"Таблица {name}: неверное число строк после Resize"
+    digest = hashlib.sha256(payload).hexdigest()
+    return catalog, CATALOG_VERSION + ":" + digest
+
+
+def excel_value(value, column):
+    if value is None or value == "":
+        return None
+
+    if column in BOOL_COLUMNS:
+        text = str(value).strip().casefold()
+
+        if text in {"true", "истина", "1", "1.0"}:
+            return True
+
+        if text in {"false", "ложь", "0", "0.0"}:
+            return False
+
+        raise ValueError(
+            f"Некорректный флаг {column}: {value!r}"
         )
 
-    # Очищаем данные только после успешного Resize.
-    body.ClearContents()
+    if column in TEXT_COLUMNS:
+        return str(value)
 
-    # Удаляем старые значения под уменьшившейся таблицей.
-    if old_bottom > bottom:
-        sheet.range(
-            (bottom + 1, left),
-            (old_bottom, right),
-        ).clear_contents()
+    return value
 
-    for index, header_name in enumerate(headers):
-        text_column = (
-            name not in TABLES
-            or header_name in TEXT_COLUMNS
+
+def matrix_of(values, column_count):
+    if not isinstance(values, (tuple, list)):
+        return ((values,),)
+
+    if values and isinstance(values[0], (tuple, list)):
+        return tuple(tuple(row) for row in values)
+
+    if column_count == 1:
+        return tuple((value,) for value in values)
+
+    return (tuple(values),)
+
+
+def refresh_for_book(book, db_path, *, force=False):
+    catalog, new_hash = read_catalog(db_path)
+
+    try:
+        prop = book.api.CustomDocumentProperties.Item(HASH_PROPERTY)
+        old_hash = str(prop.Value or "")
+    except Exception:
+        old_hash = ""
+
+    if not force and old_hash == new_hash:
+        return {
+            "ok": True,
+            "changed": False,
+            "catalog_hash": new_hash,
+        }
+
+    sheet = book.sheets["Пересчет"]
+    objects = sheet.api.ListObjects
+    tables = {}
+
+    for i in range(1, int(objects.Count) + 1):
+        table = objects.Item(i)
+        name = str(table.Name)
+
+        if name in TABLES:
+            tables[name] = table
+
+    missing = set(TABLES) - set(tables)
+
+    if missing:
+        raise ValueError(
+            "На листе Пересчет отсутствуют таблицы: "
+            f"{sorted(missing)}"
         )
 
-        column_range = sheet.range(
-            (top + 1, left + index),
-            (top + data_rows, left + index),
+    # Проверяем все три таблицы до начала записи.
+    plans = []
+
+    for name, data in catalog.items():
+        table = tables[name]
+
+        headers = [
+            str(value)
+            for value in matrix_of(
+                table.HeaderRowRange.Value2,
+                len(data["columns"]),
+            )[0]
+        ]
+
+        if (
+            len(headers) != len(data["columns"])
+            or set(headers) != set(data["columns"])
+        ):
+            raise ValueError(
+                f"Не совпадают столбцы таблицы {name}: {headers}"
+            )
+
+        matrix = tuple(
+            tuple(excel_value(row.get(h), h) for h in headers)
+            for row in data["rows"]
         )
 
-        column_range.number_format = (
-            "@" if text_column else "General"
+        # Excel оставляем одну пустую строку, если справочник пуст.
+        matrix = matrix or (tuple(None for _ in headers),)
+        plans.append((table, headers, matrix))
+
+    app = book.app.api
+    previous = (
+        app.Calculation,
+        app.EnableEvents,
+        app.ScreenUpdating,
+    )
+
+    protected = bool(sheet.api.ProtectContents)
+    unprotected = False
+
+    try:
+        if plans:
+            app.Calculation = -4135  # xlCalculationManual
+            app.EnableEvents = False
+            app.ScreenUpdating = False
+
+            if protected:
+                sheet.api.Unprotect(Password="1984")
+                unprotected = True
+
+        for table, headers, matrix in plans:
+            top = int(table.HeaderRowRange.Row)
+            left = int(table.HeaderRowRange.Column)
+            right = left + len(headers) - 1
+
+            old_bottom = (
+                int(table.Range.Row)
+                + int(table.Range.Rows.Count)
+                - 1
+            )
+            bottom = (
+                top
+                + len(matrix)
+                + int(bool(table.ShowTotals))
+            )
+
+            if int(table.ListRows.Count) != len(matrix):
+                new_range = sheet.range(
+                    (top, left),
+                    (bottom, right),
+                )
+                table.Resize(new_range.api)
+
+            body = table.DataBodyRange
+
+            if body is None or int(body.Rows.Count) != len(matrix):
+                raise RuntimeError(
+                    f"Не удалось задать размер таблицы {table.Name}"
+                )
+
+            if old_bottom > bottom:
+                sheet.range(
+                    (bottom + 1, left),
+                    (old_bottom, right),
+                ).clear_contents()
+
+            for i, header in enumerate(headers):
+                column_range = sheet.range(
+                    (top + 1, left + i),
+                    (top + len(matrix), left + i),
+                )
+                column_range.number_format = (
+                    "@" if header in TEXT_COLUMNS else "General"
+                )
+
+            body.Value2 = matrix
+
+    finally:
+        if plans:
+            try:
+                if unprotected:
+                    sheet.api.Protect(Password="1984")
+            finally:
+                app.Calculation = previous[0]
+                app.EnableEvents = previous[1]
+                app.ScreenUpdating = previous[2]
+
+    # Хэш подтвердит VBA после заполнения таблиц номеров.
+    return {
+        "ok": True,
+        "changed": True,
+        "catalog_hash": new_hash,
+    }
+
+Значение equipment-vba-v2 заставит первый запуск обновить справочники и исправить списки после предыдущей реализации. Дальше будет обычная проверка хэша.
+
+2. В refresh_tasks.py добавь передачу результата обновления обратно в VBA.
+
+В классе RefreshTasksReport, после:
+
+external_statuses_kept: int = 0
+
+добавь:
+
+equipment_changed: bool = False
+    equipment_hash: str = ""
+
+Внутри _refresh_tasks_impl найди добавленный ранее блок:
+
+if refresh_equipment:
+
+Замени этот блок вместе со следующим сохранением книги, до строки return RefreshTasksReport(, на:
+
+equipment_changed = False
+    equipment_hash = ""
+
+    if refresh_equipment:
+        from equipment_catalog import refresh_for_book
+
+        progress("Проверяю справочник оборудования")
+        stage_started_at = time_module.perf_counter()
+
+        equipment_result = refresh_for_book(target_book, db_path)
+
+        equipment_changed = bool(equipment_result["changed"])
+        equipment_hash = str(equipment_result["catalog_hash"])
+
+        log_elapsed(
+            "Проверка/обновление справочника оборудования",
+            stage_started_at,
+            details=f"changed={equipment_changed}",
         )
 
-    body.Value2 = matrix
+        progress(
+            "Исходные справочники оборудования обновлены"
+            if equipment_changed
+            else "Справочник оборудования: без изменений"
+        )
 
-Ещё в функции validation_targets замени выражение:
+    if not equipment_changed:
+        progress("Сохраняю книгу с формами")
+        stage_started_at = time_module.perf_counter()
 
-base.Offset(0, index * width)
+        target_book.save()
+
+        log_elapsed(
+            "Сохранение книги с формами",
+            stage_started_at,
+            details=f"книга={target_book.name}",
+        )
+    else:
+        progress("Передаю обновление списков оборудования в VBA")
+
+При изменившемся справочнике сохранение выполнит VBA после заполнения таблиц номеров.
+
+В следующий за этим return RefreshTasksReport(...) добавь два аргумента:
+
+equipment_changed=equipment_changed,
+        equipment_hash=equipment_hash,
+
+Например, конец этого возврата станет таким:
+
+sqlite_statuses_applied=sqlite_statuses_applied,
+        external_statuses_kept=external_statuses_kept,
+        equipment_changed=equipment_changed,
+        equipment_hash=equipment_hash,
+    )
+
+Параметр refresh_equipment, его передачу между функциями и аргумент командной строки --refresh-equipment сохрани — они уже нужны для существующего общего вызова.
+
+3. В VBA, в модуле equipment, замени только процедуру createMnemonicTabless.
+
+getEquipmentNumbers, getEquipmentModels и sortStringArray оставь.
+
+В твоей старой createMnemonicTabless есть ошибка на одну строку в циклах добавления/удаления строк. Ниже размер задаётся сразу, а сами номера по-прежнему берутся твоей функцией.
+
+Вставь эту процедуру и две вспомогательные функции:
+
+Public Sub createMnemonicTabless()
+    Dim ws As Worksheet
+    Set ws = ActiveWorkbook.Worksheets("Пересчет")
+
+    Dim targets As Object
+    Set targets = CreateObject("Scripting.Dictionary")
+    targets.CompareMode = vbTextCompare
+
+    Dim cell As Range, tbl As ListObject
+    Dim mnemonic As String, key As Variant
+
+    Dim source As Range
+    Set source = ws.ListObjects("modelsEquipment") _
+                   .ListColumns("mnemonicName").DataBodyRange
+
+    If source Is Nothing Then Exit Sub
+
+    ' Сначала находим все исходные таблицы.
+    For Each cell In source.Cells
+        mnemonic = Trim$(CStr(cell.Value2))
+
+        If Len(mnemonic) > 0 Then
+            If Not targets.Exists(mnemonic) Then
+                Set tbl = FindEquipmentNumberTable(ws, mnemonic)
+
+                If tbl Is Nothing Then
+                    Err.Raise vbObjectError + 4820, _
+                              "createMnemonicTabless", _
+                              "Не найдена исходная таблица оборудования: " & mnemonic
+                End If
+
+                If tbl.ListColumns.Count <> 1 Then
+                    Err.Raise vbObjectError + 4821, _
+                              "createMnemonicTabless", _
+                              "Таблица " & mnemonic & _
+                              " должна содержать один столбец."
+                End If
+
+                If StrComp(tbl.ListColumns(1).Name, _
+                           mnemonic, vbTextCompare) <> 0 Then
+
+                    Err.Raise vbObjectError + 4822, _
+                              "createMnemonicTabless", _
+                              "Неожиданный заголовок таблицы " & mnemonic
+                End If
+
+                targets.Add mnemonic, tbl
+            End If
+        End If
+    Next cell
+
+    Dim numbers() As String
+    Dim values() As Variant
+
+    Dim count As Long, dataRows As Long, j As Long
+    Dim oldBottom As Long, newBottom As Long, column As Long
+    Dim newRange As Range
+
+    For Each key In targets.Keys
+        Set tbl = targets(key)
+
+        numbers = getEquipmentNumbers(CStr(key))
+        count = EquipmentNumberCount(numbers)
+
+        If count > 1 Then sortStringArray numbers
+
+        dataRows = count
+        If dataRows = 0 Then dataRows = 1
+
+        ReDim values(1 To dataRows, 1 To 1)
+
+        For j = 1 To count
+            values(j, 1) = numbers(LBound(numbers) + j - 1)
+        Next j
+
+        oldBottom = tbl.Range.Row + tbl.Range.Rows.Count - 1
+        column = tbl.Range.Column
+
+        Set newRange = tbl.HeaderRowRange.Cells(1, 1).Resize( _
+            dataRows + 1 + IIf(tbl.ShowTotals, 1, 0), 1)
+
+        newBottom = newRange.Row + newRange.Rows.Count - 1
+
+        If tbl.ListRows.Count <> dataRows Then
+            tbl.Resize newRange
+        End If
+
+        If oldBottom > newBottom Then
+            ws.Range( _
+                ws.Cells(newBottom + 1, column), _
+                ws.Cells(oldBottom, column) _
+            ).ClearContents
+        End If
+
+        tbl.DataBodyRange.NumberFormat = "@"
+        tbl.DataBodyRange.Value2 = values
+    Next key
+End Sub
+
+
+Private Function FindEquipmentNumberTable( _
+    ByVal ws As Worksheet, _
+    ByVal mnemonic As String _
+) As ListObject
+
+    Dim tbl As ListObject
+
+    For Each tbl In ws.ListObjects
+        If StrComp(tbl.Name, mnemonic, vbTextCompare) = 0 _
+           Or StrComp(tbl.DisplayName, mnemonic, vbTextCompare) = 0 Then
+
+            Set FindEquipmentNumberTable = tbl
+            Exit Function
+        End If
+    Next tbl
+
+    ' У исходных CSB-IB и КПП-1 DisplayName содержит подчёркивание.
+    Dim aliasName As String
+    aliasName = Replace(mnemonic, "-", "_")
+
+    For Each tbl In ws.ListObjects
+        If StrComp(tbl.Name, aliasName, vbTextCompare) = 0 _
+           Or StrComp(tbl.DisplayName, aliasName, vbTextCompare) = 0 Then
+
+            Set FindEquipmentNumberTable = tbl
+            Exit Function
+        End If
+    Next tbl
+End Function
+
+
+Private Function EquipmentNumberCount( _
+    ByRef numbers() As String _
+) As Long
+
+    On Error Resume Next
+    EquipmentNumberCount = UBound(numbers) - LBound(numbers) + 1
+    On Error GoTo 0
+End Function
+
+Эта версия сохраняет имена таблиц и заголовки. Если исходная таблица отсутствует, она сообщит её название. В проверенном шаблоне все необходимые таблицы есть.
+
+В тот же модуль equipment добавь процедуру завершения обновления:
+
+Public Sub CompleteEquipmentCatalogRefresh( _
+    ByVal wb As Workbook, _
+    ByVal catalogHash As String, _
+    Optional ByVal saveWorkbook As Boolean = True _
+)
+    If wb Is Nothing Then
+        Err.Raise vbObjectError + 4830, , _
+                  "Не указана книга проекта."
+    End If
+
+    If Len(Trim$(catalogHash)) = 0 Then
+        Err.Raise vbObjectError + 4831, , _
+                  "Python не вернул хэш справочника."
+    End If
+
+    Dim previousBook As Workbook
+    Dim previousSheet As Object
+
+    Set previousBook = Application.ActiveWorkbook
+    Set previousSheet = Application.ActiveSheet
+
+    Dim oldCalculation As XlCalculation
+    Dim oldEvents As Boolean, oldScreen As Boolean
+
+    oldCalculation = Application.Calculation
+    oldEvents = Application.EnableEvents
+    oldScreen = Application.ScreenUpdating
+
+    Dim previousHash As String
+    previousHash = GetWorkbookMetadataProperty( _
+        wb, "EquipmentCatalogHash")
+
+    Dim unprotected As New Collection
+    Dim sheetName As Variant, ws As Worksheet
+
+    Dim errNumber As Long
+    Dim errSource As String
+    Dim errText As String
+
+    On Error GoTo Failed
+
+    Application.EnableEvents = False
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+
+    wb.Activate
+
+    For Each sheetName In Array( _
+        "Пересчет", "AP", "BP", "EMV", "GC", _
+        "GOR", "SSF", "Rec", "JOIN", "OPOH", "OP", "PD" _
+    )
+        Set ws = wb.Worksheets(CStr(sheetName))
+
+        If ws.ProtectContents Then
+            ws.Unprotect Password:="1984"
+            unprotected.Add ws
+        End If
+    Next sheetName
+
+    ' Заполняем существующие таблицы номерами оборудования.
+    createMnemonicTabless
+
+    ' Обновляем выбор моделей существующими процедурами.
+    equipmentModelsRefreshAP
+    equipmentModelsRefreshBP
+    equipmentModelsRefreshEMV
+    equipmentModelsRefreshGC
+    equipmentModelsRefreshGOR
+    equipmentModelsRefreshSSF
+    equipmentModelsRefreshRec
+    equipmentModelsRefreshJOIN
+    equipmentModelsRefreshOPOH
+
+    If Not wb.Worksheets("OP").ListObjects("Lab_samples") _
+             .DataBodyRange Is Nothing Then
+        equipmentModelsRefreshOP
+    End If
+
+    equipmentModelsRefreshPD
+
+    RemoveObsoleteEquipmentModelTables wb
+
+    ' Возвращаем защиту только тем листам, с которых сняли её здесь.
+    Do While unprotected.Count > 0
+        Set ws = unprotected(1)
+
+        ws.Protect Password:="1984", _
+                   UserInterfaceOnly:=True, _
+                   AllowFiltering:=True
+
+        unprotected.Remove 1
+    Loop
+
+    ' Подтверждаем хэш после заполнения списков.
+    SetWorkbookMetadataProperty _
+        wb, "EquipmentCatalogHash", catalogHash, False
+
+    If saveWorkbook Then wb.Save
+
+CleanExit:
+    On Error Resume Next
+
+    For Each ws In unprotected
+        ws.Protect Password:="1984", _
+                   UserInterfaceOnly:=True, _
+                   AllowFiltering:=True
+    Next ws
+
+    If Not previousBook Is Nothing Then previousBook.Activate
+    If Not previousSheet Is Nothing Then previousSheet.Activate
+
+    Application.Calculation = oldCalculation
+    Application.EnableEvents = oldEvents
+    Application.ScreenUpdating = oldScreen
+
+    On Error GoTo 0
+
+    If errNumber <> 0 Then
+        Err.Raise errNumber, errSource, errText
+    End If
+
+    Exit Sub
+
+Failed:
+    errNumber = Err.Number
+    errSource = Err.Source
+    errText = Err.Description
+
+    On Error Resume Next
+
+    SetWorkbookMetadataProperty _
+        wb, "EquipmentCatalogHash", previousHash, False
+
+    On Error GoTo 0
+    GoTo CleanExit
+End Sub
+
+И сразу после неё добавь очистку созданных предыдущей реализацией таблиц eqModels_*:
+
+Private Sub RemoveObsoleteEquipmentModelTables(ByVal wb As Workbook)
+    Dim ws As Worksheet
+    Dim tbl As ListObject
+    Dim area As Range
+    Dim i As Long
+
+    Set ws = wb.Worksheets("Пересчет")
+
+    For i = ws.ListObjects.Count To 1 Step -1
+        Set tbl = ws.ListObjects(i)
+
+        If LCase$(Left$(tbl.Name, 9)) = "eqmodels_" Then
+            If tbl.ListColumns.Count = 1 Then
+                If LCase$(tbl.ListColumns(1).Name) = "model" Then
+                    Set area = tbl.Range
+                    tbl.Unlist
+                    area.Clear
+                End If
+            End If
+        End If
+    Next i
+End Sub
+
+Она удаляет только эти вспомогательные таблицы и очищает их собственный диапазон, без сдвига ячеек. Перед этим существующие VBA-процедуры возвращают источники списков моделей на формах.
+
+4. В StudySync, в функции RefreshTasksFromExternalWorkbook, обработай возвращённый хэш.
+
+В объявления переменных именно этой функции добавь:
+
+Dim report As Object
+
+После:
+
+stdoutText = exec.StdOut.ReadAll
+    stderrText = exec.StdErr.ReadAll
+
+замени старый блок обработки exec.exitCode вместе со строкой:
+
+RefreshTasksFromExternalWorkbook = stdoutText
 
 на:
 
-sheet.range((int(base.Row), int(base.Column) + index * width)).api
+If exec.exitCode <> 0 Then
+        Err.Raise vbObjectError + 4810, _
+                  "RefreshTasksFromExternalWorkbook", _
+                  "Ошибка обновления заданий:" & vbCrLf & _
+                  stdoutText & vbCrLf & stderrText
+    End If
 
-Это также задаёт ячейку по абсолютным координатам, без неоднозначного обращения через COM.
+    Set report = JsonConverter.ParseJson(stdoutText)
 
-Сохрани Python-файл и повтори обновление проекта. Проверил расчёт прямоугольных диапазонов, уменьшение таблиц, пустые списки и сохранение начальных нулей в номерах.
+    If Not CBool(report("ok")) Then
+        Err.Raise vbObjectError + 4811, _
+                  "RefreshTasksFromExternalWorkbook", _
+                  CStr(report("message"))
+    End If
+
+    If report.Exists("equipment_changed") Then
+        If CBool(report("equipment_changed")) Then
+            frmProgress.lblStatus.Caption = _
+                "Обновляю списки номеров оборудования..."
+
+            frmProgress.Repaint
+
+            equipment.CompleteEquipmentCatalogRefresh _
+                targetBook, CStr(report("equipment_hash")), True
+        End If
+    End If
+
+    Debug.Print stdoutText
+
+    ShowNotification _
+        FormatTaskUpdateResult(stdoutText) & vbCrLf, 4
+
+    RefreshTasksFromExternalWorkbook = stdoutText
+
+Обработчики CleanExit и CleanFail под ним сохрани.
+
+Новый shell.Exec здесь не добавляется. VBA заполняет списки после завершения уже существующего Python-процесса.
+
+5. В create_project_forms.py учти такое же завершение через VBA при пакетном создании и обновлении проектов.
+
+Замени функцию run_refresh_tasks_for_book целиком:
+
+def run_refresh_tasks_for_book(
+    *,
+    app: xw.App,
+    workbook: xw.Book,
+    addin_name: str,
+    refresh_project: str,
+) -> None:
+    from refresh_tasks import refresh_tasks
+
+    progress(f"Обновляю задания для {refresh_project}")
+
+    report = refresh_tasks(
+        workbook=str(workbook.fullname),
+        db_path=str(DB_PATH),
+        source_workbook=str(TASKS_WORKBOOK),
+        project_number=refresh_project,
+        source_parent_sheet=REFRESH_TASKS_SOURCE_PARENT_SHEET,
+        source_parent_table=REFRESH_TASKS_SOURCE_PARENT_TABLE,
+        source_child_sheet=REFRESH_TASKS_SOURCE_CHILD_SHEET,
+        source_child_table=REFRESH_TASKS_SOURCE_CHILD_TABLE,
+        target_parent_sheet=REFRESH_TASKS_TARGET_PARENT_SHEET,
+        target_parent_table=REFRESH_TASKS_TARGET_PARENT_TABLE,
+        target_child_sheet=REFRESH_TASKS_TARGET_CHILD_SHEET,
+        target_child_table=REFRESH_TASKS_TARGET_CHILD_TABLE,
+        refresh_equipment=True,
+    )
+
+    if not report.ok:
+        raise RuntimeError(report.message)
+
+    if report.equipment_changed:
+        progress("VBA обновляет списки номеров оборудования")
+
+        run_addin_macro(
+            app=app,
+            workbook=workbook,
+            addin_name=addin_name,
+            macro_name="equipment.CompleteEquipmentCatalogRefresh",
+            args=(workbook.api, report.equipment_hash, False),
+        )
+
+Здесь False означает, что книгу сохранит существующий код пакетного обновления в конце своей работы.
+
+В build_new_workbook и update_existing_workbook замени вызовы этой функции на:
+
+run_refresh_tasks_for_book(
+            app=app,
+            workbook=workbook,
+            addin_name=addin_name,
+            refresh_project=refresh_project,
+        )
+
+В проверенном исходнике внутри build_new_workbook было два одинаковых последовательных вызова. Оставь один.
+
+6. Вызовы обновления проекта сохраняем в существующей общей цепочке.
+
+В wrappers перед Refresh_Project должен остаться уже добавленный вызов:
+
+RefreshTasks_SelectFile _
+            refreshEquipment:=(StrComp( _
+                macroName, "Refresh_Project", vbTextCompare _
+            ) = 0)
+
+В StudySync сохраняются передача refreshEquipment и добавление к существующей команде:
+
+If refreshEquipment Then
+        cmd = cmd & " --refresh-equipment"
+    End If
+
+Если в PowerQuery.Refresh_Project ещё остался отдельный добавленный ранее вызов RefreshEquipmentCatalog, удали его.
+
+После этих изменений достаточно обычного обновления проекта: первый запуск исправит содержимое исходных таблиц номеров; последующие будут обновлять справочники и списки только при изменении хэша. Старые дубликаты со случайными суффиксами у CSB-IB/КПП-1 новая логика использовать не будет; их можно один раз удалить вручную, сохранив исходные таблицы.
+
+Python проверен на доступной копии БД, включая пропуск обновления, изменение размеров и передачу результата. VBA в живом Excel здесь не запускался.
