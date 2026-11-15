@@ -1,83 +1,972 @@
-Обработка заняла 49s
+Обработка заняла 20m 26s
 
-Добавь в конец модуля helpersRange, после последнего End Function, такую процедуру:
+Сделаем три изменения: новый Python-файл, добавление процедур в StudySync и один вызов из Refresh_Project.
 
-Public Sub DeleteFormNames( _
-    ByVal wb As Workbook, _
-    ByVal formPrefix As String, _
-    ByVal formIndex As Long _
+Проверка хэша выполняется до подключения Python к Excel. Если справочник прежний, таблицы и списки не перезаписываются. Форму оставляем 25.0.0.
+
+1. Создай equipment_catalog.py рядом с рабочим sync.py
+
+В той же папке должны находиться существующие excel_io.py и project_config.py. Путь к БД берётся из твоего project_version.json.
+
+Вставь файл целиком:
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sqlite3
+import sys
+import traceback
+from pathlib import Path
+
+
+TABLES = {
+    "typesEquipment": "typeEquipmentId",
+    "modelsEquipment": "equipmentModelId",
+    "unitsEquipment": "equipmentUnitId",
+}
+
+HASH_PROPERTY = "EquipmentCatalogHash"
+CATALOG_VERSION = "equipment-v1"
+
+BOOL_COLUMNS = {
+    "SeparationGasVolume",
+    "TransferVolume",
+    "phaseRatio",
+    "Viscosity",
+    "Density",
+    "PVTCell",
+    "absolutePressure",
+}
+
+TEXT_COLUMNS = {
+    "serialNumber",
+    "inventoryNumber",
+    "shortNumber",
+    "status",
+    "typeEquipment",
+    "shortNameEquipment",
+    "fullNameEquipment",
+    "mnemonicName",
+    "Manufacturer",
+    "UnitPressure",
+    "UnitVolume",
+}
+
+# Лист, префикс формы, поле, назначение, тип оборудования.
+MODEL_RULES = (
+    ("AP", "AP", "apEquipment", "Density", "All"),
+    ("BP", "BP", "bpEquipment", "TransferVolume", "All"),
+    ("EMV", "EMV", "emvEquipment", "Viscosity", "All"),
+    ("GC", "GC", "equipment", "TransferVolume", "Pump"),
+
+    ("GOR", "GOR", "smplTransfEq", "TransferVolume", "All"),
+    ("GOR", "GOR", "gorEquipment", "SeparationGasVolume", "Gasometer"),
+
+    ("SSF", "SSF", "equipmentForTransfer", "TransferVolume", "All"),
+    ("SSF", "SSF", "ssfEquipment", "SeparationGasVolume", "All"),
+
+    ("Rec", "Rec", "typeSampler", "PVTCell", "All"),
+    ("Rec", "Rec", "equipmentForTransfer", "TransferVolume", "All"),
+
+    ("JOIN", "JOIN", "equipment", "PVTCell", "All"),
+    ("OPOH", "OPOH", "typeSampler", "PVTCell", "All"),
+    ("PD", "PD", "smplTransfEq", "TransferVolume", "All"),
 )
 
-    Dim prefix As String
-    prefix = Trim$(formPrefix) & "_" & CStr(formIndex) & "_"
+MODEL_GROUPS = sorted({(r[3], r[4]) for r in MODEL_RULES})
 
-    Dim i As Long
-    Dim nm As Excel.Name
-    Dim shortName As String
 
-    ' Перебираем с конца, поскольку удаление меняет индексы.
-    For i = wb.Names.Count To 1 Step -1
+def model_table(use, kind):
+    return f"eqModels_{use}_{kind}"
 
-        Set nm = wb.Names(i)
-        shortName = nm.Name
 
-        ' Убираем указание листа у локальных имён.
-        shortName = Mid$( _
-            shortName, _
-            InStrRev(shortName, "!") + 1 _
+def as_bool(value):
+    if value is None or value == "":
+        return None
+
+    text = str(value).strip().lower()
+
+    if text in {"1", "1.0", "true", "истина"}:
+        return True
+
+    if text in {"0", "0.0", "false", "ложь"}:
+        return False
+
+    raise ValueError(f"Некорректный логический флаг: {value!r}")
+
+
+def read_catalog(db_path):
+    # mode=ro не позволяет случайно создать или изменить БД.
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=15)
+    conn.row_factory = sqlite3.Row
+
+    try:
+        # Все три таблицы читаются из одного согласованного снимка.
+        conn.execute("BEGIN")
+        catalog = {}
+
+        for table, pk in TABLES.items():
+            cur = conn.execute(
+                f'SELECT * FROM "{table}" ORDER BY "{pk}"'
+            )
+
+            catalog[table] = {
+                "columns": [c[0] for c in cur.description],
+                "rows": [dict(row) for row in cur.fetchall()],
+            }
+
+    finally:
+        conn.close()
+
+    payload = json.dumps(
+        [CATALOG_VERSION, catalog],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+    digest = hashlib.sha256(payload).hexdigest()
+
+    return catalog, CATALOG_VERSION + ":" + digest
+
+
+def make_lists(catalog):
+    types = {
+        r["typeEquipmentId"]: r
+        for r in catalog["typesEquipment"]["rows"]
+    }
+
+    models = catalog["modelsEquipment"]["rows"]
+
+    by_id = {
+        r["equipmentModelId"]: r
+        for r in models
+    }
+
+    numbers = {}
+
+    for row in models:
+        mnemonic = str(row["mnemonicName"]).strip()
+        table = mnemonic.replace("-", "_")
+
+        if not re.fullmatch(r"[^\W\d][\w.]*", table):
+            raise ValueError(
+                f"Недопустимый mnemonicName: {mnemonic!r}"
+            )
+
+        numbers.setdefault(mnemonic, set())
+
+    active_models = set()
+
+    for row in catalog["unitsEquipment"]["rows"]:
+        model = by_id.get(row["equipmentModelId"])
+
+        if model is None:
+            raise ValueError(
+                "В unitsEquipment есть ссылка на неизвестную модель"
+            )
+
+        status = str(row.get("status") or "").strip().casefold()
+
+        if status != "active":
+            continue
+
+        number = str(row.get("shortNumber") or "").strip()
+
+        if number:
+            active_models.add(model["equipmentModelId"])
+            mnemonic = str(model["mnemonicName"]).strip()
+            numbers[mnemonic].add(number)
+
+    lists = {}
+
+    for use, kind in MODEL_GROUPS:
+        values = []
+
+        for row in models:
+            eq_type = types.get(row["typeEquipmentId"])
+
+            if eq_type is None:
+                raise ValueError(
+                    "В modelsEquipment есть ссылка на неизвестный тип"
+                )
+
+            if not as_bool(eq_type[use]):
+                continue
+
+            if kind != "All" and eq_type["typeEquipment"] != kind:
+                continue
+
+            if row["equipmentModelId"] in active_models:
+                values.append(str(row["mnemonicName"]).strip())
+
+        lists[model_table(use, kind)] = list(dict.fromkeys(values))
+
+    return numbers, lists
+
+
+def get_table(sheet, name):
+    try:
+        return sheet.api.ListObjects.Item(name)
+    except Exception:
+        return None
+
+
+def column_values(table, column):
+    body = table.ListColumns.Item(column).DataBodyRange
+
+    if body is None:
+        return []
+
+    values = body.Value2
+
+    if not isinstance(values, (tuple, list)):
+        return [values]
+
+    return [
+        r[0] if isinstance(r, (tuple, list)) else r
+        for r in values
+    ]
+
+
+def write_table(sheet, name, columns, rows):
+    table = get_table(sheet, name)
+
+    if table is None:
+        last = sheet.api.Cells.Find(
+            What="*",
+            LookIn=-4123,
+            SearchOrder=2,
+            SearchDirection=2,
         )
 
-        If StrComp( _
-            Left$(shortName, Len(prefix)), _
-            prefix, _
-            vbTextCompare _
-        ) = 0 Then
+        col = last.Column + 2 if last is not None else 1
 
-            nm.Delete
+        area = sheet.api.Cells(1, col).Resize(2, len(columns))
+        area.Rows(1).Value2 = (tuple(columns),)
 
+        table = sheet.api.ListObjects.Add(
+            SourceType=1,
+            Source=area,
+            XlListObjectHasHeaders=1,
+        )
+
+        table.Name = name
+
+    raw = table.HeaderRowRange.Value2
+
+    if not isinstance(raw, (tuple, list)):
+        headers = [str(raw)]
+    else:
+        values = (
+            raw[0]
+            if isinstance(raw[0], (tuple, list))
+            else raw
+        )
+        headers = [str(v) for v in values]
+
+    if set(headers) != set(columns) or len(headers) != len(columns):
+        raise ValueError(
+            f"Не совпадают столбцы таблицы {name}: {headers}"
+        )
+
+    if table.DataBodyRange is None:
+        table.ListRows.Add()
+
+    # Сначала очищаем старые строки, чтобы после уменьшения
+    # таблицы под ней не оставались старые значения.
+    table.DataBodyRange.ClearContents()
+
+    table.Resize(
+        table.HeaderRowRange.Resize(
+            max(1, len(rows)) + 1,
+            len(headers),
+        )
+    )
+
+    body = table.DataBodyRange
+
+    for i, header in enumerate(headers, 1):
+        text_column = name not in TABLES or header in TEXT_COLUMNS
+
+        body.Columns(i).NumberFormat = (
+            "@" if text_column else "General"
+        )
+
+    matrix = []
+
+    for row in rows:
+        matrix.append(
+            tuple(
+                as_bool(row.get(h))
+                if name in TABLES and h in BOOL_COLUMNS
+                else row.get(h)
+                for h in headers
+            )
+        )
+
+    # Для пустого списка оставляем одну пустую строку:
+    # это сохраняет корректную ссылку для проверки данных.
+    body.Value2 = tuple(
+        matrix or [tuple(None for _ in headers)]
+    )
+
+
+def set_validation(target, table, column):
+    if target.Cells.Count == 1:
+        target = target.MergeArea
+
+    validation = target.Validation
+
+    validation.Delete()
+    validation.Add(
+        3,
+        1,
+        1,
+        f'=INDIRECT("{table}[{column}]")',
+    )
+
+    validation.IgnoreBlank = True
+    validation.InCellDropdown = True
+    validation.ShowInput = True
+    validation.ShowError = True
+
+
+def validation_targets(book):
+    sheets = {s.name: s for s in book.sheets}
+    targets = []
+
+    # Формы с отдельными именованными диапазонами каждой страницы.
+    for sheet_name, prefix, field, use, kind in MODEL_RULES:
+        sheet = sheets.get(sheet_name)
+
+        if sheet is None:
+            continue
+
+        index = 1
+
+        while True:
+            try:
+                sheet.api.Range(f"{prefix}_{index}_sampleCode")
+            except Exception:
+                break
+
+            target = sheet.api.Range(
+                f"{prefix}_{index}_{field}"
+            )
+
+            targets.append(
+                (
+                    sheet,
+                    target,
+                    model_table(use, kind),
+                    "model",
+                )
+            )
+
+            index += 1
+
+    # Список типов пробоотборников на OP.
+    if "OP" in sheets:
+        table = get_table(sheets["OP"], "Lab_samples")
+
+        if table is not None:
+            body = table.ListColumns.Item(
+                "typeSampler"
+            ).DataBodyRange
+
+            if body is not None:
+                targets.append(
+                    (
+                        sheets["OP"],
+                        body,
+                        model_table("PVTCell", "All"),
+                        "model",
+                    )
+                )
+
+    # На CCE выбирается сразу номер PVT-ячейки.
+    if "CCE" in sheets:
+        index = 1
+
+        while True:
+            try:
+                target = sheets["CCE"].api.Range(
+                    f"CCE_{index}_PVTEqNumber"
+                )
+            except Exception:
+                break
+
+            targets.append(
+                (sheets["CCE"], target, "PVT", "PVT")
+            )
+
+            index += 1
+
+    # CVD, DLST и Stable используют имена первой формы
+    # и смещения по столбцам.
+    for (
+        sheet_name,
+        prefix,
+        field,
+        width,
+        page_row,
+        page_col,
+        limit,
+    ) in (
+        ("CVD", "CVD", "pvtCell", 16, 1, 7, 6),
+        ("DLSepTest", "DLST", "pvtCell", 18, 1, 7, 5),
+        ("Stable", "Stable", "PVTcell", 6, 13, 4, 10),
+    ):
+        sheet = sheets.get(sheet_name)
+
+        if sheet is None:
+            continue
+
+        base = sheet.api.Range(f"{prefix}_1_{field}")
+
+        for index in range(limit):
+            page = (
+                sheet.api.Cells(
+                    page_row,
+                    page_col + index * width,
+                )
+                .MergeArea.Cells(1, 1)
+                .Value2
+            )
+
+            if page is None or str(page).strip() == "":
+                break
+
+            targets.append(
+                (
+                    sheet,
+                    base.Offset(0, index * width),
+                    "PVT",
+                    "PVT",
+                )
+            )
+
+    return targets
+
+
+def apply_catalog(workbook, catalog, numbers, lists):
+    # При совпадении хэша до этого импорта выполнение не доходит.
+    from excel_io import ExcelWorkbookGateway
+
+    excel = ExcelWorkbookGateway(workbook)
+    app = excel.book.app.api
+
+    protected = []
+
+    previous = (
+        app.EnableEvents,
+        app.ScreenUpdating,
+        app.Calculation,
+    )
+
+    try:
+        calc = excel.book.sheets["Пересчет"]
+        targets = validation_targets(excel.book)
+
+        # Списки исчезнувших моделей тоже очищаем,
+        # чтобы в них не оставались прежние номера.
+        old_models = get_table(calc, "modelsEquipment")
+
+        if old_models is not None:
+            for name in column_values(
+                old_models,
+                "mnemonicName",
+            ):
+                if name is not None and str(name).strip():
+                    numbers.setdefault(str(name).strip(), set())
+
+        reserved = set(TABLES) | set(lists)
+        reserved_keys = {n.casefold() for n in reserved}
+        used_names = {}
+
+        for mnemonic in numbers:
+            name = mnemonic.replace("-", "_")
+            key = name.casefold()
+
+            if key in used_names or key in reserved_keys:
+                raise ValueError(
+                    f"Конфликт имён таблиц для {mnemonic!r}"
+                )
+
+            used_names[key] = mnemonic
+
+        if "PVT" not in numbers:
+            raise ValueError(
+                "В справочнике отсутствует mnemonicName PVT"
+            )
+
+        app.EnableEvents = False
+        app.ScreenUpdating = False
+        app.Calculation = -4135
+
+        affected = {
+            s.name: s
+            for s, _, _, _ in targets
+        }
+
+        affected[calc.name] = calc
+
+        for sheet in affected.values():
+            if sheet.api.ProtectContents:
+                sheet.api.Unprotect(Password="1984")
+                protected.append(sheet)
+
+        # Если обновление прервётся, при следующем запуске
+        # оно должно повториться, включая принудительный запуск.
+        try:
+            prop = excel.book.api.CustomDocumentProperties.Item(
+                HASH_PROPERTY
+            )
+        except Exception:
+            prop = None
+
+        if prop is not None:
+            prop.Value = ""
+
+        # Основные таблицы содержат все приборы,
+        # включая неактивные.
+        for table, data in catalog.items():
+            write_table(
+                calc,
+                table,
+                data["columns"],
+                data["rows"],
+            )
+
+        # В списки выбора номеров попадают активные приборы.
+        for mnemonic, values in numbers.items():
+            rows = [
+                {mnemonic: n}
+                for n in sorted(
+                    values,
+                    key=lambda n: (len(n), n),
+                )
+            ]
+
+            write_table(
+                calc,
+                mnemonic.replace("-", "_"),
+                [mnemonic],
+                rows,
+            )
+
+        # Источники выпадающих списков моделей.
+        for name, values in lists.items():
+            write_table(
+                calc,
+                name,
+                ["model"],
+                [{"model": v} for v in values],
+            )
+
+        # Меняем только проверки данных.
+        # Значения, уже выбранные в ячейках, не очищаем.
+        for _, target, table, column in targets:
+            set_validation(target, table, column)
+
+    finally:
+        try:
+            for sheet in protected:
+                sheet.api.Protect(Password="1984")
+
+        finally:
+            try:
+                app.Calculation = previous[2]
+                app.ScreenUpdating = previous[1]
+                app.EnableEvents = previous[0]
+
+            finally:
+                excel.close()
+
+
+def refresh(workbook, db_path, known_hash=""):
+    catalog, new_hash = read_catalog(db_path)
+
+    if new_hash == known_hash:
+        return {
+            "ok": True,
+            "changed": False,
+            "catalog_hash": new_hash,
+        }
+
+    numbers, lists = make_lists(catalog)
+
+    apply_catalog(
+        workbook,
+        catalog,
+        numbers,
+        lists,
+    )
+
+    return {
+        "ok": True,
+        "changed": True,
+        "catalog_hash": new_hash,
+    }
+
+
+def main():
+    from project_config import component_path
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--workbook",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--known-hash",
+        default="",
+    )
+
+    parser.add_argument(
+        "--db",
+        default=str(component_path("database_schema")),
+    )
+
+    parser.add_argument("--progress-file")
+
+    args = parser.parse_args()
+
+    try:
+        if args.progress_file:
+            Path(args.progress_file).write_text(
+                "Проверка справочника оборудования...\n",
+                encoding="utf-8",
+            )
+
+        result = refresh(
+            args.workbook,
+            args.db,
+            args.known_hash,
+        )
+
+    except Exception as exc:
+        traceback.print_exc(file=sys.stderr)
+
+        result = {
+            "ok": False,
+            "changed": False,
+            "message": str(exc),
+        }
+
+    print(json.dumps(result, ensure_ascii=False))
+
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+Скрипт сохраняет существующие имена таблиц номеров, например AP, PVT, CSB_IB. Дополнительно он автоматически создаёт на «Пересчете» несколько таблиц eqModels_* для списков моделей. Ссылки на таблицы позволяют обходиться без длинной строки перечисления в Validation.Add, у которой есть ограничение 255 символов. 
+
+2. Добавь следующий код в конец VBA-модуля StudySync
+
+Именно в StudySync, потому что он использует уже имеющиеся там приватные функции запуска Python, чтения файлов и отображения прогресса.
+
+Ничего из существующего модуля удалять не нужно.
+
+Public Sub RefreshEquipmentCatalog( _
+    Optional ByVal forceRefresh As Boolean = False _
+)
+
+    Dim wb As Workbook
+    Dim shell As Object
+    Dim process As Object
+    Dim result As Object
+
+    Dim knownHash As String
+    Dim scriptPath As String
+
+    Dim suffix As String
+    Dim progressFile As String
+    Dim stdoutFile As String
+    Dim stderrFile As String
+
+    Dim pythonCmd As String
+    Dim command As String
+    Dim stdoutText As String
+    Dim stderrText As String
+
+    Dim failureNumber As Long
+    Dim failureText As String
+
+    On Error GoTo CleanFail
+
+    If ActiveWorkbook Is Nothing Then
+        Err.Raise vbObjectError + 4800, , _
+                  "Нет активной книги."
+    End If
+
+    Set wb = ActiveWorkbook
+
+    If wb Is ThisWorkbook Then
+        Err.Raise vbObjectError + 4801, , _
+                  "Активна надстройка, а не форма."
+    End If
+
+    If Len(wb.Path) = 0 Then
+        Err.Raise vbObjectError + 4802, , _
+                  "Сначала сохрани книгу с формами."
+    End If
+
+    If Not forceRefresh Then
+
+        knownHash = GetWorkbookMetadataProperty( _
+            wb, _
+            "EquipmentCatalogHash" _
+        )
+
+        If Len(knownHash) > 0 Then
+            If Not EquipmentCatalogCacheReady(wb) Then
+                knownHash = ""
+            End If
         End If
 
-    Next i
+    End If
+
+    scriptPath = _
+        Left$(SYNC_SCRIPT, InStrRev(SYNC_SCRIPT, "\")) & _
+        "equipment_catalog.py"
+
+    suffix = _
+        Format$(Now, "yyyymmdd_hhnnss") & "_" & _
+        CStr(Int(Rnd() * 1000000))
+
+    progressFile = _
+        Environ$("TEMP") & _
+        "\equipment_progress_" & suffix & ".log"
+
+    stdoutFile = _
+        Environ$("TEMP") & _
+        "\equipment_stdout_" & suffix & ".log"
+
+    stderrFile = _
+        Environ$("TEMP") & _
+        "\equipment_stderr_" & suffix & ".log"
+
+    pythonCmd = _
+        Quote(GetWorkingPythonExe) & " -u " & _
+        Quote(scriptPath) & _
+        " --workbook " & Quote(wb.FullName) & _
+        " --known-hash " & Quote(knownHash) & _
+        " --progress-file " & Quote(progressFile)
+
+    command = _
+        Quote(Environ$("ComSpec")) & _
+        " /d /s /c " & _
+        Quote( _
+            "set ""PYTHONUTF8=1"" && " & _
+            "set ""PYTHONIOENCODING=utf-8"" && " & _
+            pythonCmd & _
+            " 1>" & Quote(stdoutFile) & _
+            " 2>" & Quote(stderrFile) _
+        )
+
+    Set shell = CreateObject("WScript.Shell")
+    Set process = shell.Exec(command)
+
+    frmProgress.lblStatus.Caption = _
+        "Проверяю справочник оборудования..."
+
+    frmProgress.Show vbModeless
+    frmProgress.Repaint
+    DoEvents
+
+    WaitForPythonProcess process, progressFile
+
+    stdoutText = ReadUtf8TextFileSafe(stdoutFile)
+    stderrText = ReadUtf8TextFileSafe(stderrFile)
+
+    If Len(stderrText) > 0 Then
+        Debug.Print stderrText
+    End If
+
+    If Len(Trim$(stdoutText)) = 0 Then
+        Err.Raise _
+            vbObjectError + 4803, , _
+            "Python не вернул результат." & _
+            vbCrLf & stderrText
+    End If
+
+    Set result = JsonConverter.ParseJson(stdoutText)
+
+    If process.ExitCode <> 0 _
+       Or Not CBool(result("ok")) Then
+
+        Err.Raise _
+            vbObjectError + 4804, , _
+            CStr(result("message"))
+
+    End If
+
+    If CBool(result("changed")) Then
+
+        ' Новый хэш записываем только после полного
+        ' успешного обновления таблиц и списков.
+        SetWorkbookMetadataProperty _
+            wb, _
+            "EquipmentCatalogHash", _
+            CStr(result("catalog_hash"))
+
+        Debug.Print "EquipmentCatalog: обновлён"
+
+    Else
+
+        Debug.Print "EquipmentCatalog: без изменений"
+
+    End If
+
+CleanExit:
+
+    On Error Resume Next
+
+    Unload frmProgress
+    Application.StatusBar = False
+
+    DeleteFileIfExists progressFile
+    DeleteFileIfExists stdoutFile
+    DeleteFileIfExists stderrFile
+
+    Set process = Nothing
+    Set shell = Nothing
+
+    On Error GoTo 0
+
+    If failureNumber <> 0 Then
+        Err.Raise _
+            failureNumber, _
+            "RefreshEquipmentCatalog", _
+            failureText
+    End If
+
+    Exit Sub
+
+CleanFail:
+
+    failureNumber = Err.Number
+    failureText = Err.Description
+
+    Resume CleanExit
 
 End Sub
 
-Затем в модуле AP, в процедуре DeleteLastListAP2, найди этот блок:
 
-Dim headerCell As Range
-Dim namedRange As String
+Private Function EquipmentCatalogCacheReady( _
+    ByVal wb As Workbook _
+) As Boolean
 
-For Each headerCell In tableResults.HeaderRowRange.Cells
-    namedRange = "AP_" & lastForm & "_" & CStr(headerCell.Value)
+    Dim ws As Worksheet
+    Dim table As ListObject
+    Dim tableName As Variant
+    Dim cell As Range
 
-    If NamedRangeExists(ActiveWorkbook, namedRange) Then
-        ActiveWorkbook.Names(namedRange).Delete
-    End If
-Next headerCell
+    On Error GoTo NotReady
 
-Замени его целиком одной строкой:
+    Set ws = wb.Worksheets("Пересчет")
 
-DeleteFormNames sheetAP.Parent, "AP", lastForm
+    For Each tableName In Array( _
+        "typesEquipment", _
+        "modelsEquipment", _
+        "unitsEquipment", _
+        "eqModels_Density_All", _
+        "eqModels_Viscosity_All", _
+        "eqModels_TransferVolume_All", _
+        "eqModels_TransferVolume_Pump", _
+        "eqModels_SeparationGasVolume_All", _
+        "eqModels_SeparationGasVolume_Gasometer", _
+        "eqModels_PVTCell_All" _
+    )
 
-Аналогично замени такие же блоки в остальных процедурах. У них отличается только префикс:
+        Set table = ws.ListObjects(CStr(tableName))
 
-Модуль	Процедура	Строка вместо старого блока
+    Next tableName
 
-BP	DeleteLastListBP2	DeleteFormNames sheetBP.Parent, "BP", lastForm
-EMV	DeleteLastListEMV	DeleteFormNames sheetEMV.Parent, "EMV", lastForm
-GC	DeleteLastListGC2	DeleteFormNames sheetGC.Parent, "GC", lastForm
-GOR	DeleteLastListGOR	DeleteFormNames sheetGOR.Parent, "GOR", lastForm
-OPOH	DeleteLastListOPOH	DeleteFormNames sheetOPOH.Parent, "OPOH", lastForm
+    For Each cell In _
+        ws.ListObjects("modelsEquipment") _
+          .ListColumns("mnemonicName") _
+          .DataBodyRange.Cells
+
+        If Len(Trim$(CStr(cell.Value2))) > 0 Then
+
+            Set table = ws.ListObjects( _
+                Replace( _
+                    Trim$(CStr(cell.Value2)), _
+                    "-", _
+                    "_" _
+                ) _
+            )
+
+        End If
+
+    Next cell
+
+    EquipmentCatalogCacheReady = True
+    Exit Function
+
+NotReady:
+
+    EquipmentCatalogCacheReady = False
+
+End Function
 
 
-В каждой процедуре новый вызов должен стоять перед удалением столбцов формы. Например, для AP получится:
+Public Sub ForceRefreshEquipmentCatalog()
 
-DeleteFormNames sheetAP.Parent, "AP", lastForm
+    RefreshEquipmentCatalog True
 
-sheetAP.Range( _
-    sheetAP.Columns(firstColLastForm), _
-    sheetAP.Columns(lastColLastForm) _
-).EntireColumn.Delete
+End Sub
 
-Call DeleteCheckBoxesFromColumnRight(sheetAP, firstColLastForm)
+3. Добавь вызов в PowerQuery.Refresh_Project
 
-Теперь при удалении третьей формы будут удаляться все имена AP_3_*, включая AP_3_d, AP_3_P и AP_3_Tt. Формулы этих имён при удалении не вычисляются.
+В конце этой процедуры сейчас стоит:
+
+withoutTask:
+
+End Sub
+
+Замени на:
+
+withoutTask:
+
+    RefreshEquipmentCatalog
+
+End Sub
+
+Метка должна остаться на месте: благодаря этому справочник проверяется и при отсутствии заданий.
+
+Существующие createMnemonicTabless и equipmentModelsRefresh… для этого обновления вызывать не нужно — новый Python-код выполняет пересборку списков сам.
+
+Проверка после установки
+
+Пересобери/сохрани надстройку и перезапусти Excel. Открой рабочую книгу и дважды выполни в Immediate Window:
+
+RefreshEquipmentCatalog
+
+При первом успешном запуске появится:
+
+EquipmentCatalog: обновлён
+
+При втором, если БД не менялась:
+
+EquipmentCatalog: без изменений
+
+Для принудительной пересборки:
+
+ForceRefreshEquipmentCatalog
+
+После первого обновления сохрани книгу обычным способом — вместе с ней сохранится хэш. Версия формы остаётся 25.0.0.
+
+Проверил расчёт хэша и пропуск обновления на твоих 309 записях, группировку оборудования, сохранение начальных нулей и соответствие полей шаблону. Выполнение через COM в Windows Excel здесь не проверял.
