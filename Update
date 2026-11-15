@@ -1,33 +1,22 @@
-Обработка заняла 5m 55s
+Обработка заняла 2m 49s
 
-Имена в форме есть. Нашёл проблему в том, как код проверяет их доступность, но настоящую ошибку сейчас скрывает обработчик.
+Тогда обойдёмся без точек останова. В modNotifications нашёл вероятного виновника вылета: SetTimer вызывает VBA для закрытия уведомления. Такие вызовы таймера могут приводить к падению Excel; связь именно с твоим вылетом пока предполагаю. 
 
-В helpersRange.NamedRangeExists стоит:
+Чтобы продолжить проверку графика:
 
-Set testRange = wb.Names(rangeName).RefersToRange
+1. Удали все точки останова: Ctrl+Shift+F9 в редакторе VBA.
+2. В модуле helpersRange, в функции NamedRangeExists, замени конец функции на:
 
-При любой ошибке функция возвращает False. Поэтому сообщение «не найдены диапазоны» означает также «имя существует, но его формула сейчас не возвращает диапазон». RefersToRange действительно может завершаться ошибкой при невозможности получить диапазон. 
+NotExists:
+    Debug.Print "NamedRangeExists: "; rangeName; _
+                " | Error: "; Err.Number; _
+                " | "; Err.Description
 
-В твоём шаблоне AP_1_d задан так:
+    NamedRangeExists = False
 
-=OFFSET(AP!$J$22,0,0,COUNT(AP_source_1[VPR d]),1)
+End Function
 
-То есть его размер зависит от расчётного столбца VPR d, а не непосредственно от введённых плотностей. Если COUNT возвращает ноль, получается недопустимая высота диапазона. 
+3. Запусти обычную операцию, при которой должен обновляться график GOR.
+4. После завершения открой Ctrl+G и пришли строки с AP_1_P, AP_1_d и подобными именами.
 
-Есть подходящий под это сценарий: загрузка AP выполняется при xlCalculationManual, а RefreshGORAPDensityChart вызывается до EndMacro, возвращающего автоматический пересчёт. Но нулевой COUNT именно в момент твоего сбоя пока не подтверждён.
-
-Ещё проверил сборку: в отдельном GOR.bas уже стоят твои строки sheetAP.Range(...), а внутри PVT_Addin.xlam остался прежний вариант. Проверка через NamedRangeExists присутствует в обоих.
-
-Чтобы установить точную причину, поставь точку останова в RefreshGORAPDensityChart на строке:
-
-Set pressureRange = Nothing
-
-При остановке выполни в Immediate Window:
-
-? wb.FullName
-? wb.Names("AP_" & formIndex & "_d").RefersTo
-? Application.Count(sourceTable.ListColumns("VPR P").DataBodyRange), Application.Count(sourceTable.ListColumns("VPR d").DataBodyRange)
-? TypeName(sheetAP.Evaluate(wb.Names("AP_" & formIndex & "_d").RefersTo))
-? wb.Names("AP_" & formIndex & "_d").RefersToRange.Address
-
-Пришли вывод и ошибку последней строки, если она появится. Нужен результат именно во время остановки макроса: после его завершения режим пересчёта уже меняется, поэтому ручная проверка может успешно находить тот же диапазон.
+Debug.Print запишет настоящую ошибку в Immediate Window без остановки макроса. 
