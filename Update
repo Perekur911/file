@@ -1,19 +1,95 @@
-Обработка заняла 3m 23s
+Обработка заняла 9m 5s
 
-На фото видно: оба запуска завершились с changed=True, а этап занял сначала 0,297 с, затем 26,979 с. Значит, Python оба раза выполнял ветку перезаписи справочников. Причину задержки внутри неё этот лог пока не разделяет.
+Теперь видно точно:
 
-Для обычного обновления запускай Refresh_Project_wrap. Если запускаешь ForceRefreshEquipmentCatalog, он специально стирает сохранённый хэш — поэтому changed=True будет каждый раз.
+- БД и расчёт хэша — 0,007 с.
+- Чтение хэша из Excel — ошибка «Член группы не найден».
+- Запись трёх таблиц — 22,904 с.
 
-Чтобы проверить обычный запуск, добавим короткую диагностику.
+В моём коде ошибка чтения свойства превращалась в old_hash="", после чего выполнялось обновление. Исправим это: хэш прочитает существующая VBA-функция и передаст в тот же вызов Python. Также сократим обращения к Excel при форматировании.
 
-1. В equipment_catalog.py добавь к импортам:
+Уточнение: на фото разные проекты — F749 и F750. Для каждой книги первое обновление справочников может быть необходимо; пропуск записи проверяется повторным обновлением той же книги.
 
-import logging
-from time import perf_counter
+1. В StudySync, внутри RefreshTasksFromExternalWorkbook, найди:
 
-2. Замени начало refresh_for_book, от объявления функции до строки sheet = book.sheets["Пересчет"] включительно, следующим:
+If refreshEquipment Then
+        cmd = cmd & " --refresh-equipment"
+    End If
 
-def refresh_for_book(book, db_path, *, force=False):
+Замени на:
+
+If refreshEquipment Then
+        Dim equipmentSavedHash As String
+
+        equipmentSavedHash = GetWorkbookMetadataProperty( _
+            targetBook, "EquipmentCatalogHash", "")
+
+        cmd = cmd & " --refresh-equipment" & _
+              " --equipment-saved-hash=" & Quote(equipmentSavedHash)
+    End If
+
+Существующий вызов CompleteEquipmentCatalogRefresh после завершения Python сохрани.
+
+2. В refresh_tasks.py передай этот аргумент до функции обновления оборудования.
+
+В конце списка параметров обеих функций — refresh_tasks и _refresh_tasks_impl — после:
+
+refresh_equipment: bool = False,
+
+добавь:
+
+equipment_saved_hash: str | None = None,
+
+В самом начале тела _refresh_tasks_impl, перед первым progress(...), добавь:
+
+if refresh_equipment and equipment_saved_hash is None:
+        raise ValueError(
+            "Не передан equipment_saved_hash из VBA "
+            "для проверки оборудования."
+        )
+
+В refresh_tasks, внутри вызова _refresh_tasks_impl(...), после:
+
+refresh_equipment=refresh_equipment,
+
+добавь:
+
+equipment_saved_hash=equipment_saved_hash,
+
+В _refresh_tasks_impl замени:
+
+equipment_result = refresh_for_book(target_book, db_path)
+
+на:
+
+equipment_result = refresh_for_book(
+            target_book,
+            db_path,
+            saved_hash=equipment_saved_hash,
+        )
+
+В функции main, рядом с добавлением --refresh-equipment, добавь:
+
+parser.add_argument("--equipment-saved-hash", default=None)
+
+Ниже, в вызове run_json(...), после:
+
+refresh_equipment=args.refresh_equipment,
+
+добавь:
+
+equipment_saved_hash=args.equipment_saved_hash,
+
+3. В equipment_catalog.py убери чтение свойства через COM.
+
+Замени начало refresh_for_book — от объявления функции до проверки совпадения хэшей включительно — следующим кодом:
+
+def refresh_for_book(book, db_path, *, saved_hash=None, force=False):
+    if saved_hash is None:
+        raise ValueError(
+            f"Не передан сохранённый {HASH_PROPERTY} из VBA."
+        )
+
     logger = logging.getLogger("refresh_tasks")
 
     started_at = perf_counter()
@@ -24,22 +100,11 @@ def refresh_for_book(book, db_path, *, force=False):
         perf_counter() - started_at,
     )
 
-    started_at = perf_counter()
-
-    try:
-        prop = book.api.CustomDocumentProperties.Item(HASH_PROPERTY)
-        old_hash = str(prop.Value or "")
-    except Exception as exc:
-        old_hash = ""
-        logger.warning(
-            "Оборудование: не удалось прочитать хэш Excel: %r",
-            exc,
-        )
+    old_hash = str(saved_hash or "")
 
     logger.info(
-        "Оборудование: чтение хэша Excel — %.3f с; "
+        "Оборудование: сравнение хэшей; "
         "old=%r; new=%r; force=%s",
-        perf_counter() - started_at,
         old_hash,
         new_hash,
         force,
@@ -52,20 +117,116 @@ def refresh_for_book(book, db_path, *, force=False):
             "catalog_hash": new_hash,
         }
 
-    write_started_at = perf_counter()
+Далее сохраняется существующий код начиная с:
+
+write_started_at = perf_counter()
     sheet = book.sheets["Пересчет"]
 
-Ниже продолжится существующий код начиная с:
+Старый блок с CustomDocumentProperties.Item(...), except и предупреждением о чтении хэша полностью удаляется.
 
-objects = sheet.api.ListObjects
+Теперь сократим обращения при форматировании. Перед refresh_for_book добавь:
 
-3. В конце этой же функции, перед последним return, добавь:
+def column_letter(number):
+    result = ""
 
-logger.info(
-        "Оборудование: запись трёх таблиц Excel — %.3f с",
-        perf_counter() - write_started_at,
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+
+    return result
+
+Внутри refresh_for_book замени цикл от for table, headers, matrix in plans: до следующего finally:, оставив сам finally и его содержимое, на:
+
+for table, headers, matrix in plans:
+            header = table.HeaderRowRange
+
+            top = int(header.Row)
+            left = int(header.Column)
+            right = left + len(headers) - 1
+
+            left_letter = column_letter(left)
+            right_letter = column_letter(right)
+
+            old_range = table.Range
+            old_bottom = (
+                int(old_range.Row)
+                + int(old_range.Rows.Count)
+                - 1
+            )
+
+            bottom = (
+                top
+                + len(matrix)
+                + int(bool(table.ShowTotals))
+            )
+
+            if int(table.ListRows.Count) != len(matrix):
+                table.Resize(
+                    sheet.api.Range(
+                        f"{left_letter}{top}:"
+                        f"{right_letter}{bottom}"
+                    )
+                )
+
+            body = table.DataBodyRange
+
+            if body is None or int(body.Rows.Count) != len(matrix):
+                raise RuntimeError(
+                    f"Не удалось задать размер таблицы {table.Name}"
+                )
+
+            if old_bottom > bottom:
+                sheet.api.Range(
+                    f"{left_letter}{bottom + 1}:"
+                    f"{right_letter}{old_bottom}"
+                ).ClearContents()
+
+            body.NumberFormat = "General"
+
+            text_areas = []
+
+            for i, name in enumerate(headers):
+                if name in TEXT_COLUMNS:
+                    col = column_letter(left + i)
+                    text_areas.append(
+                        f"{col}{top + 1}:{col}{top + len(matrix)}"
+                    )
+
+            if text_areas:
+                sheet.api.Range(
+                    ",".join(text_areas)
+                ).NumberFormat = "@"
+
+            body.Value2 = matrix
+
+Теперь форматирование выполняется шестью операциями вместо 29: общий формат и текстовые столбцы для каждой таблицы. Несмежные текстовые столбцы объединяются одним адресом Range через запятую — Excel поддерживает такой способ обращения. 
+
+Запись значений остаётся одной операцией на таблицу.
+
+4. В create_project_forms.py передай хэш при пакетном обновлении.
+
+В функции run_refresh_tasks_for_book, сразу после:
+
+from refresh_tasks import refresh_tasks
+
+добавь:
+
+equipment_saved_hash = run_addin_macro(
+        app=app,
+        workbook=workbook,
+        addin_name=addin_name,
+        macro_name="modMetadata.GetWorkbookMetadataProperty",
+        args=(workbook.api, "EquipmentCatalogHash", ""),
     )
 
-В текущем варианте любая ошибка чтения свойства Excel молча превращается в пустой хэш и вызывает повторное обновление. Теперь такая ошибка будет видна.
+В существующий вызов refresh_tasks(...), после:
 
-После одного запуска Refresh_Project_wrap пришли строки из task_refresh.log, начинающиеся с Оборудование:. Они покажут отдельно время чтения БД, получения хэша из Excel и записи таблиц, а также значения сравниваемых хэшей. 
+refresh_equipment=True,
+
+добавь:
+
+equipment_saved_hash=str(equipment_saved_hash or ""),
+
+Это вызов VBA в уже используемом экземпляре Excel. Дополнительный Python-процесс не запускается.
+
+Проверки передачи пустого и заполненного хэша, а также пропуска записи при совпадении прошли. После успешного обновления повторное обычное обновление той же книги, если справочник не менялся, должно дать changed=False и пропустить этап записи, занимавший около 23 секунд. Первое заполнение книги всё ещё потребует записи; сокращение COM-вызовов должно уменьшить её время, но точный выигрыш проверяется в Excel.
